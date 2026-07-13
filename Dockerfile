@@ -11,7 +11,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get update && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
 
-RUN useradd --create-home --uid 1000 brain
+RUN useradd --create-home --uid 1000 brain \
+    && mkdir /data && chown brain:brain /data
 USER brain
 WORKDIR /home/brain
 
