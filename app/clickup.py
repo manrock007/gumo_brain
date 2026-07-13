@@ -16,10 +16,10 @@ API = "https://api.clickup.com/api/v2"
 # internal state -> candidate ClickUp status names (first match on the list wins)
 STATUS_CANDIDATES = {
     "running": ["in progress", "in review", "active"],
-    "awaiting_input": ["needs input", "review", "in progress"],
-    "pr_opened": ["complete", "done", "closed"],
-    "no_fix": ["complete", "done", "closed"],
-    "skipped": ["complete", "done", "closed"],
+    "awaiting_input": ["needs input", "blocked", "review", "in review", "in progress"],
+    "pr_opened": ["accepted", "complete", "done", "closed"],
+    "no_fix": ["rejected", "complete", "done", "closed"],
+    "skipped": ["rejected", "complete", "done", "closed"],
     "error": ["to do", "open"],
     "timeout": ["to do", "open"],
 }
