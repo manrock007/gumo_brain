@@ -8,8 +8,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
         > /etc/apt/sources.list.d/github-cli.list \
-    && apt-get update && apt-get install -y --no-install-recommends gh \
+    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends gh nodejs \
     && rm -rf /var/lib/apt/lists/*
+
+# ClickUp progress-comment CLI used by Claude during fixes
+COPY bin/brain-ticket /usr/local/bin/brain-ticket
+RUN chmod +x /usr/local/bin/brain-ticket
 
 RUN useradd --create-home --uid 1000 brain \
     && mkdir /data && chown brain:brain /data

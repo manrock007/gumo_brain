@@ -42,6 +42,33 @@ class SentryClient:
             r.raise_for_status()
             return r.json()
 
+    async def top_unresolved_issues(self, limit: int = 25) -> list[dict]:
+        """Most-frequent unresolved issues over the last 14 days (sweep source)."""
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.get(
+                f"{self._base}/organizations/{self._org}/issues/",
+                headers=self._headers,
+                params={"query": "is:unresolved", "sort": "freq",
+                        "statsPeriod": "14d", "limit": limit},
+            )
+            r.raise_for_status()
+            return r.json()
+
+    async def resolve_short_id(self, short_id: str) -> str | None:
+        """Resolve a short id like GUMO-1A to a numeric issue id."""
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.get(
+                    f"{self._base}/organizations/{self._org}/shortids/{short_id}/",
+                    headers=self._headers,
+                )
+                r.raise_for_status()
+                data = r.json()
+                return str(data.get("groupId") or data.get("group", {}).get("id"))
+        except Exception:
+            log.warning("could not resolve short id %s", short_id)
+            return None
+
     async def post_comment(self, issue_id: str, text: str) -> None:
         """Leave a note on the issue. Best-effort — never fails the job."""
         try:

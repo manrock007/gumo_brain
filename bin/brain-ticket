@@ -1,0 +1,37 @@
+#!/usr/bin/env python3
+"""Post a progress comment to the ClickUp ticket tracking the current fix.
+
+Usage: brain-ticket <task_id> "<markdown message>"
+Reads CLICKUP_TOKEN from the environment. Dependency-free (stdlib only).
+"""
+import json
+import os
+import sys
+import urllib.request
+
+def main() -> int:
+    if len(sys.argv) < 3:
+        print("usage: brain-ticket <task_id> <message>", file=sys.stderr)
+        return 2
+    token = os.environ.get("CLICKUP_TOKEN")
+    if not token:
+        print("CLICKUP_TOKEN not set; skipping ticket update", file=sys.stderr)
+        return 0  # never fail the fix over tracking
+    task_id, message = sys.argv[1], " ".join(sys.argv[2:])
+    req = urllib.request.Request(
+        f"https://api.clickup.com/api/v2/task/{task_id}/comment",
+        data=json.dumps({"comment_text": message[:9000]}).encode(),
+        headers={"Authorization": token, "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            resp.read()
+        print("ticket updated")
+        return 0
+    except Exception as e:
+        print(f"ticket update failed: {e}", file=sys.stderr)
+        return 0  # best-effort
+
+if __name__ == "__main__":
+    sys.exit(main())
