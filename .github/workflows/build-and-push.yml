@@ -1,0 +1,83 @@
+name: Build, Push and Deploy Brain Image
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    permissions: { contents: read, id-token: write }
+    outputs:
+      deploy_tag: ${{ steps.meta.outputs.short_sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      - uses: aws-actions/amazon-ecr-login@v2
+      - uses: docker/setup-buildx-action@v3
+      - name: Prepare image tags
+        id: meta
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          {
+            echo "short_sha=${SHORT_SHA}"
+            echo 'tags<<EOF'
+            echo "${{ secrets.ECR_BRAIN_REPO }}:latest"
+            echo "${{ secrets.ECR_BRAIN_REPO }}:${SHORT_SHA}"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+      - name: Build & Push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+    timeout-minutes: 15
+    concurrency:
+      group: gumo-brain-deploy
+      cancel-in-progress: false
+    steps:
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
+      - name: Deploy pushed brain image
+        run: |
+          ssh -i ~/.ssh/id_rsa ec2-user@${{ secrets.EC2_HOST }} bash <<'EOSSH'
+            set -euo pipefail
+            cd /opt/gumo
+            IMAGE_TAG_TO_DEPLOY='${{ needs.build.outputs.deploy_tag }}'
+            if grep -q '^BRAIN_IMAGE_TAG=' .env; then
+              sed -i "s/^BRAIN_IMAGE_TAG=.*/BRAIN_IMAGE_TAG=${IMAGE_TAG_TO_DEPLOY}/" .env
+            else
+              printf '\nBRAIN_IMAGE_TAG=%s\n' "${IMAGE_TAG_TO_DEPLOY}" >> .env
+            fi
+            aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | docker login --username AWS --password-stdin ${{ secrets.ECR_BRAIN_REPO }}
+            docker compose pull gumo-brain
+            docker compose up -d --no-deps gumo-brain
+            for i in $(seq 1 30); do
+              STATUS="$(curl -ksS --max-time 5 -o /dev/null -w '%{http_code}' https://gumo.co.in/brain/health || true)"
+              if [ "${STATUS}" = "200" ]; then
+                echo "Brain healthy on attempt ${i}"
+                exit 0
+              fi
+              sleep 2
+            done
+            echo "Brain health check failed"
+            docker logs --tail 100 gumo-brain || true
+            exit 1
+          EOSSH
