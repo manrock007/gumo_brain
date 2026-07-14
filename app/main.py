@@ -3,6 +3,7 @@ import json
 import logging
 import re
 import secrets
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -25,6 +26,9 @@ basic = HTTPBasic()
 
 ISSUE_URL_RE = re.compile(r"/issues/(\d+)")
 SHORT_ID_RE = re.compile(r"^[A-Z][A-Z0-9_-]*-[A-Z0-9]+$")
+# https://app.clickup.com/t/86abcd123 or /t/<team_id>/CUSTOM-123, or a bare task id
+CLICKUP_URL_RE = re.compile(r"app\.clickup\.com/t/(?:\d+/)?([A-Za-z0-9_-]+)")
+CLICKUP_ID_RE = re.compile(r"^[A-Za-z0-9_-]{4,}$")
 
 
 def require_auth(credentials: HTTPBasicCredentials = Depends(basic)):
@@ -124,6 +128,114 @@ async def trigger(body: TriggerBody):
         "decision": decision,
         "clickup_task_url": task_url,
     }
+
+
+@app.get("/api/projects", dependencies=[Depends(require_auth)])
+async def projects():
+    """Configured Sentry-project -> repo mappings, for the dashboard's project picker."""
+    mapping = json.loads(settings.repo_map)
+    return [{"slug": slug, "repo": entry.get("repo", "")} for slug, entry in sorted(mapping.items())]
+
+
+class TaskBody(BaseModel):
+    project: str
+    clickup: str | None = None  # ClickUp task URL or id — adopt an existing ticket
+    title: str | None = None    # ... or create a new ticket from title + summary
+    summary: str | None = None
+
+
+@app.post("/api/tasks", dependencies=[Depends(require_auth)])
+async def submit_task(body: TaskBody):
+    """Manually reported request (bug fix / change request). The ClickUp ticket —
+    adopted from a pasted URL or created from title+summary — is the record of work."""
+    worker: Worker = app.state.worker
+    project = body.project.strip()
+    if settings.repo_for_project(project) is None:
+        raise HTTPException(status_code=400, detail=f"unknown project '{project}'")
+
+    ref = (body.clickup or "").strip()
+    if ref:
+        if m := CLICKUP_URL_RE.search(ref):
+            cu_id = m.group(1)
+        elif CLICKUP_ID_RE.match(ref):
+            cu_id = ref
+        else:
+            raise HTTPException(status_code=400, detail=f"could not parse a ClickUp task from '{ref}'")
+        cu_task = await worker.clickup.get_task(cu_id)
+        if cu_task is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"ClickUp task '{cu_id}' not found (or ClickUp integration disabled)",
+            )
+        title = cu_task["name"] or "untitled request"
+        request_text = cu_task["description"] or title
+        job_id = f"task-{cu_task['id']}"
+        task_id, task_url = cu_task["id"], cu_task["url"]
+        picked_up_note = (
+            "gumo_brain picked this up. I'll analyse the code first and post my plan + "
+            "questions here — reply `/proceed <guidance>` or `/skip`, or answer on the dashboard."
+        )
+    else:
+        title = (body.title or "").strip()
+        summary = (body.summary or "").strip()
+        if not title:
+            raise HTTPException(status_code=400, detail="provide a ClickUp URL, or a title")
+        request_text = summary or title
+        created = await worker.clickup.create_task(
+            name=f"[{project}] {title}",
+            description=(
+                f"**Manual request via gumo_brain dashboard**\n**Project:** {project}\n\n"
+                f"{request_text}\n\n"
+                "_Claude analyses first and posts its plan + questions below. Reply "
+                "`/proceed <guidance>` or `/skip`, or answer on the dashboard._"
+            ),
+        )
+        if created:
+            task_id, task_url = created
+            job_id = f"task-{task_id}"
+        else:  # ClickUp outage degrades tracking, never fixing
+            task_id, task_url = None, None
+            job_id = f"task-{uuid.uuid4().hex[:10]}"
+        picked_up_note = None
+
+    decision = worker.intake_task(
+        job_id, title=title, project=project, request=request_text,
+        clickup_task_id=task_id, clickup_task_url=task_url,
+    )
+    if "queued" not in decision:
+        raise HTTPException(status_code=409, detail=decision)
+    if ref and picked_up_note:
+        await worker.clickup.comment(task_id or "", picked_up_note)
+
+    return {
+        "job_id": job_id,
+        "title": title,
+        "project": project,
+        "decision": decision,
+        "clickup_task_url": task_url,
+    }
+
+
+class AnswerBody(BaseModel):
+    action: str  # proceed | skip
+    answer: str = ""
+
+
+@app.post("/api/jobs/{job_id}/answer", dependencies=[Depends(require_auth)])
+async def answer_job(job_id: str, body: AnswerBody):
+    """Answer an awaiting_input job from the dashboard. The decision is posted to the
+    ClickUp ticket (keeper of record) before the job advances."""
+    action = body.action.strip().lower()
+    if action not in ("proceed", "skip"):
+        raise HTTPException(status_code=400, detail="action must be 'proceed' or 'skip'")
+    worker: Worker = app.state.worker
+    try:
+        status = await worker.resolve_awaiting(job_id, action, body.answer.strip())
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"unknown job '{job_id}'")
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    return {"job_id": job_id, "status": status}
 
 
 @app.post("/webhooks/sentry")

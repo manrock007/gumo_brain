@@ -44,6 +44,34 @@ class ClickUp:
         except Exception:
             log.exception("could not load ClickUp list statuses; status sync disabled")
 
+    async def get_task(self, task_id: str) -> dict | None:
+        """Fetch an existing task (any list) — used to adopt user-submitted tickets."""
+        if not self.enabled or not task_id:
+            return None
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.get(
+                    f"{API}/task/{task_id}",
+                    headers=self._headers,
+                    params={"include_markdown_description": "true"},
+                )
+                r.raise_for_status()
+                d = r.json()
+                return {
+                    "id": str(d["id"]),
+                    "name": d.get("name", ""),
+                    "url": d.get("url", ""),
+                    "description": (
+                        d.get("markdown_description")
+                        or d.get("description")
+                        or d.get("text_content")
+                        or ""
+                    ),
+                }
+        except Exception:
+            log.exception("ClickUp get_task failed for %s", task_id)
+            return None
+
     async def create_task(self, name: str, description: str) -> tuple[str, str] | None:
         if not self.enabled:
             return None
