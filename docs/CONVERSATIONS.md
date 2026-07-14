@@ -25,10 +25,10 @@ change — auth and onboarding state live there. So:
 
 | increment | contents | status |
 |-----------|----------|--------|
-| **1 (this PR)** | Artifact-primed gate chat: `gate_chat` table, `POST/GET /api/jobs/{id}/chat`, dashboard chat panel, ClickUp mirroring + verb footer + non-verb nudge, the full per-repo lock domain, chat cost telemetry. Zero dependency on session storage. | **built** |
-| 2 | Session persistence behind `session_persistence` flag (+ §5 bootstrap contract), `--session-id` ownership, STAGE_ASK resume for code stages only. | designed (§4) |
-| 3 | Fork-chat as the code-gate upgrade (session's memory of test output/exploration is the value there), dollar-budgeted. | designed (§4) |
-| 4 | Gate modes (auto-advance). Cut from v2.1 entirely; re-proposed only after week-one `stage_runs` data, starting from the P5→P6 / P7→P8 pairs, and closing three holes: non-boilerplate Questions must park; first clean run after a /redo must park; P5 without a captured PR_URL must park. | deferred |
+| **1** | Artifact-primed gate chat: `gate_chat` table, `POST/GET /api/jobs/{id}/chat`, dashboard chat panel, ClickUp mirroring + verb footer + non-verb nudge, the full per-repo lock domain, chat cost telemetry. Zero dependency on session storage. | **built** |
+| **2** | Session persistence behind `session_persistence` flag (+ §4 bootstrap contract, session-lost detection, `--session-id` ownership, janitor), STAGE_ASK resume for code stages only. | **built** (flag off by default) |
+| **3** | Fork-chat as the code-gate upgrade (session's memory of test output/exploration is the value there); chat sessions keyed by (job, stage, attempt); global claude-invocation lock for shared-store runs; artifact-primed mode stays the doc-gate default AND the fallback. | **built** (active only with the flag) |
+| **4** | Gate modes: per-feature `gate_mode=light` auto-advances P2/P4–P8 on a clean STAGE_DONE — with the critique's guards built in: non-boilerplate Questions park, first clean run after a /redo parks, P5 without a captured PR_URL parks, mid-run human edits park, mirror-down parks. Default remains `full`; relax only after week-one `stage_runs` data. | **built** (opt-in per feature) |
 
 ## 2. Gate chat (increment 1 — as built)
 
@@ -85,10 +85,12 @@ when the workspace frees. Cross-repo, chat and the serial worker can run
 dir writes that matter and share no workspace; increment 2's shared-session
 store adds the constraints in §4.
 
-## 4. Increments 2-3: session resume + STAGE_ASK (designed, amended, not built)
+## 4. Session resume + STAGE_ASK (increments 2-3 — as built, flag-gated)
 
-All critique amendments are folded here so the next increment starts from the
-corrected design:
+Everything below ships in code but activates only with
+`session_persistence=true`; without it, asks still park as gates and their
+answers route to fresh re-runs with the Q&A injected (labeled). The critique
+amendments are folded in:
 
 - **Persistence bootstrap (flag-gated)**: `session_persistence=false` by
   default. Turning it on points stage subprocesses at

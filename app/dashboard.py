@@ -82,7 +82,7 @@ DASHBOARD_HTML = """<!doctype html>
   .brain th, .stats-body th { color:var(--muted); font-weight:600; }
   .brain button { padding:3px 10px; border:0; border-radius:6px; background:var(--accent); color:#fff; cursor:pointer; font:inherit; font-size:12px; }
   .brain button:disabled { opacity:.5; }
-  .ok-t { color:var(--ok); } .err-t { color:var(--err); }
+  .ok-t { color:var(--ok); } .err-t { color:var(--err); } .muted-t { color:var(--muted); }
 </style>
 </head>
 <body>
@@ -118,6 +118,10 @@ DASHBOARD_HTML = """<!doctype html>
       <input id="feat-title" placeholder="Title">
       <textarea id="feat-summary" placeholder="What should be built? Goal, users, constraints, links&hellip;"></textarea>
       <input id="feat-owner" placeholder="Owner — ClickUp user id (optional, gets gate notifications)">
+      <select id="feat-gatemode">
+        <option value="full" selected>full &mdash; pause at every stage (default)</option>
+        <option value="light">light &mdash; pause at P0/P1/P3/P9 + questions</option>
+      </select>
       <input id="feat-related" placeholder="Related pipeline job id(s) (optional, comma-separated)">
       <div class="hint">P0 Intake &rarr; P9 Ship; every stage parks below (and on ClickUp) for your Proceed / Redo / Skip.</div>
       <button id="feat-go">Start pipeline</button>
@@ -171,18 +175,28 @@ function stageStrip(j) {
   }
   const mirror = j.mirror_ok ? '' :
     '<span class="chip" title="ClickUp artifact mirror unhealthy — artifacts live in git; answer gates here">mirror off</span>';
+  const askq = j.status === 'awaiting_input' && j.gate_kind === 'ask'
+    ? '<span class="chip" title="the engine paused mid-stage to ask a question — answering resumes from the pause point">question &mdash; resumes in place</span>'
+    : '';
   return `<div class="strip">${segs}</div>
-    <div class="stagetext">P${cur} ${esc(j.stage_name || STAGE_NAMES[cur] || '')}${mirror}</div>`;
+    <div class="stagetext">P${cur} ${esc(j.stage_name || STAGE_NAMES[cur] || '')}${askq}${mirror}</div>`;
 }
 
 function answerBlock(j) {
   const id = esc(j.issue_id);
   const feature = j.kind === 'feature';
+  // STAGE_ASK gates: the engine paused mid-work to ask — 'proceed' delivers the
+  // answer and resumes in place, so the button reads Answer; Redo discards the
+  // pause point and restarts the stage.
+  const isAsk = j.gate_kind === 'ask';
+  const goLabel = isAsk ? 'Answer' : 'Proceed';
+  const redoTitle = isAsk ? ' title="restarts the stage fresh (discards the pause point)"' : '';
+  const placeholder = isAsk ? 'Your answer&hellip;' : 'Your answer / guidance&hellip;';
   const btns = feature
-    ? `<button class="go" onclick="answer('${id}','proceed',this)">Proceed</button>
-       <button class="redo" onclick="answer('${id}','redo',this)">Redo</button>
+    ? `<button class="go" onclick="answer('${id}','proceed',this)">${goLabel}</button>
+       <button class="redo"${redoTitle} onclick="answer('${id}','redo',this)">Redo</button>
        <button class="no" onclick="answer('${id}','skip',this)">Skip</button>`
-    : `<button class="go" onclick="answer('${id}','proceed',this)">Proceed</button>
+    : `<button class="go" onclick="answer('${id}','proceed',this)">${goLabel}</button>
        <button class="no" onclick="answer('${id}','skip',this)">Skip</button>`;
   const hint = feature
     ? `<div class="hint">Redo re-runs this stage with your notes as corrections &mdash; optionally prefix 'P3 ' to redo an earlier stage.</div>`
@@ -196,7 +210,7 @@ function answerBlock(j) {
         <div class="hint">Answers come from the gate's documents and the repo (read-only). Typically 15&ndash;90s.</div>
       </details>`
     : '';
-  return `<div class="answer"><textarea id="ans-${id}" data-job="${id}" data-draft="gb-draft-${id}" placeholder="Your answer / guidance&hellip;"></textarea>
+  return `<div class="answer"><textarea id="ans-${id}" data-job="${id}" data-draft="gb-draft-${id}" placeholder="${placeholder}"></textarea>
     ${chat}${hint}<div class="btns">${btns}</div></div>`;
 }
 
@@ -339,19 +353,25 @@ function fmtWait(sec) {
 function statsTable(data) {
   const runs = data.runs || [];
   if (!runs.length) return '<div class="empty">no stage runs yet</div>';
+  const autoStages = new Set();  // stages the engine advanced without a human gate (light mode)
+  for (const g of data.guidance || []) if (g.action === 'auto') autoStages.add(Number(g.stage));
   const by = {};
   for (const r of runs) {  // aggregate per stage; runs arrive ordered, last status wins
-    const s = by[r.stage] || (by[r.stage] = { n: 0, dur: 0, cost: 0, wait: 0, status: '' });
+    const s = by[r.stage] || (by[r.stage] = { n: 0, dur: 0, cost: 0, wait: 0, status: '', gate: '' });
     s.n += 1;
     s.dur += r.duration_ms || 0;
     s.cost += r.cost_usd || 0;
     if (r.gate_posted_at && r.gate_answered_at) s.wait += Math.max(0, r.gate_answered_at - r.gate_posted_at);
     if (r.result_status) s.status = r.result_status;
+    s.gate = r.gate_action || '';  // latest run's gate_action wins ('' = never answered by a human)
   }
   const rows = Object.keys(by).map(Number).sort((a, b) => a - b).map(st => {
     const s = by[st];
+    const res = !s.gate && autoStages.has(st)
+      ? '<span class="muted-t" title="auto-advanced (light gate mode)">auto</span>'
+      : esc(s.status);
     return `<tr><td>P${st} ${esc(STAGE_NAMES[st] || '')}</td><td>${s.n}</td><td>${fmtMMSS(s.dur)}</td>
-      <td>$${s.cost.toFixed(2)}</td><td>${fmtWait(s.wait)}</td><td>${esc(s.status)}</td></tr>`;
+      <td>$${s.cost.toFixed(2)}</td><td>${fmtWait(s.wait)}</td><td>${res}</td></tr>`;
   }).join('');
   return `<table><tr><th>stage</th><th>attempts</th><th>duration</th><th>cost</th><th>gate wait</th><th>result</th></tr>${rows}</table>`;
 }
@@ -600,6 +620,7 @@ async function submitFeature(ev) {
     title: document.getElementById('feat-title').value.trim(),
     summary: document.getElementById('feat-summary').value.trim(),
     owner: document.getElementById('feat-owner').value.trim(),
+    gate_mode: document.getElementById('feat-gatemode').value,
     related_to: document.getElementById('feat-related').value.trim(),
   };
   if (!body.project) { msg.textContent = 'Pick a project first.'; return false; }

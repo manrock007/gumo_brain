@@ -10,6 +10,7 @@ import asyncio
 import logging
 import re
 import time
+import uuid
 from pathlib import Path
 
 from .artifacts import ArtifactSync, artifact_path, feature_dir, list_artifacts, normalize
@@ -31,6 +32,7 @@ from .fixer import (
     git,
     prepare_feature_workspace,
     run_claude_raw,
+    session_transcript_exists,
 )
 from .memory import MemoryReader
 from .prompts import _test_block
@@ -54,6 +56,10 @@ class RepoLocks:
 
     def __init__(self):
         self._locks: dict[str, asyncio.Lock] = {}
+        # concurrent claude invocations sharing the session store's config dir
+        # must serialize — its state files are read-modify-written per invocation
+        # (docs/CONVERSATIONS.md §4). Only acquired when session_persistence is on.
+        self.claude_global = asyncio.Lock()
 
     def for_repo(self, repo: str) -> asyncio.Lock:
         if repo not in self._locks:
@@ -72,24 +78,23 @@ BUILD_GROUP_RE = re.compile(r"^#{1,4}\s*build\s+group\b", re.IGNORECASE | re.MUL
 
 
 def parse_stage_output(text: str) -> tuple[str, str, str | None]:
-    """(marker, payload, pr_url). Marker: done | fail | unparsed. End-anchored:
-    the LAST line-start occurrence wins; a bare URL elsewhere never counts."""
+    """(marker, payload, pr_url). Marker: done | fail | ask | unparsed.
+    End-anchored: the LAST line-start occurrence wins; a bare URL elsewhere
+    never counts."""
     text = text or ""
     pr_matches = PR_LINE_RE.findall(text)
     pr_url = pr_matches[-1] if pr_matches else None
 
-    done_positions = [m for m in re.finditer(r"^STAGE_DONE:", text, re.MULTILINE)]
-    fail_positions = [m for m in re.finditer(r"^STAGE_FAIL:", text, re.MULTILINE)]
-    last_done = done_positions[-1].start() if done_positions else -1
-    last_fail = fail_positions[-1].start() if fail_positions else -1
-
-    if last_done == -1 and last_fail == -1:
+    candidates = []
+    for marker, tag in (("done", "STAGE_DONE:"), ("fail", "STAGE_FAIL:"), ("ask", "STAGE_ASK:")):
+        positions = list(re.finditer(rf"^{tag}", text, re.MULTILINE))
+        if positions:
+            candidates.append((positions[-1].start(), marker, tag))
+    if not candidates:
         return "unparsed", text.strip(), pr_url
-    if last_done >= last_fail:
-        payload = text[last_done + len("STAGE_DONE:"):].strip()
-        return "done", payload, pr_url
-    payload = text[last_fail + len("STAGE_FAIL:"):].strip()
-    return "fail", payload, pr_url
+    pos, marker, tag = max(candidates)
+    payload = text[pos + len(tag):].strip()
+    return marker, payload, pr_url
 
 
 def extract_questions_last(analysis: str) -> str:
@@ -126,15 +131,23 @@ class Engine:
         branch = f"brain/feat-{job_id}"
 
         state = self.store.stage_state_get(job_id, stage) or {"attempts": 0, "base_sha": ""}
-        attempt = int(state["attempts"]) + 1
+        # a STAGE_ASK resume continues the SAME attempt — no bump, no rewind
+        resuming = self._resume_intended(job, stage)
+        if resuming:
+            attempt = int(job.get("resume_attempt") or state["attempts"] or 1)
+        else:
+            attempt = int(state["attempts"]) + 1
         run_id = self.store.stage_run_open(job_id, stage, attempt, queued_at)
+        if resuming:
+            self.store.stage_run_mark_resumed(run_id)
         self.store.set_fields(job_id, run_started_at=time.time(), stage_attempts=attempt)
         job["stage_attempts"] = attempt  # keep the local view consistent for _park
         self.store.set_status(job_id, "running")
         await self.clickup.set_status(job.get("clickup_task_id") or "", "running")
 
         try:
-            return await self._run_stage_inner(job, stage, run_id, target, branch, queued_at)
+            return await self._run_stage_inner(job, stage, run_id, target, branch,
+                                               queued_at, resuming)
         except BranchLostError as e:
             self.store.stage_run_close(run_id, "branch_lost")
             self.store.set_status(job_id, "error", detail=str(e))
@@ -146,11 +159,25 @@ class Engine:
             raise
 
     async def _run_stage_inner(self, job: dict, stage: int, run_id: int, target,
-                               branch: str, queued_at: float | None):
+                               branch: str, queued_at: float | None,
+                               resuming: bool = False):
         job_id = job["issue_id"]
         state = self.store.stage_state_get(job_id, stage) or {"attempts": 0, "base_sha": ""}
-        attempt = int(state["attempts"]) + 1
+        attempt = int(job.get("stage_attempts") or int(state["attempts"]) + 1)
         workspace = await prepare_feature_workspace(self.settings, target, branch, stage)
+
+        # STAGE_ASK resume validation happens against the PRE-pull origin head so a
+        # third-party push invalidates, but engine-authored post-park commits
+        # (edit pulls, guidance) never do — they are enumerated in the resume message.
+        resume_reason = ""
+        if resuming:
+            code, oh = await git(workspace, "rev-parse", f"origin/{branch}")
+            if code != 0 or oh.strip() != (job.get("resume_head") or ""):
+                resuming, resume_reason = False, "the branch moved while parked"
+            elif int(job.get("ask_count") or 0) >= self.settings.max_asks_per_stage:
+                resuming, resume_reason = False, "the ask budget for this stage is spent"
+            elif not session_transcript_exists(self.settings, job.get("resume_session_id") or ""):
+                resuming, resume_reason = False, "the session transcript is gone (restart/prune)"
 
         # An explicit redo of THIS code stage rewinds to the stage baseline,
         # preserving the rejected attempt under refs/gumo/. This keys off the
@@ -158,12 +185,12 @@ class Engine:
         # also fires when the pipeline merely re-advances through this stage after
         # an earlier-stage redo, which would hard-reset to a now-stale baseline.
         redo_notes = self._pending_redo_notes(job_id, stage)
-        if (job.get("pending_redo_stage") == stage and stage_kind(stage) == "code"
-                and state.get("base_sha")):
+        if (not resuming and job.get("pending_redo_stage") == stage
+                and stage_kind(stage) == "code" and state.get("base_sha")):
             await git(workspace, "update-ref",
-                      f"refs/gumo/{job_id}/P{stage}-attempt-{attempt - 1}", "HEAD")
+                      f"refs/gumo/{job_id}/P{stage}-attempt-{max(1, attempt - 1)}", "HEAD")
             await git(workspace, "push", "origin",
-                      f"refs/gumo/{job_id}/P{stage}-attempt-{attempt - 1}")
+                      f"refs/gumo/{job_id}/P{stage}-attempt-{max(1, attempt - 1)}")
             await git(workspace, "reset", "--hard", state["base_sha"])
         if job.get("pending_redo_stage") == stage:
             self.store.set_fields(job_id, pending_redo_stage=None)
@@ -176,7 +203,7 @@ class Engine:
         await self._write_guidance_file(workspace, job)
 
         # P6 auto-skips when the (post-pull) plan has a single build group
-        if stage == 6 and not self._plan_has_multiple_groups(workspace, job_id):
+        if stage == 6 and not resuming and not self._plan_has_multiple_groups(workspace, job_id):
             self.store.stage_run_close(run_id, "skipped_single_group")
             self.store.set_fields(job_id, stage=7, stage_attempts=0)
             self.store.set_status(job_id, "queued")
@@ -184,19 +211,43 @@ class Engine:
             await self._comment(job, "P6 auto-skipped — the plan has a single build group. Queued P7.")
             return "requeue"
 
-        code, head = await git(workspace, "rev-parse", "HEAD")
-        base_sha = head.strip() if code == 0 else ""
-        self.store.stage_state_set(job_id, stage, base_sha=base_sha, bump_attempts=True)
+        if resuming:
+            # a resumed run continues the SAME attempt against the SAME baseline
+            base_sha = state.get("base_sha") or ""
+        else:
+            code, head = await git(workspace, "rev-parse", "HEAD")
+            base_sha = head.strip() if code == 0 else ""
+            self.store.stage_state_set(job_id, stage, base_sha=base_sha, bump_attempts=True)
 
-        prompt = await self._build_prompt(job, stage, target, branch, workspace,
-                                          redo_notes, edited)
         kind = stage_kind(stage)
         tools = DOC_STAGE_TOOLS if kind == "doc" else BASE_ALLOWED_TOOLS + target.allow
         timeout = (self.settings.doc_stage_timeout_seconds if kind == "doc"
                    else self.settings.claude_timeout_seconds)
 
-        log.info("job %s: running P%s (%s) attempt %s", job_id, stage, stage_name(stage), attempt)
-        raw = await run_claude_raw(self.settings, workspace, prompt, tools, timeout)
+        ask_answer = (job.get("resume_answer") or "").strip()
+        resume_sid = (job.get("resume_session_id") or "").strip()
+        # consume the pending resume exactly once, whichever path runs
+        if resume_sid or job.get("gate_kind") == "ask":
+            self.store.set_fields(job_id, resume_session_id="", resume_stage=None,
+                                  resume_attempt=None, resume_head="", resume_answer="",
+                                  gate_kind="")
+        if resuming:
+            self.store.set_fields(job_id, ask_count=int(job.get("ask_count") or 0) + 1)
+            prompt = self._resume_message(job, stage, ask_answer, edited)
+            log.info("job %s: resuming P%s session %s", job_id, stage, resume_sid[:8])
+            raw = await self._invoke(workspace, prompt, tools, timeout, resume_session=resume_sid)
+            if raw.status == "session_lost":
+                resuming, resume_reason = False, "the session could not be resumed"
+        if not resuming:
+            if resume_reason and ask_answer:
+                # the human's answer must survive the downgrade to a fresh re-run
+                redo_notes = (f"(Your earlier STAGE_ASK could not resume: {resume_reason}. "
+                              f"Re-run the stage; the human's answer to your question was: "
+                              f"{ask_answer})\n\n{redo_notes}").strip()
+            prompt = await self._build_prompt(job, stage, target, branch, workspace,
+                                              redo_notes, edited)
+            log.info("job %s: running P%s (%s) attempt %s", job_id, stage, stage_name(stage), attempt)
+            raw = await self._invoke(workspace, prompt, tools, timeout)
 
         try:
             await self._after_run(job, stage, run_id, target, branch, workspace, raw, base_sha)
@@ -252,6 +303,15 @@ class Engine:
                              flag="STAGE_FAIL — the stage reports it is blocked",
                              conflicted=conflicted)
             return
+        if marker == "ask":
+            if stage_kind(stage) == "code" and stage != 9:
+                self.store.stage_run_close(run_id, "stage_ask", **self._meta(raw))
+                await self._park(job, stage, run_id, workspace, target, base_sha,
+                                 payload or "(no question given)", pr_url,
+                                 conflicted=conflicted,
+                                 ask_session=raw.meta.get("session_id") or "")
+                return
+            marker = "unparsed"  # doc stages / P9 must not ask — fail closed
         if marker == "unparsed":
             self.store.stage_run_close(run_id, "unparsed", **self._meta(raw))
             await self._park(job, stage, run_id, workspace, target, base_sha,
@@ -263,14 +323,62 @@ class Engine:
         self.store.stage_run_close(run_id, "done", **self._meta(raw))
         if pr_url:
             self.store.set_fields(job_id, pr_url=pr_url)
+
+        # light gate mode: checkpoint stages always park; the rest auto-advance
+        # on a clean STAGE_DONE unless a guard trips (docs/CONVERSATIONS.md §1)
+        if self._auto_advance_ok(job, stage, payload, pr_url, conflicted):
+            self.store.guidance_add(job_id, stage, "auto",
+                                    "auto-advanced (light gate mode)", "engine")
+            evidence = await self._evidence(workspace, target, base_sha, stage, pr_url)
+            await self._comment(
+                job, f"P{stage} ({stage_name(stage)}) complete — auto-advanced "
+                     f"(light gate mode).\n\n{payload[:3000]}{evidence}")
+            self.store.set_fields(job_id, stage=stage + 1, stage_attempts=0, question="")
+            self.store.set_status(job_id, "queued")
+            log.info("job %s: P%s auto-advanced (light mode)", job_id, stage)
+            return "requeue"
+
         await self._park(job, stage, run_id, workspace, target, base_sha,
                          payload, pr_url, conflicted=conflicted)
 
+    # light mode parks unconditionally at P0/P1/P3/P9; other stages may advance
+    LIGHT_MODE_AUTO_STAGES = {2, 4, 5, 6, 7, 8}
+    BOILERPLATE_Q_RE = re.compile(r"approve|continue|proceed|look good|lgtm", re.IGNORECASE)
+
+    def _auto_advance_ok(self, job, stage, payload, pr_url, conflicted) -> bool:
+        if (job.get("gate_mode") or "full") != "light":
+            return False
+        if stage not in self.LIGHT_MODE_AUTO_STAGES:
+            return False
+        if conflicted:  # a human edited mid-run — they must see the warning
+            return False
+        if not job.get("mirror_ok", 1):
+            return False
+        if stage == 5 and not (pr_url or job.get("pr_url")):
+            return False  # P5 without a captured draft PR must park
+        # the first clean run after an explicit /redo of this stage must park
+        for e in reversed(self.store.guidance_for(job["issue_id"])):
+            if e["stage"] == stage and e["action"] in ("redo", "proceed", "auto"):
+                if e["action"] == "redo":
+                    return False
+                break
+        # only a boilerplate approval question may auto-advance
+        questions = extract_questions_last(payload)
+        items = [l.strip() for l in questions.splitlines()
+                 if re.match(r"^\d+[.)]", l.strip())]
+        if len(items) > 1:
+            return False
+        probe = items[0] if items else questions.strip()
+        return bool(len(probe) <= 160 and self.BOILERPLATE_Q_RE.search(probe))
+
     async def _park(self, job, stage, run_id, workspace, target, base_sha,
-                    payload, pr_url, flag: str = "", conflicted: list[str] | None = None):
+                    payload, pr_url, flag: str = "", conflicted: list[str] | None = None,
+                    ask_session: str = ""):
         """Gate-park, crash-safe ordering: DB transition (with marker) BEFORE the
-        ClickUp comment; the poller only reacts to /verb comments so ours are inert."""
+        ClickUp comment; the poller only reacts to /verb comments so ours are inert.
+        ask_session marks a STAGE_ASK gate: the answer resumes that session in place."""
         job_id = job["issue_id"]
+        is_ask = bool(ask_session)
         evidence = await self._evidence(workspace, target, base_sha, stage, pr_url)
         warnings = ""
         if flag:
@@ -281,31 +389,49 @@ class Engine:
         attempts = int(job.get("stage_attempts") or 0)
         if attempts >= 3:
             warnings += f"\n\n⚠️ This stage has been redone {attempts} times."
+        if is_ask and int(job.get("ask_count") or 0) + 1 >= self.settings.max_asks_per_stage:
+            warnings += ("\n\n⚠️ This stage keeps asking — consider `/redo` with clearer "
+                         "guidance or a sharper plan.")
 
         question = extract_questions_last(payload)
         comments = await self.clickup.comments(job.get("clickup_task_id") or "")
         marker = comments[-1]["id"] if comments else ""
         code, head = await git(workspace, "rev-parse", "HEAD")
-        self.store.set_fields(
-            job_id,
+        head = head.strip() if code == 0 else ""
+        fields = dict(
             analysis=payload,
             question=question,
             evidence=(evidence + warnings).strip(),
             comment_marker=marker,
-            parked_head=head.strip() if code == 0 else "",
+            parked_head=head,
         )
+        if is_ask:
+            # resume state and the ask flag land in the SAME update, before the
+            # ClickUp comment — a crash in between leaves a fully answerable gate
+            fields.update(gate_kind="ask", resume_session_id=ask_session,
+                          resume_stage=stage, resume_attempt=attempts or 1,
+                          resume_head=head, resume_answer="")
+            self.store.guidance_add(job_id, stage, "ask", question[:1500], "engine", head)
+        self.store.set_fields(job_id, **fields)
         self.store.set_status(job_id, "awaiting_input", detail=payload[:2000])
         self.store.stage_run_gate_posted(run_id)
         await self.clickup.set_status(job.get("clickup_task_id") or "", "awaiting_input")
 
+        if is_ask:
+            header = f"**Question: P{stage} {stage_name(stage)} — work paused, resumes in place.**"
+            actions = (f"Reply `/proceed <your answer>` — the stage picks up exactly where it "
+                       f"stopped. `/redo <notes>` restarts the stage fresh; `/skip` aborts. "
+                       f"Here, on any artifact subtask, or on the dashboard.")
+        else:
+            header = (f"**Gate: P{stage} {stage_name(stage)} — "
+                      f"{'attempt ' + str(job.get('stage_attempts')) if int(job.get('stage_attempts') or 0) > 1 else 'complete'}.**")
+            actions = (f"Reply `/proceed <guidance>` to continue to P{min(stage + 1, 9)}, "
+                       f"`/redo <notes>` to re-run this stage (or `/redo P<k> <notes>` for an earlier one), "
+                       f"or `/skip` to abort — here, on any artifact subtask, or on the dashboard.")
         gate_body = (
-            f"{GATE_PREFIX} **Gate: P{stage} {stage_name(stage)} — "
-            f"{'attempt ' + str(job.get('stage_attempts')) if int(job.get('stage_attempts') or 0) > 1 else 'complete'}.**\n\n"
+            f"{GATE_PREFIX} {header}\n\n"
             f"{payload[:6000]}\n"
-            f"{evidence}{warnings}\n\n---\n"
-            f"Reply `/proceed <guidance>` to continue to P{min(stage + 1, 9)}, "
-            f"`/redo <notes>` to re-run this stage (or `/redo P<k> <notes>` for an earlier one), "
-            f"or `/skip` to abort — here, on any artifact subtask, or on the dashboard."
+            f"{evidence}{warnings}\n\n---\n{actions}"
         )
         await self._comment(job, gate_body, raw=True)
         owner = (job.get("owner") or "").strip()
@@ -369,6 +495,63 @@ class Engine:
         entries = [e for e in self.store.guidance_for(job_id)
                    if e["action"] == "redo" and e["stage"] == stage]
         return entries[-1]["text"] if entries else ""
+
+    async def _invoke(self, workspace, prompt, tools, timeout,
+                      resume_session: str | None = None, fork_session: bool = False,
+                      config_dir: str | None = None):
+        """All stage/session claude invocations funnel here: the engine owns the
+        session id on fresh runs (timeout/error runs still have a resumable id on
+        record), and invocations sharing the session store serialize globally."""
+        sid = None
+        if resume_session is None and self.settings.session_persistence:
+            sid = str(uuid.uuid4())
+        if self.settings.session_persistence and config_dir is None:
+            async with self.locks.claude_global:
+                return await run_claude_raw(self.settings, workspace, prompt, tools, timeout,
+                                            resume_session=resume_session,
+                                            fork_session=fork_session, session_id=sid)
+        return await run_claude_raw(self.settings, workspace, prompt, tools, timeout,
+                                    resume_session=resume_session,
+                                    fork_session=fork_session, session_id=sid,
+                                    config_dir=config_dir)
+
+    def _resume_intended(self, job: dict, stage: int) -> bool:
+        """A pending STAGE_ASK resume exists for exactly this gate (head/budget/
+        transcript validation happens later, in the workspace)."""
+        return bool(job.get("gate_kind") == "ask"
+                    and (job.get("resume_session_id") or "").strip()
+                    and job.get("resume_stage") == stage
+                    and (job.get("resume_answer") or "").strip())
+
+    def _resume_message(self, job: dict, stage: int, answer: str, edited: list[str]) -> str:
+        parts = [
+            f"The human answered your STAGE_ASK question at the P{stage} gate:",
+            "",
+            answer,
+        ]
+        chat = self.store.chat_for(job["issue_id"], stage)
+        if chat:
+            lines, total = [], 0
+            for t in chat:
+                line = f"{'Reviewer' if t['role'] == 'human' else 'Engine'}: {(t['text'] or '').strip()[:600]}"
+                if total + len(line) > 3000:
+                    break
+                lines.append(line)
+                total += len(line)
+            parts += ["", "While parked, this conversation happened at the gate "
+                          "(a read-only copy of you answered — treat it as context):",
+                      *lines]
+        if edited:
+            parts += ["", "While parked, humans edited these artifacts (authoritative, "
+                          "already committed): " + ", ".join(f"`{a}`" for a in edited)]
+        parts += ["", "NOTE: other runs may have used this workspace while you were parked. "
+                      "Tracked files match your branch, but ignored files (node_modules, "
+                      "build outputs, caches) may have changed — re-run installs/builds "
+                      "before trusting earlier test results.",
+                  "", "Continue the stage exactly where you stopped. The output protocol "
+                      "is unchanged: end with STAGE_DONE:, STAGE_FAIL:, or (if another "
+                      "human decision surfaces) STAGE_ASK:."]
+        return "\n".join(parts)
 
     async def _write_guidance_file(self, workspace, job):
         """Mirror the guidance log into git — decisions belong to the branch."""
@@ -503,17 +686,45 @@ class Engine:
                     text = p.read_text().strip()
                     inline[name] = text[:6000] + ("\n… (truncated — read the file)" if len(text) > 6000 else "")
 
-            prompt = build_chat_prompt(
-                target=target, branch=branch, job=job, stage=stage, message=message,
-                transcript=self.store.chat_for(job_id, stage)[:-1],  # exclude the turn being answered
-                inline_artifacts=inline,
-            )
-            raw = await run_claude_raw(
-                self.settings, workspace, prompt,
-                allowed_tools=CHAT_TOOLS,
-                timeout=self.settings.chat_timeout_seconds,
-                disallowed_tools=CHAT_DENIED_TOOLS,
-            )
+            # Chat mode by gate class (docs/CONVERSATIONS.md §1): code gates fork the
+            # stage session when possible — its memory of the exploration and test
+            # output is the value there; everything else is artifact-primed (cheap).
+            resume_sid, fork_new = self._chat_session_for(job, stage)
+            if resume_sid:
+                prompt = (
+                    f"PAUSE — you are at the P{stage} gate of this stage run, in READ-ONLY "
+                    f"mode, answering the human reviewer's question below. This is a copy of "
+                    f"your session: the working session will only see the reviewer's final "
+                    f"Answer plus this conversation's transcript. Do NOT modify, create or "
+                    f"delete anything. Answer directly and concisely (under 250 words unless "
+                    f"the question demands more); cite files when referencing code; if an "
+                    f"honest answer requires changing the work, say so and recommend /redo "
+                    f"with concrete notes.\n\nThe reviewer asks:\n\n{message.strip()[:4000]}"
+                )
+                async with self.locks.claude_global:  # shares the session store
+                    raw = await run_claude_raw(
+                        self.settings, workspace, prompt,
+                        allowed_tools=CHAT_TOOLS,
+                        timeout=self.settings.chat_timeout_seconds,
+                        disallowed_tools=CHAT_DENIED_TOOLS,
+                        resume_session=resume_sid, fork_session=fork_new,
+                    )
+                if raw.status == "session_lost":
+                    resume_sid = None  # fall through to artifact-primed below
+            if not resume_sid:
+                prompt = build_chat_prompt(
+                    target=target, branch=branch, job=job, stage=stage, message=message,
+                    transcript=self.store.chat_for(job_id, stage)[:-1],  # exclude the turn being answered
+                    inline_artifacts=inline,
+                )
+                raw = await run_claude_raw(
+                    self.settings, workspace, prompt,
+                    allowed_tools=CHAT_TOOLS,
+                    timeout=self.settings.chat_timeout_seconds,
+                    disallowed_tools=CHAT_DENIED_TOOLS,
+                    config_dir=(self.settings.claude_chat_config_dir
+                                if self.settings.session_persistence else None),
+                )
             # hygiene: a chat run must never leave residue for _checkpoint to commit
             code, status = await git(workspace, "status", "--porcelain")
             dirty = code == 0 and bool(status.strip())
@@ -528,6 +739,25 @@ class Engine:
         if dirty:
             reply += "\n\n_(note: the chat attempted writes; they were discarded)_"
         return reply, self._meta(raw), False
+
+    def _chat_session_for(self, job: dict, stage: int) -> tuple[str | None, bool]:
+        """(session_to_resume, fork_new): continue this gate's existing chat
+        session, else fork the stage session — chat sessions are keyed by
+        (job, stage, attempt) via the gate_chat rows, never a bare jobs column
+        (a stale fork must never answer a later gate's questions)."""
+        if stage_kind(stage) != "code" or not self.settings.session_persistence:
+            return None, False
+        attempt = int(job.get("stage_attempts") or 1)
+        for t in reversed(self.store.chat_for(job["issue_id"], stage)):
+            if (t["role"] == "engine" and t.get("session_id") and not t.get("degraded")
+                    and int(t.get("attempt") or 0) == attempt
+                    and session_transcript_exists(self.settings, t["session_id"])):
+                return t["session_id"], False  # continue the gate's chat session
+        runs = [r for r in self.store.stage_runs_for(job["issue_id"])
+                if r["stage"] == stage and r.get("session_id")]
+        if runs and session_transcript_exists(self.settings, runs[-1]["session_id"]):
+            return runs[-1]["session_id"], True  # first message: fork the stage session
+        return None, False
 
     # ---------- memory bootstrap (kind=memory) ----------
 
@@ -549,9 +779,9 @@ class Engine:
             run_id = self.store.stage_run_open(job_id, stage=run, attempt=1)
             prompt = build_bootstrap_prompt(target=target, branch=branch, project=project,
                                             is_canonical=is_canonical, run=run)
-            raw = await run_claude_raw(self.settings, workspace, prompt,
-                                       BASE_ALLOWED_TOOLS + target.allow,
-                                       self.settings.claude_timeout_seconds)
+            raw = await self._invoke(workspace, prompt,
+                                     BASE_ALLOWED_TOOLS + target.allow,
+                                     self.settings.claude_timeout_seconds)
             await self._checkpoint(workspace, branch, job_id, stage=0)
             if raw.status != "ok":
                 self.store.stage_run_close(run_id, raw.status, **self._meta(raw))

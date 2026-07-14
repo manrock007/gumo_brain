@@ -17,6 +17,7 @@ from .config import get_settings
 from .dashboard import DASHBOARD_HTML
 from .db import JobStore
 from .feature_prompts import stage_name
+from .fixer import ensure_session_store
 from .memory import MemoryReader
 from .sentry_api import extract_issue_ref, verify_signature
 from .worker import GateConflict, Worker
@@ -49,6 +50,8 @@ def require_auth(credentials: HTTPBasicCredentials = Depends(basic)):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Path(settings.data_dir).mkdir(parents=True, exist_ok=True)
+    if settings.session_persistence:
+        ensure_session_store(settings)
     store = JobStore(settings.db_path)
     worker = Worker(settings, store)
     tasks = [
@@ -56,6 +59,7 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(worker.poll_clickup_forever()),
         asyncio.create_task(worker.sweep_forever()),
         asyncio.create_task(worker.reap_forever()),
+        asyncio.create_task(worker.prune_sessions_forever()),
     ]
     app.state.store = store
     app.state.worker = worker
@@ -152,6 +156,7 @@ class SubmitBody(BaseModel):
     summary: str | None = None
     owner: str | None = None       # features: ClickUp user id for gate notifications
     related_to: str | None = None  # features: sibling pipeline job id(s), comma-separated
+    gate_mode: str | None = None   # features: 'full' (default) | 'light' (checkpoints + guards)
 
 
 async def _prepare_ticket(worker: Worker, body: SubmitBody, prefix: str,
@@ -243,6 +248,7 @@ async def submit_feature(body: SubmitBody):
         clickup_task_id=t["task_id"], clickup_task_url=t["task_url"],
         cu_list_id=t["list_id"], owner=(body.owner or "").strip(),
         related_jobs=(body.related_to or "").strip(),
+        gate_mode=(body.gate_mode or "").strip().lower(),
     )
     if "queued" not in decision:
         raise HTTPException(status_code=409, detail=decision)

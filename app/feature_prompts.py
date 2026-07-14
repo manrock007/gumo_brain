@@ -47,10 +47,18 @@ End your final message with exactly one of:
   you need from the human (minimum: "1. Approve and continue to the next stage?").
   Make each question answerable in one line.
 - `STAGE_FAIL:` followed by 2-3 sentences on why this stage cannot be completed
-  (missing information, out of scope, blocked) and what would unblock it.
+  (missing information, out of scope, blocked) and what would unblock it.{ask_clause}
 
 Nothing advances without one of these markers — an unmarked output parks the
 pipeline for human triage."""
+
+ASK_CLAUSE = """
+- `STAGE_ASK:` when you hit a decision mid-work that the plan doesn't settle and
+  only the human can make (product behaviour, data semantics, a trade-off with
+  no clear winner). COMMIT what you have first, then print `STAGE_ASK:` followed
+  by 2-4 sentences of context and a `## Questions` section with the specific
+  question(s). Do NOT guess, and do NOT use STAGE_FAIL for askable questions —
+  after the human answers, your session resumes right where you stopped."""
 
 
 def _guidance_block(guidance_entries: list[dict], current_stage: int) -> str:
@@ -247,7 +255,8 @@ binding:
 {task_header}
 
 {contract}
-{OUTPUT_PROTOCOL.format(payload_desc=payload_desc)}
+{OUTPUT_PROTOCOL.format(payload_desc=payload_desc,
+                        ask_clause=ASK_CLAUSE if kind == "code" and stage != 9 else "")}
 """
 
 

@@ -34,6 +34,10 @@ CREATE TABLE IF NOT EXISTS jobs (
     pending_redo_stage INTEGER,      -- set by a redo answer; consumed (reset) by the next run
     resume_session_id TEXT DEFAULT '',  -- STAGE_ASK: session to resume when answered
     resume_stage INTEGER,               -- STAGE_ASK: stage the pending resume belongs to
+    resume_attempt INTEGER,             -- STAGE_ASK: attempt the resume continues (no bump)
+    resume_head TEXT DEFAULT '',        -- STAGE_ASK: origin head at park (validation)
+    resume_answer TEXT DEFAULT '',      -- STAGE_ASK: the human's answer, written by the CAS
+    gate_kind TEXT DEFAULT '',          -- '' = normal gate | 'ask' = STAGE_ASK question
     ask_count INTEGER NOT NULL DEFAULT 0,  -- resumes consumed by the current stage attempt
     gate_mode TEXT NOT NULL DEFAULT 'full',  -- full = every stage parks | light = checkpoints
     pr_url TEXT,
@@ -124,6 +128,10 @@ MIGRATIONS = {  # table -> columns added after that table first shipped (in-plac
         "pending_redo_stage": "INTEGER",
         "resume_session_id": "TEXT DEFAULT ''",
         "resume_stage": "INTEGER",
+        "resume_attempt": "INTEGER",
+        "resume_head": "TEXT DEFAULT ''",
+        "resume_answer": "TEXT DEFAULT ''",
+        "gate_kind": "TEXT DEFAULT ''",
         "ask_count": "INTEGER NOT NULL DEFAULT 0",
         "gate_mode": "TEXT NOT NULL DEFAULT 'full'",
     },
