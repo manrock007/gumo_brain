@@ -138,8 +138,9 @@ class Engine:
         else:
             attempt = int(state["attempts"]) + 1
         run_id = self.store.stage_run_open(job_id, stage, attempt, queued_at)
-        if resuming:
-            self.store.stage_run_mark_resumed(run_id)
+        # NOTE: resumed=1 is stamped by the inner run only once the resume
+        # invocation actually succeeds — an intended resume can still downgrade
+        # to a fresh run (head moved, budget spent, transcript pruned)
         self.store.set_fields(job_id, run_started_at=time.time(), stage_attempts=attempt)
         job["stage_attempts"] = attempt  # keep the local view consistent for _park
         self.store.set_status(job_id, "running")
@@ -238,6 +239,9 @@ class Engine:
             raw = await self._invoke(workspace, prompt, tools, timeout, resume_session=resume_sid)
             if raw.status == "session_lost":
                 resuming, resume_reason = False, "the session could not be resumed"
+            else:
+                # only now is this run truly a continuation of the parked session
+                self.store.stage_run_mark_resumed(run_id)
         if not resuming:
             if resume_reason and ask_answer:
                 # the human's answer must survive the downgrade to a fresh re-run
