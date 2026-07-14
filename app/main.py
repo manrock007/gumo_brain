@@ -15,8 +15,10 @@ from pydantic import BaseModel
 from .config import get_settings
 from .dashboard import DASHBOARD_HTML
 from .db import JobStore
+from .feature_prompts import stage_name
+from .memory import MemoryReader
 from .sentry_api import extract_issue_ref, verify_signature
-from .worker import Worker
+from .worker import GateConflict, Worker
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 log = logging.getLogger("brain")
@@ -52,6 +54,7 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(worker.run_forever()),
         asyncio.create_task(worker.poll_clickup_forever()),
         asyncio.create_task(worker.sweep_forever()),
+        asyncio.create_task(worker.reap_forever()),
     ]
     app.state.store = store
     app.state.worker = worker
@@ -75,7 +78,11 @@ async def dashboard():
 
 @app.get("/api/jobs", dependencies=[Depends(require_auth)])
 async def jobs():
-    return app.state.store.recent()
+    rows = app.state.store.recent()
+    for r in rows:
+        if r.get("kind") == "feature":
+            r["stage_name"] = stage_name(int(r.get("stage") or 0))
+    return rows
 
 
 class TriggerBody(BaseModel):
@@ -137,18 +144,18 @@ async def projects():
     return [{"slug": slug, "repo": entry.get("repo", "")} for slug, entry in sorted(mapping.items())]
 
 
-class TaskBody(BaseModel):
+class SubmitBody(BaseModel):
     project: str
     clickup: str | None = None  # ClickUp task URL or id — adopt an existing ticket
     title: str | None = None    # ... or create a new ticket from title + summary
     summary: str | None = None
+    owner: str | None = None       # features: ClickUp user id for gate notifications
+    related_to: str | None = None  # features: sibling pipeline job id(s), comma-separated
 
 
-@app.post("/api/tasks", dependencies=[Depends(require_auth)])
-async def submit_task(body: TaskBody):
-    """Manually reported request (bug fix / change request). The ClickUp ticket —
-    adopted from a pasted URL or created from title+summary — is the record of work."""
-    worker: Worker = app.state.worker
+async def _prepare_ticket(worker: Worker, body: SubmitBody, prefix: str,
+                          intro: str) -> dict:
+    """Adopt a pasted ClickUp ticket or create one; shared by tasks + features."""
     project = body.project.strip()
     if settings.repo_for_project(project) is None:
         raise HTTPException(status_code=400, detail=f"unknown project '{project}'")
@@ -162,80 +169,153 @@ async def submit_task(body: TaskBody):
         else:
             raise HTTPException(status_code=400, detail=f"could not parse a ClickUp task from '{ref}'")
         cu_task = await worker.clickup.get_task(cu_id)
-        if cu_task is None:
+        if cu_task is None or cu_task.get("missing"):
             raise HTTPException(
                 status_code=404,
                 detail=f"ClickUp task '{cu_id}' not found (or ClickUp integration disabled)",
             )
-        title = cu_task["name"] or "untitled request"
-        request_text = cu_task["description"] or title
-        job_id = f"task-{cu_task['id']}"
-        task_id, task_url = cu_task["id"], cu_task["url"]
-        picked_up_note = (
-            "gumo_brain picked this up. I'll analyse the code first and post my plan + "
-            "questions here — reply `/proceed <guidance>` or `/skip`, or answer on the dashboard."
-        )
-    else:
-        title = (body.title or "").strip()
-        summary = (body.summary or "").strip()
-        if not title:
-            raise HTTPException(status_code=400, detail="provide a ClickUp URL, or a title")
-        request_text = summary or title
-        created = await worker.clickup.create_task(
-            name=f"[{project}] {title}",
-            description=(
-                f"**Manual request via gumo_brain dashboard**\n**Project:** {project}\n\n"
-                f"{request_text}\n\n"
-                "_Claude analyses first and posts its plan + questions below. Reply "
-                "`/proceed <guidance>` or `/skip`, or answer on the dashboard._"
-            ),
-        )
-        if created:
-            task_id, task_url = created
-            job_id = f"task-{task_id}"
-        else:  # ClickUp outage degrades tracking, never fixing
-            task_id, task_url = None, None
-            job_id = f"task-{uuid.uuid4().hex[:10]}"
-        picked_up_note = None
+        return {
+            "project": project,
+            "job_id": f"{prefix}-{cu_task['id']}",
+            "title": cu_task["name"] or "untitled",
+            "request": cu_task["description"] or cu_task["name"],
+            "task_id": cu_task["id"],
+            "task_url": cu_task["url"],
+            "list_id": cu_task.get("list_id") or "",
+            "adopted": True,
+        }
 
-    decision = worker.intake_task(
-        job_id, title=title, project=project, request=request_text,
-        clickup_task_id=task_id, clickup_task_url=task_url,
+    title = (body.title or "").strip()
+    summary = (body.summary or "").strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="provide a ClickUp URL, or a title")
+    request_text = summary or title
+    created = await worker.clickup.create_task(
+        name=f"[{project}] {title}",
+        description=(
+            f"{intro}\n**Project:** {project}\n\n{request_text}\n\n"
+            "_Reply `/proceed <guidance>`, `/redo <notes>` or `/skip` to gate comments, "
+            "or answer on the dashboard._"
+        ),
     )
-    if "queued" not in decision:
-        raise HTTPException(status_code=409, detail=decision)
-    if ref and picked_up_note:
-        await worker.clickup.comment(task_id or "", picked_up_note)
-
+    if created:
+        task_id, task_url = created
+        job_id = f"{prefix}-{task_id}"
+        list_id = settings.clickup_list_id
+    else:  # ClickUp outage degrades tracking, never fixing
+        task_id, task_url, list_id = None, None, ""
+        job_id = f"{prefix}-{uuid.uuid4().hex[:10]}"
     return {
-        "job_id": job_id,
-        "title": title,
-        "project": project,
-        "decision": decision,
-        "clickup_task_url": task_url,
+        "project": project, "job_id": job_id, "title": title, "request": request_text,
+        "task_id": task_id, "task_url": task_url, "list_id": list_id or "", "adopted": False,
     }
 
 
+@app.post("/api/tasks", dependencies=[Depends(require_auth)])
+async def submit_task(body: SubmitBody):
+    """Manually reported request (bug fix / change request) — 2-phase HITL flow."""
+    worker: Worker = app.state.worker
+    t = await _prepare_ticket(worker, body, "task", "**Manual request via gumo_brain dashboard**")
+    decision = worker.intake_task(
+        t["job_id"], title=t["title"], project=t["project"], request=t["request"],
+        clickup_task_id=t["task_id"], clickup_task_url=t["task_url"],
+    )
+    if "queued" not in decision:
+        raise HTTPException(status_code=409, detail=decision)
+    if t["adopted"]:
+        await worker.clickup.comment(
+            t["task_id"] or "",
+            "gumo_brain picked this up. I'll analyse the code first and post my plan + "
+            "questions here — reply `/proceed <guidance>` or `/skip`, or answer on the dashboard.",
+        )
+    return {"job_id": t["job_id"], "title": t["title"], "project": t["project"],
+            "decision": decision, "clickup_task_url": t["task_url"]}
+
+
+@app.post("/api/features", dependencies=[Depends(require_auth)])
+async def submit_feature(body: SubmitBody):
+    """Feature pipeline: P0-P9 with a human gate after every stage (docs/ENGINE.md)."""
+    worker: Worker = app.state.worker
+    t = await _prepare_ticket(worker, body, "feat", "**Feature pipeline via gumo_brain**")
+    decision = worker.intake_feature(
+        t["job_id"], title=t["title"], project=t["project"], request=t["request"],
+        clickup_task_id=t["task_id"], clickup_task_url=t["task_url"],
+        cu_list_id=t["list_id"], owner=(body.owner or "").strip(),
+        related_jobs=(body.related_to or "").strip(),
+    )
+    if "queued" not in decision:
+        raise HTTPException(status_code=409, detail=decision)
+    if t["adopted"]:
+        await worker.clickup.comment(
+            t["task_id"] or "",
+            "gumo_brain adopted this ticket as a FEATURE PIPELINE (P0 Intake → P9 Ship). "
+            "Each stage posts its artifact as a subtask you can edit directly; every stage "
+            "parks here for your `/proceed`, `/redo` or `/skip` (or answer on the dashboard).",
+        )
+    return {"job_id": t["job_id"], "title": t["title"], "project": t["project"],
+            "decision": decision, "clickup_task_url": t["task_url"]}
+
+
 class AnswerBody(BaseModel):
-    action: str  # proceed | skip
+    action: str  # proceed | redo | skip
     answer: str = ""
 
 
 @app.post("/api/jobs/{job_id}/answer", dependencies=[Depends(require_auth)])
 async def answer_job(job_id: str, body: AnswerBody):
-    """Answer an awaiting_input job from the dashboard. The decision is posted to the
-    ClickUp ticket (keeper of record) before the job advances."""
+    """Answer a parked gate from the dashboard. The decision is recorded on the
+    ClickUp ticket; a lost race against a ClickUp comment answer returns 409."""
     action = body.action.strip().lower()
-    if action not in ("proceed", "skip"):
-        raise HTTPException(status_code=400, detail="action must be 'proceed' or 'skip'")
+    if action not in ("proceed", "redo", "skip"):
+        raise HTTPException(status_code=400, detail="action must be 'proceed', 'redo' or 'skip'")
     worker: Worker = app.state.worker
     try:
-        status = await worker.resolve_awaiting(job_id, action, body.answer.strip())
+        status = await worker.answer_job(job_id, action, body.answer.strip(), via="dashboard")
     except KeyError:
         raise HTTPException(status_code=404, detail=f"unknown job '{job_id}'")
     except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e))
+    except GateConflict:
+        raise HTTPException(status_code=409, detail="already answered via ClickUp")
     return {"job_id": job_id, "status": status}
+
+
+@app.get("/api/features/{job_id}/stats", dependencies=[Depends(require_auth)])
+async def feature_stats(job_id: str):
+    """Per-stage telemetry — the receipts behind the 10x claim."""
+    store: JobStore = app.state.store
+    if store.get(job_id) is None:
+        raise HTTPException(status_code=404, detail=f"unknown job '{job_id}'")
+    return {
+        "runs": store.stage_runs_for(job_id),
+        "guidance": store.guidance_for(job_id),
+        "artifacts": store.artifacts_for(job_id),
+    }
+
+
+@app.get("/api/memory", dependencies=[Depends(require_auth)])
+async def memory_index():
+    reader = MemoryReader(settings)
+    mapping = json.loads(settings.repo_map)
+    return {slug: reader.cached(slug).get("meta", {}) | {
+        "exists": reader.cached(slug)["exists"]} for slug in sorted(mapping)}
+
+
+@app.get("/api/memory/{project}", dependencies=[Depends(require_auth)])
+async def memory_project(project: str):
+    if settings.repo_for_project(project) is None:
+        raise HTTPException(status_code=404, detail=f"unknown project '{project}'")
+    return MemoryReader(settings).cached(project)
+
+
+@app.post("/api/memory/{project}/bootstrap", dependencies=[Depends(require_auth)])
+async def memory_bootstrap(project: str):
+    if settings.repo_for_project(project) is None:
+        raise HTTPException(status_code=404, detail=f"unknown project '{project}'")
+    decision = app.state.worker.intake_memory(project)
+    if "queued" not in decision:
+        raise HTTPException(status_code=409, detail=decision)
+    return {"project": project, "decision": decision}
 
 
 @app.post("/webhooks/sentry")

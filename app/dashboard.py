@@ -1,7 +1,14 @@
-"""Single-file dashboard: intake (Sentry issue or manual request) + job queue.
+"""Single-file dashboard for gumo_brain v2 — the Gumo Engine (docs/ENGINE.md §6).
 
-Awaiting-input jobs surface Claude's questions inline; answers are posted back to
-the ClickUp ticket (keeper of record) and advance the job to phase 2.
+Three intake panels (Sentry fix / request / feature pipeline P0-P9), a Product
+brain panel (per-repo memory freshness + bootstrap), and the four-column job
+queue. Feature cards carry a P0-P9 stage strip, a lazy per-stage stats table,
+and gates with Proceed / Redo / Skip. Typed gate answers survive re-renders
+(in-memory snapshot + localStorage drafts keyed `gb-draft-<job_id>`).
+
+NOTE: this module is one big Python string. It deliberately contains NO
+backslashes — JS regexes are built with `new RegExp` + `String.fromCharCode`
+— so Python escape handling can never mangle the emitted HTML/JS.
 """
 
 DASHBOARD_HTML = """<!doctype html>
@@ -35,20 +42,38 @@ DASHBOARD_HTML = """<!doctype html>
   .badge.pr_opened { background:var(--ok); } .badge.awaiting_input { background:var(--warn); }
   .badge.error,.badge.timeout { background:var(--err); }
   .badge.kind { background:transparent; color:var(--muted); border:1px solid var(--line); }
+  .chip { display:inline-block; font-size:11px; padding:0 8px; border-radius:99px; background:var(--warn); color:#fff; margin-left:8px; }
   .empty { color:var(--muted); font-size:13px; }
   .q { white-space:pre-wrap; font-size:13px; background:var(--bg); border:1px solid var(--line); border-radius:8px; padding:8px 10px; margin-top:8px; max-height:180px; overflow:auto; }
   details { margin-top:6px; font-size:12px; }
   details summary { cursor:pointer; color:var(--muted); }
-  details pre { white-space:pre-wrap; font:12px/1.5 ui-monospace,monospace; background:var(--bg); border:1px solid var(--line); border-radius:8px; padding:8px 10px; max-height:320px; overflow:auto; }
+  details pre { white-space:pre-wrap; overflow-wrap:anywhere; font:12px/1.5 ui-monospace,monospace; background:var(--bg); border:1px solid var(--line); border-radius:8px; padding:8px 10px; max-height:320px; overflow:auto; }
+  .strip { display:flex; gap:2px; margin-top:8px; }
+  .seg { flex:1; text-align:center; font-size:9px; line-height:15px; border-radius:3px; border:1px solid var(--line); color:var(--muted); }
+  .seg.done { background:var(--accent); border-color:var(--accent); color:#fff; opacity:.55; }
+  .seg.cur { background:var(--accent); border-color:var(--accent); color:#fff; animation:pulse 1.4s ease-in-out infinite; }
+  .seg.cur.still { animation:none; }
+  @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:.4; } }
+  .stagetext { font-size:12px; color:var(--muted); margin-top:2px; }
   .answer textarea { width:100%; margin-top:8px; padding:6px 10px; border:1px solid var(--line); border-radius:8px; background:var(--bg); color:var(--fg); font:inherit; font-size:13px; resize:vertical; min-height:44px; }
   .answer .btns { display:flex; gap:8px; margin-top:6px; }
   .answer button { flex:1; padding:6px 0; border:0; border-radius:8px; cursor:pointer; font:inherit; font-size:13px; color:#fff; }
   .answer button.go { background:var(--ok); } .answer button.no { background:var(--err); }
+  .answer button.redo { background:var(--warn); }
   .answer button:disabled { opacity:.5; }
+  .answer .hint { margin:4px 0 0; }
+  .brain { margin:0 0 24px; }
+  .brain > summary { cursor:pointer; font-size:13px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); }
+  .brain table, .stats-body table { border-collapse:collapse; font-size:12px; margin-top:8px; }
+  .brain th, .brain td, .stats-body th, .stats-body td { border:1px solid var(--line); padding:3px 8px; text-align:left; }
+  .brain th, .stats-body th { color:var(--muted); font-weight:600; }
+  .brain button { padding:3px 10px; border:0; border-radius:6px; background:var(--accent); color:#fff; cursor:pointer; font:inherit; font-size:12px; }
+  .brain button:disabled { opacity:.5; }
+  .ok-t { color:var(--ok); } .err-t { color:var(--err); }
 </style>
 </head>
 <body>
-<h1>gumo_brain <small>Sentry + requests &rarr; Claude autofix</small></h1>
+<h1>gumo_brain <small>the Gumo Engine &mdash; Sentry fixes, requests &amp; feature pipelines</small></h1>
 <div id="msg"></div>
 
 <div class="intake">
@@ -71,7 +96,26 @@ DASHBOARD_HTML = """<!doctype html>
       <button id="task-go">Submit</button>
     </form>
   </div>
+  <div class="panel">
+    <h2>Feature pipeline (P0&ndash;P9)</h2>
+    <form onsubmit="return submitFeature(event)">
+      <select id="feat-project" required></select>
+      <input id="feat-clickup" placeholder="ClickUp task URL (optional — adopts that ticket)">
+      <div class="hint">&hellip;or describe the feature and a ClickUp ticket is created:</div>
+      <input id="feat-title" placeholder="Title">
+      <textarea id="feat-summary" placeholder="What should be built? Goal, users, constraints, links&hellip;"></textarea>
+      <input id="feat-owner" placeholder="Owner — ClickUp user id (optional, gets gate notifications)">
+      <input id="feat-related" placeholder="Related pipeline job id(s) (optional, comma-separated)">
+      <div class="hint">P0 Intake &rarr; P9 Ship; every stage parks below (and on ClickUp) for your Proceed / Redo / Skip.</div>
+      <button id="feat-go">Start pipeline</button>
+    </form>
+  </div>
 </div>
+
+<details class="panel brain">
+  <summary>Product brain <span class="hint" style="display:inline">&mdash; per-repo memory freshness</span></summary>
+  <div id="brain-body"><div class="empty">loading&hellip;</div></div>
+</details>
 
 <div class="cols">
   <div class="col"><h2>Pending</h2><div id="pending"></div></div>
@@ -86,53 +130,281 @@ const GROUPS = {
   awaiting: ['awaiting_input'],
   completed: ['pr_opened', 'no_fix', 'skipped', 'error', 'timeout'],
 };
-function esc(s) { const d = document.createElement('span'); d.textContent = s || ''; return d.innerHTML; }
+const STAGE_NAMES = ['Intake', 'PRD', 'Recon', 'Design', 'Plan', 'Build 1', 'Build 2+', 'Test', 'Review', 'Ship'];
+const KIND_LABEL = { sentry: 'sentry', task: 'request', feature: 'feature', memory: 'memory' };
+const LIVE = ['received', 'queued', 'running', 'awaiting_input'];
+
+function esc(s) { const d = document.createElement('span'); d.textContent = s == null ? '' : String(s); return d.innerHTML; }
+
+// URL matcher built WITHOUT regex-literal escapes: this file ships inside a
+// Python string, so backslashes are banned. fromCharCode(9,10,13,34,39) puts
+// tab, LF, CR, double-quote and single-quote in the negated class.
+const URL_RE = new RegExp('https://[^ <>)' + String.fromCharCode(9, 10, 13, 34, 39) + ']+', 'g');
+function linkify(s) {
+  // esc() first: matched URLs then contain no <>"' and are attribute-safe
+  // (& is already &amp;, which parses back to & inside the href attribute).
+  return esc(s).replace(URL_RE, (u) => `<a href="${u}" target="_blank">${u}</a>`);
+}
+
+// ---------- cards ----------
+
+function stageStrip(j) {
+  const cur = Number(j.stage) || 0;
+  const still = LIVE.includes(j.status) ? '' : ' still'; // no pulse on finished pipelines
+  let segs = '';
+  for (let i = 0; i < 10; i++) {
+    const cls = i < cur ? 'done' : (i === cur ? 'cur' + still : 'todo');
+    segs += `<span class="seg ${cls}" title="P${i} ${esc(STAGE_NAMES[i])}">P${i}</span>`;
+  }
+  const mirror = j.mirror_ok ? '' :
+    '<span class="chip" title="ClickUp artifact mirror unhealthy — artifacts live in git; answer gates here">mirror off</span>';
+  return `<div class="strip">${segs}</div>
+    <div class="stagetext">P${cur} ${esc(j.stage_name || STAGE_NAMES[cur] || '')}${mirror}</div>`;
+}
+
+function answerBlock(j) {
+  const id = esc(j.issue_id);
+  const feature = j.kind === 'feature';
+  const btns = feature
+    ? `<button class="go" onclick="answer('${id}','proceed',this)">Proceed</button>
+       <button class="redo" onclick="answer('${id}','redo',this)">Redo</button>
+       <button class="no" onclick="answer('${id}','skip',this)">Skip</button>`
+    : `<button class="go" onclick="answer('${id}','proceed',this)">Proceed</button>
+       <button class="no" onclick="answer('${id}','skip',this)">Skip</button>`;
+  const hint = feature
+    ? `<div class="hint">Redo re-runs this stage with your notes as corrections &mdash; optionally prefix 'P3 ' to redo an earlier stage.</div>`
+    : '';
+  return `<div class="answer"><textarea id="ans-${id}" data-job="${id}" placeholder="Your answer / guidance&hellip;"></textarea>
+    ${hint}<div class="btns">${btns}</div></div>`;
+}
+
 function card(j) {
+  const id = esc(j.issue_id);
   let links = '';
   if (j.issue_url) links += `<a href="${esc(j.issue_url)}" target="_blank">Sentry</a>`;
   if (j.clickup_task_url) links += `<a href="${esc(j.clickup_task_url)}" target="_blank">ClickUp</a>`;
   if (j.pr_url) links += `<a href="${esc(j.pr_url)}" target="_blank">PR</a>`;
   const when = new Date(j.updated_at * 1000).toLocaleString();
   const score = j.score != null ? ` &middot; score ${j.score}` : '';
-  const phase = j.phase > 1 ? ' &middot; phase 2' : '';
-  const kind = `<span class="badge kind">${j.kind === 'task' ? 'request' : 'sentry'}</span>`;
+  const phase = j.kind === 'task' && j.phase > 1 ? ' &middot; phase 2' : '';
+  const owner = j.kind === 'feature' && j.owner ? ` &middot; owner ${esc(j.owner)}` : '';
+  const kind = `<span class="badge kind">${esc(KIND_LABEL[j.kind] || j.kind)}</span>`;
+  const strip = j.kind === 'feature' ? stageStrip(j) : '';
+
   let ask = '';
   if (j.status === 'awaiting_input') {
-    const id = esc(j.issue_id);
     ask = `<div class="q">${esc(j.question || (j.detail || '').slice(0, 500))}</div>`
-      + (j.analysis ? `<details><summary>full analysis</summary><pre>${esc(j.analysis)}</pre></details>` : '')
-      + `<div class="answer"><textarea id="ans-${id}" placeholder="Your answer / guidance&hellip;"></textarea>
-         <div class="btns"><button class="go" onclick="answer('${id}','proceed',this)">Proceed</button>
-         <button class="no" onclick="answer('${id}','skip',this)">Skip</button></div></div>`;
+      + (j.evidence ? `<details data-key="${id}:ev"><summary>evidence</summary><pre>${linkify(j.evidence)}</pre></details>` : '')
+      + (j.analysis ? `<details data-key="${id}:an"><summary>full analysis</summary><pre>${esc(j.analysis)}</pre></details>` : '')
+      + answerBlock(j);
+  }
+  let rekick = '';
+  if (j.kind === 'feature' && (j.status === 'error' || j.status === 'timeout')) {
+    rekick = `<div class="answer"><div class="btns">
+      <button class="redo" onclick="answer('${id}','redo',this)">Re-kick (redo)</button></div></div>`;
+  }
+  let stats = '';
+  if (j.kind === 'feature') {
+    stats = `<details class="stats" data-key="${id}:stats" data-job="${id}"><summary>stats</summary>
+      <div class="stats-body" id="stats-${id}"><div class="empty">&hellip;</div></div></details>`;
   }
   return `<div class="job"><div class="t">${esc(j.title || j.issue_id)}</div>
-    <div class="m"><span class="badge ${esc(j.status)}">${esc(j.status)}</span>${kind}${esc(j.project)}${score}${phase}</div>
-    <div class="m">${links}</div><div class="m">${when}</div>${ask}</div>`;
+    <div class="m"><span class="badge ${esc(j.status)}">${esc(j.status)}</span>${kind}${esc(j.project)}${score}${phase}${owner}</div>
+    ${strip}<div class="m">${links}</div><div class="m">${when}</div>${ask}${rekick}${stats}</div>`;
 }
+
+// ---------- render, with draft + <details> state preservation (§6: typed
+// input must survive re-renders, even when the jobs payload changed) ----------
+
+function captureDrafts() {
+  const snap = {};
+  let focus = null;
+  for (const t of document.querySelectorAll('.answer textarea')) {
+    snap[t.dataset.job] = t.value;
+    if (t === document.activeElement)
+      focus = { job: t.dataset.job, start: t.selectionStart, end: t.selectionEnd };
+  }
+  return { snap, focus };
+}
+
+function restoreDrafts(state) {
+  for (const t of document.querySelectorAll('.answer textarea')) {
+    const id = t.dataset.job;
+    // in-memory snapshot (freshest) first, then the localStorage draft
+    // (survives reloads; written on every input, cleared on answered)
+    const v = state.snap[id] !== undefined ? state.snap[id] : localStorage.getItem('gb-draft-' + id);
+    if (v) t.value = v;
+    if (state.focus && state.focus.job === id) {
+      t.focus();
+      try { t.setSelectionRange(state.focus.start, state.focus.end); } catch (e) { /* ok */ }
+    }
+  }
+}
+
 function renderJobs(jobs) {
+  const drafts = captureDrafts();
+  const open = new Set();
+  for (const d of document.querySelectorAll('details[data-key]')) if (d.open) open.add(d.dataset.key);
+
   for (const [div, statuses] of Object.entries(GROUPS)) {
     const items = jobs.filter(j => statuses.includes(j.status));
     document.getElementById(div).innerHTML =
       items.length ? items.map(card).join('') : '<div class="empty">none</div>';
   }
+
+  // re-open evidence/analysis/stats panels; stats bodies refill from cache
+  // first (no flicker), then the toggle event triggers a fresh fetch.
+  for (const d of document.querySelectorAll('details[data-key]')) {
+    if (!open.has(d.dataset.key)) continue;
+    if (d.classList.contains('stats') && statsCache[d.dataset.job])
+      d.querySelector('.stats-body').innerHTML = statsCache[d.dataset.job];
+    d.open = true;
+  }
+  restoreDrafts(drafts);
 }
+
+// persist drafts as they are typed (delegated: cards are re-created on render)
+document.addEventListener('input', (e) => {
+  const t = e.target;
+  if (t && t.matches && t.matches('.answer textarea'))
+    localStorage.setItem('gb-draft-' + t.dataset.job, t.value);
+});
+
 let lastJobs = '';
 async function refresh(force) {
   try {
     const jobs = await (await fetch('api/jobs')).json();
     const sig = JSON.stringify(jobs);
-    // don't wipe half-typed answers on the 10s poll unless something changed
+    // skip the re-render entirely when nothing changed (10s poll)
     if (force || sig !== lastJobs) { lastJobs = sig; renderJobs(jobs); }
   } catch (e) { document.getElementById('msg').textContent = 'refresh failed: ' + e; }
 }
+
+// ---------- per-feature stats (api/features/{id}/stats) ----------
+
+const statsCache = {};        // job id -> rendered table html (for re-renders)
+const statsInflight = new Set();
+
+// <details> toggle does not bubble — capture at the document instead.
+document.addEventListener('toggle', (e) => {
+  const d = e.target;
+  if (!d || !d.dataset || !d.dataset.key) return;
+  if (d.open && d.classList.contains('stats')) loadStats(d.dataset.job); // refetch on each open
+}, true);
+
+function fmtMMSS(ms) {
+  if (!ms) return '0:00';
+  const t = Math.round(ms / 1000);
+  return Math.floor(t / 60) + ':' + String(t % 60).padStart(2, '0');
+}
+
+function fmtWait(sec) {
+  if (!sec) return '&mdash;';
+  sec = Math.round(sec);
+  if (sec < 60) return sec + 's';
+  const m = Math.floor(sec / 60);
+  if (m < 60) return m + 'm ' + (sec % 60) + 's';
+  const h = Math.floor(m / 60);
+  if (h < 24) return h + 'h ' + (m % 60) + 'm';
+  return Math.floor(h / 24) + 'd ' + (h % 24) + 'h';
+}
+
+function statsTable(data) {
+  const runs = data.runs || [];
+  if (!runs.length) return '<div class="empty">no stage runs yet</div>';
+  const by = {};
+  for (const r of runs) {  // aggregate per stage; runs arrive ordered, last status wins
+    const s = by[r.stage] || (by[r.stage] = { n: 0, dur: 0, cost: 0, wait: 0, status: '' });
+    s.n += 1;
+    s.dur += r.duration_ms || 0;
+    s.cost += r.cost_usd || 0;
+    if (r.gate_posted_at && r.gate_answered_at) s.wait += Math.max(0, r.gate_answered_at - r.gate_posted_at);
+    if (r.result_status) s.status = r.result_status;
+  }
+  const rows = Object.keys(by).map(Number).sort((a, b) => a - b).map(st => {
+    const s = by[st];
+    return `<tr><td>P${st} ${esc(STAGE_NAMES[st] || '')}</td><td>${s.n}</td><td>${fmtMMSS(s.dur)}</td>
+      <td>$${s.cost.toFixed(2)}</td><td>${fmtWait(s.wait)}</td><td>${esc(s.status)}</td></tr>`;
+  }).join('');
+  return `<table><tr><th>stage</th><th>attempts</th><th>duration</th><th>cost</th><th>gate wait</th><th>result</th></tr>${rows}</table>`;
+}
+
+async function loadStats(id) {
+  if (statsInflight.has(id)) return;
+  statsInflight.add(id);
+  const body = () => document.getElementById('stats-' + id);
+  if (body() && !statsCache[id]) body().innerHTML = '<div class="empty">loading&hellip;</div>';
+  try {
+    const r = await fetch('api/features/' + encodeURIComponent(id) + '/stats');
+    const data = await r.json();
+    statsCache[id] = r.ok ? statsTable(data)
+                          : '<div class="empty">Error: ' + esc(data.detail || r.status) + '</div>';
+  } catch (e) {
+    statsCache[id] = '<div class="empty">Error: ' + esc(String(e)) + '</div>';
+  }
+  statsInflight.delete(id);
+  if (body()) body().innerHTML = statsCache[id];
+}
+
+// ---------- Product brain (api/memory) ----------
+
+let lastMem = '';
+let lastMemData = null;
+const pendingBoot = new Set();
+
+async function refreshMemory(force) {
+  try {
+    const mem = await (await fetch('api/memory')).json();
+    const sig = JSON.stringify(mem);
+    if (force || sig !== lastMem) { lastMem = sig; lastMemData = mem; renderMemory(mem); }
+  } catch (e) { /* keep the previous table; jobs poll reports connectivity */ }
+}
+
+function renderMemory(mem) {
+  const rows = Object.entries(mem).map(([p, m]) => {
+    const exists = m.exists ? '<span class="ok-t">&#10003;</span>' : '<span class="err-t">&#10007;</span>';
+    const stale = !m.exists ? '&mdash;'
+      : (m.staleness_commits == null ? '?'
+        : (m.staleness_commits > 0
+          ? esc(String(m.staleness_commits)) + (m.staleness_commits === 1 ? ' commit behind' : ' commits behind')
+          : 'fresh'));
+    const fetched = m.fetched_at ? new Date(m.fetched_at * 1000).toLocaleString() : '&mdash;';
+    const dis = pendingBoot.has(p) ? ' disabled' : '';
+    return `<tr><td>${esc(p)}</td><td>${exists}</td><td>${stale}</td><td>${fetched}</td>
+      <td><button onclick="bootstrap('${esc(p)}',this)"${dis} title="Bootstrap .gumo memory via a draft PR">Bootstrap</button></td></tr>`;
+  }).join('');
+  document.getElementById('brain-body').innerHTML = rows
+    ? `<table><tr><th>project</th><th>memory</th><th>staleness</th><th>fetched</th><th></th></tr>${rows}</table>`
+    : '<div class="empty">no projects configured</div>';
+}
+
+async function bootstrap(project, btn) {
+  const msg = document.getElementById('msg');
+  btn.disabled = true; pendingBoot.add(project);
+  msg.textContent = 'Bootstrapping memory for ' + project + '…';
+  try {
+    const r = await fetch('api/memory/' + encodeURIComponent(project) + '/bootstrap', { method: 'POST' });
+    const data = await r.json();
+    msg.textContent = r.ok ? 'memory ' + project + ': ' + (data.decision || 'queued')
+                           : 'Error: ' + (data.detail || r.status);
+    if (r.ok) refresh(true); // the memory job shows up in the queue
+  } catch (e) { msg.textContent = 'Error: ' + e; }
+  pendingBoot.delete(project);
+  if (lastMemData) renderMemory(lastMemData); else btn.disabled = false;
+}
+
+// ---------- intake forms ----------
+
 async function loadProjects() {
   try {
     const ps = await (await fetch('api/projects')).json();
-    document.getElementById('task-project').innerHTML =
-      '<option value="" disabled selected>Project&hellip;</option>' +
+    const opts = '<option value="" disabled selected>Project&hellip;</option>' +
       ps.map(p => `<option value="${esc(p.slug)}">${esc(p.slug)} (${esc(p.repo)})</option>`).join('');
-  } catch (e) { /* keep empty select; submit will fail loudly */ }
+    document.getElementById('task-project').innerHTML = opts;
+    document.getElementById('feat-project').innerHTML = opts;
+  } catch (e) { /* keep empty selects; submit will fail loudly */ }
 }
+
 async function trigger(ev) {
   ev.preventDefault();
   const btn = document.getElementById('go'), msg = document.getElementById('msg');
@@ -151,6 +423,7 @@ async function trigger(ev) {
   btn.disabled = false;
   return false;
 }
+
 async function submitTask(ev) {
   ev.preventDefault();
   const btn = document.getElementById('task-go'), msg = document.getElementById('msg');
@@ -180,26 +453,72 @@ async function submitTask(ev) {
   btn.disabled = false;
   return false;
 }
+
+async function submitFeature(ev) {
+  ev.preventDefault();
+  const btn = document.getElementById('feat-go'), msg = document.getElementById('msg');
+  const body = {
+    project: document.getElementById('feat-project').value,
+    clickup: document.getElementById('feat-clickup').value.trim(),
+    title: document.getElementById('feat-title').value.trim(),
+    summary: document.getElementById('feat-summary').value.trim(),
+    owner: document.getElementById('feat-owner').value.trim(),
+    related_to: document.getElementById('feat-related').value.trim(),
+  };
+  if (!body.project) { msg.textContent = 'Pick a project first.'; return false; }
+  if (!body.clickup && !body.title) { msg.textContent = 'Give a ClickUp URL or a title.'; return false; }
+  btn.disabled = true; msg.textContent = 'Creating ticket + starting P0 Intake…';
+  try {
+    const r = await fetch('api/features', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    const data = await r.json();
+    msg.innerHTML = r.ok
+      ? `Pipeline started for <b>${esc(data.title)}</b>` + (data.clickup_task_url ? ` &mdash; <a href="${esc(data.clickup_task_url)}" target="_blank">ClickUp ticket</a>` : '')
+      : 'Error: ' + esc(data.detail || r.status);
+    if (r.ok) {
+      for (const id of ['feat-clickup', 'feat-title', 'feat-summary', 'feat-owner', 'feat-related'])
+        document.getElementById(id).value = '';
+      refresh(true);
+    }
+  } catch (e) { msg.textContent = 'Error: ' + e; }
+  btn.disabled = false;
+  return false;
+}
+
+// ---------- gate answers (proceed / redo / skip + error re-kick) ----------
+
 async function answer(id, action, btn) {
   const msg = document.getElementById('msg');
   const box = document.getElementById('ans-' + id);
   const text = box ? box.value.trim() : '';
-  if (action === 'skip' && !confirm('Drop this job?')) return;
-  btn.disabled = true; msg.textContent = 'Recording decision on the ClickUp ticket…';
+  if (action === 'skip' && !confirm('Abort this job? (feature branches are left intact)')) return;
+  btn.disabled = true; msg.textContent = 'Recording decision…';
   try {
     const r = await fetch('api/jobs/' + encodeURIComponent(id) + '/answer', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({action, answer: text}),
     });
     const data = await r.json();
-    msg.textContent = r.ok
-      ? (action === 'proceed' ? 'Answer recorded — fix queued.' : 'Skipped.')
-      : 'Error: ' + (data.detail || r.status);
-    if (r.ok) refresh(true);
+    if (r.ok) {
+      localStorage.removeItem('gb-draft-' + id); // answered — drop the draft
+      msg.textContent = { proceed: 'Answer recorded — next run queued.',
+                          redo: 'Redo queued.', skip: 'Skipped.' }[action] || ('OK: ' + data.status);
+      refresh(true);
+    } else {
+      // 409 = lost race (e.g. already answered via ClickUp) or wrong state —
+      // surface the server's explanation and re-sync the board.
+      msg.textContent = 'Error: ' + (data.detail || r.status);
+      if (r.status === 409) refresh(true);
+    }
   } catch (e) { msg.textContent = 'Error: ' + e; }
   btn.disabled = false;
 }
-loadProjects(); refresh(true); setInterval(() => refresh(false), 10000);
+
+loadProjects(); refresh(true); refreshMemory(true);
+setInterval(() => refresh(false), 10000);
+setInterval(() => refreshMemory(false), 60000);
 </script>
 </body>
 </html>"""

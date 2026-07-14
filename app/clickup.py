@@ -45,7 +45,9 @@ class ClickUp:
             log.exception("could not load ClickUp list statuses; status sync disabled")
 
     async def get_task(self, task_id: str) -> dict | None:
-        """Fetch an existing task (any list) — used to adopt user-submitted tickets."""
+        """Fetch an existing task (any list) — used to adopt user-submitted tickets
+        and to read back artifact-mirror subtasks. Returns None on any failure;
+        callers must treat None as 'unknown', never as 'empty'."""
         if not self.enabled or not task_id:
             return None
         try:
@@ -55,12 +57,16 @@ class ClickUp:
                     headers=self._headers,
                     params={"include_markdown_description": "true"},
                 )
+                if r.status_code == 404:
+                    return {"missing": True, "id": str(task_id)}
                 r.raise_for_status()
                 d = r.json()
                 return {
                     "id": str(d["id"]),
                     "name": d.get("name", ""),
                     "url": d.get("url", ""),
+                    "list_id": str((d.get("list") or {}).get("id") or ""),
+                    "archived": bool(d.get("archived")),
                     "description": (
                         d.get("markdown_description")
                         or d.get("description")
@@ -72,22 +78,62 @@ class ClickUp:
             log.exception("ClickUp get_task failed for %s", task_id)
             return None
 
-    async def create_task(self, name: str, description: str) -> tuple[str, str] | None:
+    async def create_task(self, name: str, description: str,
+                          list_id: str | None = None,
+                          parent: str | None = None) -> tuple[str, str] | None:
+        """Create a task — or a subtask when `parent` is given. Subtasks MUST be
+        created in the parent's home list (pass list_id), not the autofix list."""
         if not self.enabled:
             return None
+        payload: dict = {"name": name[:200], "markdown_description": description}
+        if parent:
+            payload["parent"] = parent
         try:
             async with httpx.AsyncClient(timeout=30) as client:
                 r = await client.post(
-                    f"{API}/list/{self._list_id}/task",
+                    f"{API}/list/{list_id or self._list_id}/task",
                     headers=self._headers,
-                    json={"name": name[:200], "markdown_description": description},
+                    json=payload,
                 )
                 r.raise_for_status()
                 data = r.json()
                 return data["id"], data.get("url", "")
         except Exception:
-            log.exception("ClickUp create_task failed")
+            log.exception("ClickUp create_task failed (list=%s parent=%s)", list_id, parent)
             return None
+
+    async def update_description(self, task_id: str, markdown: str) -> bool:
+        if not self.enabled or not task_id:
+            return False
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.put(
+                    f"{API}/task/{task_id}",
+                    headers=self._headers,
+                    json={"markdown_description": markdown},
+                )
+                r.raise_for_status()
+                return True
+        except Exception:
+            log.exception("ClickUp update_description failed for %s", task_id)
+            return False
+
+    async def set_assignee(self, task_id: str, user_id: str) -> bool:
+        """Assign a ClickUp member (numeric user id) — triggers native notifications."""
+        if not self.enabled or not task_id or not str(user_id).isdigit():
+            return False
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.put(
+                    f"{API}/task/{task_id}",
+                    headers=self._headers,
+                    json={"assignees": {"add": [int(user_id)]}},
+                )
+                r.raise_for_status()
+                return True
+        except Exception:
+            log.exception("ClickUp set_assignee failed for %s", task_id)
+            return False
 
     async def comment(self, task_id: str, text: str):
         if not self.enabled or not task_id:
@@ -104,7 +150,7 @@ class ClickUp:
             log.exception("ClickUp comment failed for task %s", task_id)
 
     async def comments(self, task_id: str) -> list[dict]:
-        """Newest-last list of {id, text} comments."""
+        """Newest-last list of {id, text, date} comments (date: epoch seconds)."""
         if not self.enabled or not task_id:
             return []
         try:
@@ -113,7 +159,14 @@ class ClickUp:
                 r.raise_for_status()
                 items = r.json().get("comments", [])
                 items.reverse()  # API returns newest first
-                return [{"id": str(c["id"]), "text": c.get("comment_text", "")} for c in items]
+                out = []
+                for c in items:
+                    try:
+                        date = float(c.get("date", 0)) / 1000.0  # API returns ms
+                    except (TypeError, ValueError):
+                        date = 0.0
+                    out.append({"id": str(c["id"]), "text": c.get("comment_text", ""), "date": date})
+                return out
         except Exception:
             log.exception("ClickUp comments fetch failed for task %s", task_id)
             return []
