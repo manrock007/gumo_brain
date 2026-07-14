@@ -144,13 +144,10 @@ class Worker:
                         "use redo (dashboard re-kick or `/redo` on the ticket) to resume")
             if existing["status"] == "pr_opened":
                 return f"feature {job_id} already shipped: {existing['pr_url']}"
-            # terminal skipped/no_fix -> fresh restart of the pipeline
-            self.store.artifacts_clear(job_id)
+            # terminal skipped/no_fix -> fresh restart of the pipeline (atomic below)
 
-        self.store.insert(job_id, source="manual", forced=True,
-                          title=title, project=project, kind="feature")
-        self.store.set_fields(
-            job_id,
+        self.store.feature_intake(
+            job_id, title=title, project=project,
             request=request,
             stage=0,
             stage_attempts=0,

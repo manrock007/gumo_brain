@@ -286,9 +286,39 @@ class JobStore:
         is history) but clears guidance so a dead pipeline's redo notes can't leak
         into the new run as binding corrections."""
         with self._conn() as c:
-            c.execute("DELETE FROM artifact_state WHERE job_id = ?", (job_id,))
-            c.execute("DELETE FROM stage_state WHERE job_id = ?", (job_id,))
-            c.execute("DELETE FROM guidance_log WHERE job_id = ?", (job_id,))
+            self._clear_pipeline_state(c, job_id)
+
+    @staticmethod
+    def _clear_pipeline_state(c, job_id: str):
+        c.execute("DELETE FROM artifact_state WHERE job_id = ?", (job_id,))
+        c.execute("DELETE FROM stage_state WHERE job_id = ?", (job_id,))
+        c.execute("DELETE FROM guidance_log WHERE job_id = ?", (job_id,))
+
+    def feature_intake(self, job_id: str, title: str, project: str, **fields):
+        """Atomic feature (re-)intake: child-state clears + row upsert + pipeline
+        reset in ONE transaction — a crash can never leave status='received' with a
+        stale stage and no stage_state (which would strand the job on restart)."""
+        now = time.time()
+        with self._conn() as c:
+            self._clear_pipeline_state(c, job_id)
+            c.execute(
+                """INSERT INTO jobs (issue_id, kind, project, title, status, source, forced, attempts, created_at, updated_at)
+                   VALUES (?, 'feature', ?, ?, 'received', 'manual', 1, 1, ?, ?)
+                   ON CONFLICT(issue_id) DO UPDATE SET
+                     status = 'received',
+                     source = 'manual',
+                     forced = 1,
+                     title = excluded.title,
+                     project = excluded.project,
+                     attempts = jobs.attempts + 1,
+                     updated_at = excluded.updated_at""",
+                (job_id, project, title, now, now),
+            )
+            cols = ", ".join(f"{k} = ?" for k in fields)
+            c.execute(
+                f"UPDATE jobs SET {cols}, updated_at = ? WHERE issue_id = ?",
+                (*fields.values(), now, job_id),
+            )
 
     # ---------- per-stage state ----------
 
