@@ -32,6 +32,10 @@ CREATE TABLE IF NOT EXISTS jobs (
     comment_marker TEXT DEFAULT '',  -- last ClickUp comment id we processed
     parked_head TEXT DEFAULT '',     -- branch HEAD at gate park (what the human answers against)
     pending_redo_stage INTEGER,      -- set by a redo answer; consumed (reset) by the next run
+    resume_session_id TEXT DEFAULT '',  -- STAGE_ASK: session to resume when answered
+    resume_stage INTEGER,               -- STAGE_ASK: stage the pending resume belongs to
+    ask_count INTEGER NOT NULL DEFAULT 0,  -- resumes consumed by the current stage attempt
+    gate_mode TEXT NOT NULL DEFAULT 'full',  -- full = every stage parks | light = checkpoints
     pr_url TEXT,
     detail TEXT,
     attempts INTEGER NOT NULL DEFAULT 0,
@@ -82,24 +86,46 @@ CREATE TABLE IF NOT EXISTS stage_runs (
     cost_usd REAL,
     num_turns INTEGER,
     duration_ms REAL,
-    result_status TEXT DEFAULT ''
+    result_status TEXT DEFAULT '',
+    session_id TEXT DEFAULT '',      -- the run's CLI session (resumable)
+    resumed INTEGER NOT NULL DEFAULT 0  -- 1 = this run continued a STAGE_ASK session
+);
+
+CREATE TABLE IF NOT EXISTS gate_chat (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL,
+    stage INTEGER NOT NULL,
+    attempt INTEGER NOT NULL DEFAULT 1,
+    role TEXT NOT NULL,              -- human | engine
+    text TEXT NOT NULL,
+    at REAL NOT NULL
 );
 """
 
-MIGRATIONS = {  # jobs columns added after v1 shipped -> DDL, for in-place upgrade
-    "kind": "TEXT NOT NULL DEFAULT 'sentry'",
-    "request": "TEXT DEFAULT ''",
-    "question": "TEXT DEFAULT ''",
-    "stage": "INTEGER NOT NULL DEFAULT 0",
-    "stage_attempts": "INTEGER NOT NULL DEFAULT 0",
-    "evidence": "TEXT DEFAULT ''",
-    "owner": "TEXT DEFAULT ''",
-    "related_jobs": "TEXT DEFAULT ''",
-    "mirror_ok": "INTEGER NOT NULL DEFAULT 1",
-    "cu_list_id": "TEXT DEFAULT ''",
-    "run_started_at": "REAL",
-    "parked_head": "TEXT DEFAULT ''",
-    "pending_redo_stage": "INTEGER",
+MIGRATIONS = {  # table -> columns added after that table first shipped (in-place upgrade)
+    "jobs": {
+        "kind": "TEXT NOT NULL DEFAULT 'sentry'",
+        "request": "TEXT DEFAULT ''",
+        "question": "TEXT DEFAULT ''",
+        "stage": "INTEGER NOT NULL DEFAULT 0",
+        "stage_attempts": "INTEGER NOT NULL DEFAULT 0",
+        "evidence": "TEXT DEFAULT ''",
+        "owner": "TEXT DEFAULT ''",
+        "related_jobs": "TEXT DEFAULT ''",
+        "mirror_ok": "INTEGER NOT NULL DEFAULT 1",
+        "cu_list_id": "TEXT DEFAULT ''",
+        "run_started_at": "REAL",
+        "parked_head": "TEXT DEFAULT ''",
+        "pending_redo_stage": "INTEGER",
+        "resume_session_id": "TEXT DEFAULT ''",
+        "resume_stage": "INTEGER",
+        "ask_count": "INTEGER NOT NULL DEFAULT 0",
+        "gate_mode": "TEXT NOT NULL DEFAULT 'full'",
+    },
+    "stage_runs": {
+        "session_id": "TEXT DEFAULT ''",
+        "resumed": "INTEGER NOT NULL DEFAULT 0",
+    },
 }
 
 
@@ -108,10 +134,11 @@ class JobStore:
         self._path = path
         with self._conn() as c:
             c.executescript(SCHEMA)
-            cols = {r["name"] for r in c.execute("PRAGMA table_info(jobs)").fetchall()}
-            for col, ddl in MIGRATIONS.items():
-                if col not in cols:
-                    c.execute(f"ALTER TABLE jobs ADD COLUMN {col} {ddl}")
+            for table, columns in MIGRATIONS.items():
+                cols = {r["name"] for r in c.execute(f"PRAGMA table_info({table})").fetchall()}
+                for col, ddl in columns.items():
+                    if col not in cols:
+                        c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
 
     @contextmanager
     def _conn(self):
@@ -356,15 +383,20 @@ class JobStore:
 
     def stage_run_close(self, run_id: int, result_status: str,
                         cost_usd: float | None = None, num_turns: int | None = None,
-                        duration_ms: float | None = None):
+                        duration_ms: float | None = None, session_id: str | None = None):
         with self._conn() as c:
             c.execute(
                 """UPDATE stage_runs SET ended_at = ?, result_status = ?,
                      cost_usd = COALESCE(?, cost_usd), num_turns = COALESCE(?, num_turns),
-                     duration_ms = COALESCE(?, duration_ms)
+                     duration_ms = COALESCE(?, duration_ms),
+                     session_id = COALESCE(?, session_id)
                    WHERE id = ?""",
-                (time.time(), result_status, cost_usd, num_turns, duration_ms, run_id),
+                (time.time(), result_status, cost_usd, num_turns, duration_ms, session_id, run_id),
             )
+
+    def stage_run_mark_resumed(self, run_id: int):
+        with self._conn() as c:
+            c.execute("UPDATE stage_runs SET resumed = 1 WHERE id = ?", (run_id,))
 
     def stage_run_gate_posted(self, run_id: int):
         with self._conn() as c:
@@ -389,3 +421,33 @@ class JobStore:
                 "SELECT * FROM stage_runs WHERE job_id = ? ORDER BY id", (job_id,)
             ).fetchall()
             return [dict(r) for r in rows]
+
+    # ---------- gate chat (INSERT-only transcript) ----------
+
+    def chat_add(self, job_id: str, stage: int, attempt: int, role: str, text: str):
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO gate_chat (job_id, stage, attempt, role, text, at) VALUES (?, ?, ?, ?, ?, ?)",
+                (job_id, stage, attempt, role, text, time.time()),
+            )
+
+    def chat_for(self, job_id: str, stage: int | None = None) -> list[dict]:
+        with self._conn() as c:
+            if stage is None:
+                rows = c.execute(
+                    "SELECT * FROM gate_chat WHERE job_id = ? ORDER BY id", (job_id,)
+                ).fetchall()
+            else:
+                rows = c.execute(
+                    "SELECT * FROM gate_chat WHERE job_id = ? AND stage = ? ORDER BY id",
+                    (job_id, stage),
+                ).fetchall()
+            return [dict(r) for r in rows]
+
+    def chat_count(self, job_id: str, stage: int) -> int:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT COUNT(*) AS n FROM gate_chat WHERE job_id = ? AND stage = ? AND role = 'human'",
+                (job_id, stage),
+            ).fetchone()
+            return row["n"]

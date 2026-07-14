@@ -91,6 +91,18 @@ class Settings(BaseSettings):
     stage_gates: str = ""  # future: comma list of auto-advance stages, e.g. "5,7"; empty = all gated
     reaper_grace_seconds: int = 600
 
+    # Conversational gates (docs/CONVERSATIONS.md)
+    chat_timeout_seconds: int = 300
+    chat_max_turns_per_gate: int = 10
+    max_asks_per_stage: int = 3
+    default_gate_mode: str = "full"  # full = every stage parks; light = P0/P1/P3/P9 + asks
+    session_ttl_days: int = 14
+
+    @property
+    def claude_config_dir(self) -> str:
+        """Session transcripts live on the data volume so resume survives restarts."""
+        return f"{self.data_dir}/claude-config"
+
     # Storage
     data_dir: str = "/data"
 
