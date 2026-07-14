@@ -92,19 +92,27 @@ def _entries_tail(workspace: str, rel_dir: str, cap: int) -> str:
 
 
 class MemoryReader:
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, locks=None):
         self.settings = settings
+        self.locks = locks  # RepoLocks; None for read-only cache use (dashboard)
 
     async def product_scope(self, project: str, workspace: str) -> dict[str, str]:
         """Product-scope files, base-pinned. For the canonical repo, read them
         from its own clone; for client repos, read from the canonical
-        workspace's origin/<base> (fetched fresh)."""
+        workspace's origin/<base> (fetched fresh) — under the canonical repo's
+        lock, since that workspace belongs to other jobs too."""
         canonical = self.settings.memory_canonical_project
         if project == canonical:
             return {f: _read(workspace, f"{PRODUCT_DIR}/{f}") for f in PRODUCT_FILES}
         target = self.settings.repo_for_project(canonical)
         if target is None:
             return {}
+        if self.locks is not None:
+            async with self.locks.for_repo(target.repo):
+                return await self._read_canonical(target)
+        return await self._read_canonical(target)
+
+    async def _read_canonical(self, target) -> dict[str, str]:
         ws = Path(self.settings.workspaces_dir) / target.repo.split("/")[-1]
         if not (ws / ".git").exists():
             code, out = await _run(

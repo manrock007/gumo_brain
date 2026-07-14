@@ -146,12 +146,16 @@ async def prepare_feature_workspace(settings: Settings, target: RepoTarget,
 
 async def run_claude_raw(settings: Settings, workspace: str, prompt: str,
                          allowed_tools: list[str], timeout: int,
-                         resume_session: str | None = None) -> RawRunResult:
+                         resume_session: str | None = None,
+                         disallowed_tools: list[str] | None = None) -> RawRunResult:
     """Low-level headless run. Returns the CLI's result text verbatim plus the
     telemetry envelope (session/cost/turns/duration) — callers own the parsing.
 
     resume_session continues an existing session (same working directory) with
-    its full context intact — the backbone of gate chat and STAGE_ASK resume."""
+    full context — increment 2 (docs/CONVERSATIONS.md); requires
+    settings.session_persistence. disallowed_tools is a hard DENY list —
+    --allowedTools alone is additive to settings-file grants, so read-only
+    chat runs must explicitly deny the write tools."""
     cmd = [settings.claude_binary, "-p"]
     if resume_session:
         cmd += ["-r", resume_session]
@@ -160,16 +164,20 @@ async def run_claude_raw(settings: Settings, workspace: str, prompt: str,
         "--output-format", "json",
         "--allowedTools", ",".join(allowed_tools),
     ]
+    if disallowed_tools:
+        cmd += ["--disallowedTools", ",".join(disallowed_tools)]
     if settings.claude_model:
         cmd += ["--model", settings.claude_model]
 
     env = os.environ.copy()
     env["GH_TOKEN"] = settings.github_token
     env["CLICKUP_TOKEN"] = settings.clickup_token  # used by the brain-ticket CLI
-    # sessions live on the data volume so resume survives container restarts;
     # never inherit an ambient session identity from the service's own env
-    env["CLAUDE_CONFIG_DIR"] = settings.claude_config_dir
     env.pop("CLAUDE_CODE_SESSION_ID", None)
+    if settings.session_persistence:
+        # sessions on the data volume so resume survives restarts (increment 2;
+        # needs the §1 bootstrap contract deployed — flag-gated until then)
+        env["CLAUDE_CONFIG_DIR"] = settings.claude_config_dir
 
     proc = await asyncio.create_subprocess_exec(
         *cmd,

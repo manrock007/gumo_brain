@@ -6,6 +6,7 @@ failure) → mirror artifacts → park at the gate. Fail-closed everywhere:
 nothing advances without an explicit STAGE_DONE and a human answer.
 """
 
+import asyncio
 import logging
 import re
 import time
@@ -18,6 +19,7 @@ from .db import JobStore
 from .feature_prompts import (
     STAGES,
     build_bootstrap_prompt,
+    build_chat_prompt,
     build_stage_prompt,
     stage_artifact,
     stage_kind,
@@ -37,6 +39,30 @@ log = logging.getLogger("brain.engine")
 
 GATE_PREFIX = "**[gumo_brain]**"
 DOC_STAGE_TOOLS = ["Read", "Grep", "Glob"]
+# chat runs are read-only by DENY, not just allow: --allowedTools is additive to any
+# settings-file grants living in the (persistent) workspace, so write tools must be
+# explicitly disallowed (docs/CONVERSATIONS.md §2)
+CHAT_TOOLS = ["Read", "Grep", "Glob"]
+CHAT_DENIED_TOOLS = ["Edit", "Write", "NotebookEdit", "Bash", "WebFetch", "WebSearch"]
+
+
+class RepoLocks:
+    """One asyncio.Lock per repo workspace. Every workspace toucher — stage runs,
+    sentry/task fixes, memory bootstraps, chat runs, canonical product-scope reads —
+    must hold the repo's lock. In-process: the service MUST run single-process
+    (uvicorn workers=1; see deploy wiring)."""
+
+    def __init__(self):
+        self._locks: dict[str, asyncio.Lock] = {}
+
+    def for_repo(self, repo: str) -> asyncio.Lock:
+        if repo not in self._locks:
+            self._locks[repo] = asyncio.Lock()
+        return self._locks[repo]
+
+    def is_busy(self, repo: str) -> bool:
+        lock = self._locks.get(repo)
+        return bool(lock and lock.locked())
 
 PR_LINE_RE = re.compile(
     r"^[\s`*>-]*PR_URL:\s*`?(https://github\.com/[\w./-]+/pull/\d+)`?[\s`]*$", re.MULTILINE
@@ -79,12 +105,14 @@ def extract_questions_last(analysis: str) -> str:
 
 
 class Engine:
-    def __init__(self, settings: Settings, store: JobStore, clickup: ClickUp):
+    def __init__(self, settings: Settings, store: JobStore, clickup: ClickUp,
+                 locks: RepoLocks | None = None):
         self.settings = settings
         self.store = store
         self.clickup = clickup
+        self.locks = locks or RepoLocks()
         self.sync = ArtifactSync(store, clickup, settings.clickup_mirror_max_chars)
-        self.memory = MemoryReader(settings)
+        self.memory = MemoryReader(settings, locks=self.locks)
 
     # ---------- the one entry point ----------
 
@@ -292,6 +320,7 @@ class Engine:
             "cost_usd": raw.meta.get("cost_usd"),
             "num_turns": raw.meta.get("num_turns"),
             "duration_ms": raw.meta.get("duration_ms"),
+            "session_id": raw.meta.get("session_id"),
         }
 
     async def _evidence(self, workspace, target, base_sha, stage, pr_url) -> str:
@@ -413,6 +442,92 @@ class Engine:
     async def _comment(self, job, text, raw: bool = False):
         body = text if raw else f"{GATE_PREFIX} {text}"
         await self.clickup.comment(job.get("clickup_task_id") or "", body)
+
+    # ---------- gate chat (artifact-primed, read-only — docs/CONVERSATIONS.md §2) ----------
+
+    async def chat(self, job: dict, message: str):
+        """Answer one gate-chat question. The human turn is already persisted (the
+        endpoint returns 202 immediately); this runs as a background task, waits
+        for the repo lock, and appends the engine turn — persist-then-poll, so the
+        dashboard's ordinary polling picks up the reply and nothing is lost if the
+        client disconnects."""
+        job_id = job["issue_id"]
+        stage = int(job.get("stage") or 0)
+        attempt = max(1, int(job.get("stage_attempts") or 1))
+        target = self.settings.repo_for_project(job.get("project") or "")
+
+        try:
+            reply, meta, degraded = await self._chat_inner(job, stage, message, target)
+        except Exception as e:
+            log.exception("chat run failed for %s", job_id)
+            reply, meta, degraded = (f"(chat failed: {str(e)[:300]} — the question is "
+                                     "recorded; answer the gate with Proceed/Redo/Skip)"), {}, True
+
+        self.store.chat_add(
+            job_id, stage, attempt, "engine", reply,
+            cost_usd=meta.get("cost_usd"), num_turns=meta.get("num_turns"),
+            duration_ms=meta.get("duration_ms"), session_id=meta.get("session_id") or "",
+            degraded=degraded,
+        )
+        # mirror the exchange to the ticket — ClickUp stays the record
+        await self.clickup.comment(
+            job.get("clickup_task_id") or "",
+            f"{GATE_PREFIX} 💬 **Q (P{stage} gate):** {message[:800]}\n\n"
+            f"**A:** {reply[:6000]}\n\n"
+            "_Replies here must start with /proceed, /redo, or /skip._",
+        )
+
+    async def _chat_inner(self, job, stage, message, target) -> tuple[str, dict, bool]:
+        job_id = job["issue_id"]
+        if target is None:
+            return "(no repo is mapped for this project — cannot answer from code)", {}, True
+        branch = f"brain/feat-{job_id}"
+
+        async with self.locks.for_repo(target.repo):
+            # re-validate under the lock: the gate may have been answered while queued
+            fresh = self.store.get(job_id)
+            if (not fresh or fresh["status"] != "awaiting_input"
+                    or int(fresh.get("stage") or 0) != stage):
+                return ("The gate was answered before I got to this — the pipeline has "
+                        "moved on. This question stays on the record."), {}, True
+            try:
+                workspace = await prepare_feature_workspace(self.settings, target, branch, stage)
+            except (BranchLostError, RuntimeError) as e:
+                return (f"(cannot check out the feature branch to answer from code: "
+                        f"{str(e)[:200]} — answering is limited to the gate summary)"), {}, True
+
+            inline: dict[str, str] = {}
+            for name in (stage_artifact(stage), "P1-prd.md"):
+                p = artifact_path(workspace, job_id, name)
+                if p.exists() and name not in inline:
+                    text = p.read_text().strip()
+                    inline[name] = text[:6000] + ("\n… (truncated — read the file)" if len(text) > 6000 else "")
+
+            prompt = build_chat_prompt(
+                target=target, branch=branch, job=job, stage=stage, message=message,
+                transcript=self.store.chat_for(job_id, stage)[:-1],  # exclude the turn being answered
+                inline_artifacts=inline,
+            )
+            raw = await run_claude_raw(
+                self.settings, workspace, prompt,
+                allowed_tools=CHAT_TOOLS,
+                timeout=self.settings.chat_timeout_seconds,
+                disallowed_tools=CHAT_DENIED_TOOLS,
+            )
+            # hygiene: a chat run must never leave residue for _checkpoint to commit
+            code, status = await git(workspace, "status", "--porcelain")
+            dirty = code == 0 and bool(status.strip())
+            if dirty:
+                await git(workspace, "reset", "--hard")
+                await git(workspace, "clean", "-fd")
+
+        if raw.status != "ok" or not raw.text.strip():
+            return (f"(chat run ended with `{raw.status}` — try again, or answer the "
+                    "gate with Proceed/Redo/Skip)"), self._meta(raw), True
+        reply = raw.text.strip()
+        if dirty:
+            reply += "\n\n_(note: the chat attempted writes; they were discarded)_"
+        return reply, self._meta(raw), False
 
     # ---------- memory bootstrap (kind=memory) ----------
 

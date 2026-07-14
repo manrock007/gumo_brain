@@ -91,11 +91,13 @@ class Settings(BaseSettings):
     stage_gates: str = ""  # future: comma list of auto-advance stages, e.g. "5,7"; empty = all gated
     reaper_grace_seconds: int = 600
 
-    # Conversational gates (docs/CONVERSATIONS.md)
+    # Conversational gates (docs/CONVERSATIONS.md — increment 1: artifact-primed chat)
     chat_timeout_seconds: int = 300
     chat_max_turns_per_gate: int = 10
-    max_asks_per_stage: int = 3
-    default_gate_mode: str = "full"  # full = every stage parks; light = P0/P1/P3/P9 + asks
+    # Increment 2 (session resume / STAGE_ASK) — relocating the CLI config dir to the
+    # data volume is a deploy-affecting substrate change (auth + onboarding state live
+    # there); OFF until the bootstrap contract in docs/CONVERSATIONS.md §1 is deployed.
+    session_persistence: bool = False
     session_ttl_days: int = 14
 
     @property

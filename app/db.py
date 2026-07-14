@@ -98,6 +98,11 @@ CREATE TABLE IF NOT EXISTS gate_chat (
     attempt INTEGER NOT NULL DEFAULT 1,
     role TEXT NOT NULL,              -- human | engine
     text TEXT NOT NULL,
+    cost_usd REAL,                   -- engine turns: CLI envelope telemetry
+    num_turns INTEGER,
+    duration_ms REAL,
+    session_id TEXT DEFAULT '',
+    degraded INTEGER NOT NULL DEFAULT 0,  -- answered from documents only (no session)
     at REAL NOT NULL
 );
 """
@@ -125,6 +130,13 @@ MIGRATIONS = {  # table -> columns added after that table first shipped (in-plac
     "stage_runs": {
         "session_id": "TEXT DEFAULT ''",
         "resumed": "INTEGER NOT NULL DEFAULT 0",
+    },
+    "gate_chat": {
+        "cost_usd": "REAL",
+        "num_turns": "INTEGER",
+        "duration_ms": "REAL",
+        "session_id": "TEXT DEFAULT ''",
+        "degraded": "INTEGER NOT NULL DEFAULT 0",
     },
 }
 
@@ -424,12 +436,27 @@ class JobStore:
 
     # ---------- gate chat (INSERT-only transcript) ----------
 
-    def chat_add(self, job_id: str, stage: int, attempt: int, role: str, text: str):
+    def chat_add(self, job_id: str, stage: int, attempt: int, role: str, text: str,
+                 cost_usd: float | None = None, num_turns: int | None = None,
+                 duration_ms: float | None = None, session_id: str = "",
+                 degraded: bool = False) -> int:
         with self._conn() as c:
-            c.execute(
-                "INSERT INTO gate_chat (job_id, stage, attempt, role, text, at) VALUES (?, ?, ?, ?, ?, ?)",
-                (job_id, stage, attempt, role, text, time.time()),
+            cur = c.execute(
+                """INSERT INTO gate_chat (job_id, stage, attempt, role, text,
+                     cost_usd, num_turns, duration_ms, session_id, degraded, at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (job_id, stage, attempt, role, text, cost_usd, num_turns,
+                 duration_ms, session_id, int(degraded), time.time()),
             )
+            return cur.lastrowid
+
+    def chat_last(self, job_id: str, stage: int) -> dict | None:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM gate_chat WHERE job_id = ? AND stage = ? ORDER BY id DESC LIMIT 1",
+                (job_id, stage),
+            ).fetchone()
+            return dict(row) if row else None
 
     def chat_for(self, job_id: str, stage: int | None = None) -> list[dict]:
         with self._conn() as c:

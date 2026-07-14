@@ -20,7 +20,7 @@ import time
 from .clickup import ClickUp
 from .config import Settings
 from .db import JobStore
-from .engine import GATE_PREFIX, Engine
+from .engine import GATE_PREFIX, Engine, RepoLocks
 from .fixer import prepare_workspace, run_claude
 from .grading import grade_issue
 from .prompts import (
@@ -70,7 +70,8 @@ class Worker:
         self._seq = itertools.count()
         self.sentry = SentryClient(settings)
         self.clickup = ClickUp(settings)
-        self.engine = Engine(settings, store, self.clickup)
+        self.locks = RepoLocks()
+        self.engine = Engine(settings, store, self.clickup, locks=self.locks)
 
     def _enqueue(self, job_id: str, priority: int):
         self.queue.put_nowait((priority, next(self._seq), job_id, time.time()))
@@ -203,17 +204,28 @@ class Worker:
                 self.queue.task_done()
 
     async def _process(self, job: dict, queued_at: float | None = None):
+        """Every workspace toucher runs under its repo's lock (chat runs and the
+        canonical product-scope reads take the same locks — see Engine.RepoLocks)."""
         kind = job.get("kind") or "sentry"
-        if kind == "feature":
-            result = await self.engine.run_stage(job, queued_at)
-            if result == "requeue":  # e.g. P6 auto-skip advanced the stage
-                self._enqueue(job["issue_id"], PRIO_HUMAN)
-        elif kind == "memory":
-            await self.engine.run_memory_bootstrap(job)
-        elif kind == "task":
-            await self._process_task(job)
-        else:
+        if kind == "sentry":
+            # a fresh sentry job's project isn't known until the issue is fetched;
+            # _process_sentry acquires the repo lock itself once it is
             await self._process_sentry(job)
+            return
+        target = self.settings.repo_for_project(job.get("project") or "")
+        if target is None:
+            self.store.set_status(job["issue_id"], "skipped",
+                                  detail=f"no repo mapped for '{job.get('project')}'")
+            return
+        async with self.locks.for_repo(target.repo):
+            if kind == "feature":
+                result = await self.engine.run_stage(job, queued_at)
+                if result == "requeue":  # e.g. P6 auto-skip advanced the stage
+                    self._enqueue(job["issue_id"], PRIO_HUMAN)
+            elif kind == "memory":
+                await self.engine.run_memory_bootstrap(job)
+            else:
+                await self._process_task(job)
 
     # ---------- sentry flow (v1) ----------
 
@@ -280,23 +292,24 @@ class Worker:
         stacktrace = format_stacktrace(event)
         branch = f"brain/sentry-{issue_id}"
 
-        if phase == 2:
-            prompt = build_phase2_prompt(
-                target=target, branch=branch, issue=issue_info, stacktrace=stacktrace,
-                clickup_task_id=task_id,
-                analysis=row.get("analysis") or "(analysis missing)",
-                guidance=row.get("guidance") or "(no guidance recorded)",
-            )
-            workspace = await prepare_workspace(self.settings, target, branch, keep_branch=True)
-        else:
-            prompt = build_fix_prompt(
-                target=target, branch=branch, issue=issue_info, stacktrace=stacktrace,
-                clickup_task_id=task_id,
-            )
-            workspace = await prepare_workspace(self.settings, target, branch)
+        async with self.locks.for_repo(target.repo):  # workspace toucher
+            if phase == 2:
+                prompt = build_phase2_prompt(
+                    target=target, branch=branch, issue=issue_info, stacktrace=stacktrace,
+                    clickup_task_id=task_id,
+                    analysis=row.get("analysis") or "(analysis missing)",
+                    guidance=row.get("guidance") or "(no guidance recorded)",
+                )
+                workspace = await prepare_workspace(self.settings, target, branch, keep_branch=True)
+            else:
+                prompt = build_fix_prompt(
+                    target=target, branch=branch, issue=issue_info, stacktrace=stacktrace,
+                    clickup_task_id=task_id,
+                )
+                workspace = await prepare_workspace(self.settings, target, branch)
 
-        log.info("running claude for issue %s phase %s (%s)", issue_id, phase, target.repo)
-        result = await run_claude(self.settings, target, workspace, prompt)
+            log.info("running claude for issue %s phase %s (%s)", issue_id, phase, target.repo)
+            result = await run_claude(self.settings, target, workspace, prompt)
         log.info("issue %s -> %s %s", issue_id, result.status, result.pr_url or "")
 
         if result.status == "needs_input":
@@ -630,6 +643,22 @@ class Worker:
                     payload = text[len(verb):].strip()
                     break
             if action is None:
+                # engine-authored comments (gate posts, chat mirrors) are inert
+                if text.startswith(GATE_PREFIX):
+                    if use_marker:
+                        self.store.set_fields(job["issue_id"], comment_marker=c["id"])
+                    continue
+                # a human replied conversationally — never drop it silently
+                # (docs/CONVERSATIONS.md §2): nudge once per comment, keep scanning
+                if (use_marker and job["status"] == "awaiting_input"
+                        and (job.get("kind") or "") == "feature" and text):
+                    await self.clickup.comment(
+                        job.get("clickup_task_id") or "",
+                        f"{GATE_PREFIX} I only act on `/proceed`, `/redo` or `/skip` here — "
+                        f"did you mean `/proceed {text[:120]}`? "
+                        "(For back-and-forth questions, use the chat box on the dashboard.)",
+                    )
+                    self.store.set_fields(job["issue_id"], comment_marker=c["id"])
                 continue
             try:
                 await self.answer_job(job["issue_id"], action, payload, via="clickup")

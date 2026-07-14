@@ -3,8 +3,10 @@
 Three intake panels (Sentry fix / request / feature pipeline P0-P9), a Product
 brain panel (per-repo memory freshness + bootstrap), and the four-column job
 queue. Feature cards carry a P0-P9 stage strip, a lazy per-stage stats table,
-and gates with Proceed / Redo / Skip. Typed gate answers survive re-renders
-(in-memory snapshot + localStorage drafts keyed `gb-draft-<job_id>`).
+and gates with Proceed / Redo / Skip, plus a per-gate chat with the engine
+(GET/POST api/jobs/{id}/chat, feature gates only). Typed gate answers and chat
+drafts survive re-renders (in-memory snapshot + localStorage drafts keyed
+`gb-draft-<job_id>` / `gb-chat-<job_id>`).
 
 NOTE: this module is one big Python string. It deliberately contains NO
 backslashes — JS regexes are built with `new RegExp` + `String.fromCharCode`
@@ -62,6 +64,17 @@ DASHBOARD_HTML = """<!doctype html>
   .answer button.redo { background:var(--warn); }
   .answer button:disabled { opacity:.5; }
   .answer .hint { margin:4px 0 0; }
+  .answer button.ask { background:var(--accent); }
+  .chat-log { display:flex; flex-direction:column; gap:6px; margin-top:6px; max-height:260px; overflow:auto; font-size:13px; }
+  .chat-log .turn { max-width:92%; align-self:flex-start; }
+  .chat-log .turn.human { align-self:flex-end; }
+  .chat-log .turn .b { white-space:pre-wrap; overflow-wrap:anywhere; border:1px solid var(--line); border-radius:8px; padding:6px 10px; background:var(--bg); }
+  .chat-log .turn.human .b { background:var(--accent); border-color:var(--accent); color:#fff; }
+  .chat-log .turn .c { font-size:11px; color:var(--muted); margin-top:1px; }
+  .chat-log .turn.human .c { text-align:right; }
+  .chat-log .turn.wait { color:var(--muted); font-size:12px; }
+  .spin { display:inline-block; width:10px; height:10px; border:2px solid var(--muted); border-top-color:transparent; border-radius:50%; margin-right:6px; vertical-align:-1px; animation:rot .9s linear infinite; }
+  @keyframes rot { to { transform:rotate(360deg); } }
   .brain { margin:0 0 24px; }
   .brain > summary { cursor:pointer; font-size:13px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); }
   .brain table, .stats-body table { border-collapse:collapse; font-size:12px; margin-top:8px; }
@@ -174,8 +187,17 @@ function answerBlock(j) {
   const hint = feature
     ? `<div class="hint">Redo re-runs this stage with your notes as corrections &mdash; optionally prefix 'P3 ' to redo an earlier stage.</div>`
     : '';
-  return `<div class="answer"><textarea id="ans-${id}" data-job="${id}" placeholder="Your answer / guidance&hellip;"></textarea>
-    ${hint}<div class="btns">${btns}</div></div>`;
+  const chat = feature
+    ? `<details class="chat" data-key="${id}:chat" data-job="${id}" data-updated="${esc(j.updated_at)}">
+        <summary>chat with the engine</summary>
+        <div class="chat-log" id="chat-log-${id}"><div class="empty">&hellip;</div></div>
+        <textarea id="chat-in-${id}" data-draft="gb-chat-${id}" placeholder="Ask about this gate&hellip;"></textarea>
+        <div class="btns"><button class="ask" id="chat-ask-${id}" onclick="askChat('${id}',this)">Ask</button></div>
+        <div class="hint">Answers come from the gate's documents and the repo (read-only). Typically 15&ndash;90s.</div>
+      </details>`
+    : '';
+  return `<div class="answer"><textarea id="ans-${id}" data-job="${id}" data-draft="gb-draft-${id}" placeholder="Your answer / guidance&hellip;"></textarea>
+    ${chat}${hint}<div class="btns">${btns}</div></div>`;
 }
 
 function card(j) {
@@ -217,24 +239,26 @@ function card(j) {
 // input must survive re-renders, even when the jobs payload changed) ----------
 
 function captureDrafts() {
+  // every draft-bearing textarea (gate answers gb-draft-<id>, gate chat
+  // gb-chat-<id>) carries its localStorage key in data-draft.
   const snap = {};
   let focus = null;
-  for (const t of document.querySelectorAll('.answer textarea')) {
-    snap[t.dataset.job] = t.value;
+  for (const t of document.querySelectorAll('textarea[data-draft]')) {
+    snap[t.dataset.draft] = t.value;
     if (t === document.activeElement)
-      focus = { job: t.dataset.job, start: t.selectionStart, end: t.selectionEnd };
+      focus = { key: t.dataset.draft, start: t.selectionStart, end: t.selectionEnd };
   }
   return { snap, focus };
 }
 
 function restoreDrafts(state) {
-  for (const t of document.querySelectorAll('.answer textarea')) {
-    const id = t.dataset.job;
+  for (const t of document.querySelectorAll('textarea[data-draft]')) {
+    const k = t.dataset.draft;
     // in-memory snapshot (freshest) first, then the localStorage draft
     // (survives reloads; written on every input, cleared on answered)
-    const v = state.snap[id] !== undefined ? state.snap[id] : localStorage.getItem('gb-draft-' + id);
+    const v = state.snap[k] !== undefined ? state.snap[k] : localStorage.getItem(k);
     if (v) t.value = v;
-    if (state.focus && state.focus.job === id) {
+    if (state.focus && state.focus.key === k) {
       t.focus();
       try { t.setSelectionRange(state.focus.start, state.focus.end); } catch (e) { /* ok */ }
     }
@@ -252,12 +276,14 @@ function renderJobs(jobs) {
       items.length ? items.map(card).join('') : '<div class="empty">none</div>';
   }
 
-  // re-open evidence/analysis/stats panels; stats bodies refill from cache
-  // first (no flicker), then the toggle event triggers a fresh fetch.
+  // re-open evidence/analysis/stats/chat panels; stats + chat bodies refill
+  // from cache first (no flicker), then the toggle event triggers a fetch.
   for (const d of document.querySelectorAll('details[data-key]')) {
     if (!open.has(d.dataset.key)) continue;
     if (d.classList.contains('stats') && statsCache[d.dataset.job])
       d.querySelector('.stats-body').innerHTML = statsCache[d.dataset.job];
+    if (d.classList.contains('chat') && chatCache[d.dataset.job])
+      paintChat(d.dataset.job);
     d.open = true;
   }
   restoreDrafts(drafts);
@@ -266,8 +292,8 @@ function renderJobs(jobs) {
 // persist drafts as they are typed (delegated: cards are re-created on render)
 document.addEventListener('input', (e) => {
   const t = e.target;
-  if (t && t.matches && t.matches('.answer textarea'))
-    localStorage.setItem('gb-draft-' + t.dataset.job, t.value);
+  if (t && t.matches && t.matches('textarea[data-draft]'))
+    localStorage.setItem(t.dataset.draft, t.value);
 });
 
 let lastJobs = '';
@@ -290,6 +316,7 @@ document.addEventListener('toggle', (e) => {
   const d = e.target;
   if (!d || !d.dataset || !d.dataset.key) return;
   if (d.open && d.classList.contains('stats')) loadStats(d.dataset.job); // refetch on each open
+  if (d.open && d.classList.contains('chat')) openChat(d.dataset.job);   // lazy fetch, cached
 }, true);
 
 function fmtMMSS(ms) {
@@ -344,6 +371,116 @@ async function loadStats(id) {
   }
   statsInflight.delete(id);
   if (body()) body().innerHTML = statsCache[id];
+}
+
+// ---------- gate chat (api/jobs/{id}/chat — feature gates only) ----------
+
+const chatCache = {};      // job id -> { key: updated_at at fetch, html, pending, limit }
+const chatInflight = new Set();
+const chatPollers = {};    // job id -> 5s interval handle while an answer is pending
+
+function chatTranscript(data) {
+  const turns = data.turns || [];
+  let h = '';
+  for (const t of turns) {
+    const human = t.role === 'human';
+    let meta = '';
+    if (t.degraded) meta += '(from documents only) ';
+    if (t.cost_usd != null) meta += '$' + Number(t.cost_usd).toFixed(2);
+    h += '<div class="turn ' + (human ? 'human' : 'engine') + '"><div class="b">' + esc(t.text) + '</div>'
+      + (meta ? '<div class="c">' + esc(meta) + '</div>' : '') + '</div>';
+    if (t.pending) h += '<div class="turn wait"><span class="spin"></span>answering&hellip;</div>';
+  }
+  return h || '<div class="empty">no messages yet &mdash; ask the engine about this gate</div>';
+}
+
+function paintChat(id) {
+  const c = chatCache[id];
+  const log = document.getElementById('chat-log-' + id);
+  if (!c || !log) return;
+  log.innerHTML = c.html;
+  log.scrollTop = log.scrollHeight;
+  const box = document.getElementById('chat-in-' + id);
+  const btn = document.getElementById('chat-ask-' + id);
+  if (box) {
+    box.disabled = c.limit;
+    if (c.limit) box.placeholder = 'chat limit reached for this gate — answer with Proceed/Redo/Skip';
+  }
+  if (btn) btn.disabled = c.limit;
+}
+
+async function loadChat(id) {
+  if (chatInflight.has(id)) return;
+  chatInflight.add(id);
+  const el = document.querySelector('details.chat[data-job="' + id + '"]');
+  const log = document.getElementById('chat-log-' + id);
+  if (log && !chatCache[id]) log.innerHTML = '<div class="empty">loading&hellip;</div>';
+  try {
+    const r = await fetch('api/jobs/' + encodeURIComponent(id) + '/chat');
+    const data = await r.json();
+    if (r.ok) {
+      chatCache[id] = { key: el ? el.dataset.updated : '', html: chatTranscript(data),
+                        pending: !!data.pending, limit: !!data.limit_reached };
+      if (data.pending) startChatPoll(id); else stopChatPoll(id);
+    } else {
+      chatCache[id] = { key: '', html: '<div class="empty">Error: ' + esc(data.detail || r.status) + '</div>',
+                        pending: false, limit: false };
+      stopChatPoll(id);
+    }
+  } catch (e) {
+    chatCache[id] = { key: '', html: '<div class="empty">Error: ' + esc(String(e)) + '</div>',
+                      pending: false, limit: false };
+  }
+  chatInflight.delete(id);
+  paintChat(id);
+}
+
+function openChat(id) {
+  // cache keyed by job + updated_at: reuse only while the card has not moved
+  // on and no answer is pending; otherwise (re)fetch.
+  const el = document.querySelector('details.chat[data-job="' + id + '"]');
+  const c = chatCache[id];
+  if (c && el && c.key === el.dataset.updated && !c.pending) { paintChat(id); return; }
+  loadChat(id);
+}
+
+async function askChat(id, btn) {
+  const msg = document.getElementById('msg');
+  const box = document.getElementById('chat-in-' + id);
+  const text = box ? box.value.trim() : '';
+  if (!text) return;
+  btn.disabled = true;
+  try {
+    const r = await fetch('api/jobs/' + encodeURIComponent(id) + '/chat', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({message: text}),
+    });
+    let data = {};
+    try { data = await r.json(); } catch (e2) { /* non-JSON error body */ }
+    if (r.status === 202) {
+      if (box) box.value = '';
+      localStorage.removeItem('gb-chat-' + id);
+      loadChat(id); // shows the pending turn + starts the 5s poll
+    } else {
+      // 409 = answer already in flight / chat limit reached; 404/500 = error
+      msg.textContent = 'Chat: ' + (data.detail || r.status);
+      if (r.status === 409) loadChat(id);
+    }
+  } catch (e) { msg.textContent = 'Chat error: ' + e; }
+  btn.disabled = false;
+}
+
+function startChatPoll(id) {
+  if (chatPollers[id]) return;
+  chatPollers[id] = setInterval(() => {
+    // stop when the card left awaiting_input (the chat panel is gone)
+    if (!document.getElementById('chat-log-' + id)) { stopChatPoll(id); return; }
+    loadChat(id);
+  }, 5000);
+}
+
+function stopChatPoll(id) {
+  if (chatPollers[id]) { clearInterval(chatPollers[id]); delete chatPollers[id]; }
 }
 
 // ---------- Product brain (api/memory) ----------
@@ -503,6 +640,8 @@ async function answer(id, action, btn) {
     const data = await r.json();
     if (r.ok) {
       localStorage.removeItem('gb-draft-' + id); // answered — drop the draft
+      localStorage.removeItem('gb-chat-' + id);  // the gate chat is over too
+      stopChatPoll(id); delete chatCache[id];
       msg.textContent = { proceed: 'Answer recorded — next run queued.',
                           redo: 'Redo queued.', skip: 'Skipped.' }[action] || ('OK: ' + data.status);
       refresh(true);
