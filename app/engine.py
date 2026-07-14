@@ -357,7 +357,11 @@ class Engine:
             return
         path.write_text(normalize(content))
         await git(workspace, "add", str(path))
-        await git(workspace, "commit", "-m", "guidance: record gate decisions")
+        code, out = await git(workspace, "commit", "-m", "guidance: record gate decisions")
+        if code != 0 and "nothing to commit" not in out:
+            # non-fatal: the stage-end checkpoint sweeps up uncommitted files,
+            # but a failing commit here should be visible, not silent
+            log.error("guidance.md commit failed: %s", out[-500:])
 
     async def _build_prompt(self, job, stage, target, branch, workspace,
                             redo_notes, edited) -> str:

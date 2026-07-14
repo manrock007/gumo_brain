@@ -297,8 +297,11 @@ async def feature_stats(job_id: str):
 async def memory_index():
     reader = MemoryReader(settings)
     mapping = json.loads(settings.repo_map)
-    return {slug: reader.cached(slug).get("meta", {}) | {
-        "exists": reader.cached(slug)["exists"]} for slug in sorted(mapping)}
+    out = {}
+    for slug in sorted(mapping):
+        cached = reader.cached(slug)  # one disk read per project, not two
+        out[slug] = cached.get("meta", {}) | {"exists": cached["exists"]}
+    return out
 
 
 @app.get("/api/memory/{project}", dependencies=[Depends(require_auth)])
