@@ -1,15 +1,46 @@
-# gumo_brain
+# gumo_brain — the Gumo Engine
 
-Self-hosted **Sentry + manual requests → Claude Code autofix** service. Work arrives two
-ways: a Sentry alert rule fires (or an issue is triggered manually), or a team member
-**submits a request** (bug fix / change request) on the dashboard. Either way gumo_brain
-opens (or adopts) a **ClickUp ticket** — the keeper of record for everything Claude and
-the humans decide — runs **headless Claude Code** (`claude -p`) in a clean clone of the
-owning repo, runs the repo's **unit tests**, and opens a **draft PR**.
-**Human-in-the-loop:** complex Sentry issues, and *every* manual request, park in
-`awaiting_input` — Claude posts root cause + fix strategy + concrete questions
-("new field on model A, or new model B?") to the ClickUp ticket, and the dashboard
-surfaces those questions in the queue so you can answer them in place.
+Self-hosted **software-development engine**: Sentry errors, manual requests, and full
+**feature pipelines** in; **draft PRs** out — with humans approving every consequential
+decision from a dashboard or ClickUp. Runs **headless Claude Code** (`claude -p`) in
+clean clones of the owning repos.
+
+Four job kinds:
+
+| kind | in | flow |
+|------|----|------|
+| `sentry` | alert webhook / manual / sweep | grade → fix → draft PR (HITL only if COMPLEX) |
+| `task` | dashboard (title or ClickUp URL) | analyse → **gate** → implement → draft PR |
+| `feature` | dashboard (title or ClickUp URL) | **P0 Intake → P9 Ship, human gate after every stage** |
+| `memory` | dashboard, per project | bootstrap `.gumo/` product memory → draft PR |
+
+The engine's three core mechanics (full spec: **[docs/ENGINE.md](docs/ENGINE.md)**):
+
+- **Staged pipeline with gates.** Features run P0 Intake / P1 PRD / P2 Recon /
+  P3 Design / P4 Plan / P5–P6 Build / P7 Test / P8 Review / P9 Ship — one headless run
+  per stage, parked at a gate after each. Answer `/proceed`, `/redo` (any earlier stage
+  too) or `/skip` on the ticket or inline on the dashboard. Code gates show
+  harness-captured evidence (diffstat, compare link, draft PR from P5 on).
+- **Shared artifacts.** Every stage's document (PRD, design, plan…) lives in git on the
+  feature branch (`.gumo/features/<job>/`) AND as an editable ClickUp subtask. Humans
+  edit in ClickUp — even mid-run — and the engine folds edits back into git with
+  human-wins reconciliation that tolerates ClickUp's markdown mangling. Git is the
+  source of truth; ClickUp is the editing surface; neither side's work is ever lost.
+- **Product memory.** `.gumo/memory/` (per repo) + `.gumo/product/` (canonical repo)
+  hold curated, git-versioned knowledge — what the product is, how it's built, the
+  codebase map, conventions, per-entry ADRs and changelog. Every stage prompt warms up
+  from it (capped excerpts + file pointers); every shipped PR feeds it back. Bootstrap
+  once per repo from the dashboard; freshness is tracked and shown.
+
+**Human-in-the-loop:** complex Sentry issues, *every* manual request, and *every*
+feature stage park in `awaiting_input` — the dashboard surfaces the exact questions
+("new field on model A, or new model B?") in the queue so you answer them in place;
+ClickUp comments work identically, and both channels are raced safely (single-writer
+compare-and-set).
+
+**Receipts:** every stage run records cost, turns, wall-clock, gate wait and redo count
+(`stage_runs`) — visible per feature on the dashboard, so the efficiency claim is
+measured, not asserted.
 
 ```
 Sentry alert rule ──webhook──▶ gumo_brain (FastAPI) ◀──trigger / submit request── dashboard
@@ -38,20 +69,25 @@ Also runs a periodic **sweep** that grades the top unresolved Sentry issues of t
 
 ## Endpoints
 
-- `GET /` — dashboard (basic auth, user `gumo`): pending / in-progress / awaiting-input /
-  completed jobs with Sentry, ClickUp and PR links; a manual "Fix it" trigger (Sentry issue
-  id, short id `GUMO-1A`, or URL); a "Submit a request" form (ClickUp URL, or title+summary
-  + project); and inline answering of awaiting-input questions.
-- `POST /api/trigger` — manual Sentry fix trigger, as JSON API (basic auth)
-- `POST /api/tasks` — submit a manual request: `{project, clickup?}` to adopt an existing
-  ClickUp task by URL/id, or `{project, title, summary?}` to create one (basic auth)
-- `POST /api/jobs/{job_id}/answer` — answer an awaiting-input job from the dashboard:
-  `{action: "proceed"|"skip", answer}`; the decision is posted to the ClickUp ticket
-  first, then phase 2 runs (basic auth)
-- `GET /api/jobs` — job list (basic auth)
-- `GET /api/projects` — configured project → repo mappings (basic auth)
-- `POST /webhooks/sentry` — Sentry internal-integration webhook (HMAC signature-verified)
-- `GET /health` — liveness + queue depth (no auth)
+All `api/*` and `/` behind basic auth (user `gumo`); `/health` and the webhook are open.
+
+- `GET /` — dashboard: intake (Sentry fix / request / **feature pipeline**), queue
+  columns with inline gate answering (Proceed / Redo / Skip), feature **stage strips**
+  P0–P9, per-feature stats (cost/duration/gate-wait per stage), and the **Product
+  brain** panel (memory freshness + bootstrap).
+- `POST /api/trigger` — manual Sentry fix trigger `{issue}`
+- `POST /api/tasks` — 2-phase request: `{project, clickup? | title+summary}`
+- `POST /api/features` — P0–P9 pipeline: same body + `owner?` (ClickUp user id for gate
+  notifications) and `related_to?` (sibling pipeline ids for cross-repo features)
+- `POST /api/jobs/{job_id}/answer` — `{action: proceed|redo|skip, answer}`; `redo`
+  accepts a `P<k>` prefix in the answer to re-run an earlier stage; 409 if the gate was
+  already answered via ClickUp
+- `GET /api/features/{job_id}/stats` — per-stage telemetry (runs, guidance, artifacts)
+- `GET /api/memory` / `GET /api/memory/{project}` — cached product-memory state
+- `POST /api/memory/{project}/bootstrap` — queue a memory bootstrap job
+- `GET /api/jobs`, `GET /api/projects` — job list, project→repo map
+- `POST /webhooks/sentry` — Sentry internal-integration webhook (HMAC verified)
+- `GET /health` — liveness + queue depth
 
 ## Grading
 
@@ -61,6 +97,29 @@ info/debug, or stale (`GRADE_STALE_DAYS`). Otherwise it scores on level, unhandl
 users affected, event volume and recency (minus points if a human is already assigned),
 and must reach `GRADE_MIN_SCORE`. Manual triggers bypass grading. Skips are recorded with
 their reasons and visible on the dashboard — no ClickUp ticket is created for them.
+
+## Feature pipelines (P0–P9)
+
+Submit on the dashboard (project + title/summary, or adopt a ClickUp ticket by URL).
+The pipeline runs one gated stage at a time:
+
+- **P0–P4 are document stages**: read-only runs that produce `P0-intake.md` →
+  `P4-plan.md` on the feature branch, each mirrored to an editable ClickUp subtask.
+  P0/P1 work from product memory alone (they say so explicitly if memory is missing).
+  P4 must structure the work into independently-committable **build groups** and map
+  every acceptance criterion to a planned test.
+- **P5–P8 are code stages**: build group 1 (opens the draft PR — the sentry review bot
+  starts working during your gate waits), remaining groups, tests (honest results table
+  vs the P1 acceptance criteria), self-review of the full diff.
+- **P9 ships**: distills memory (changelog entry, ADRs from your gate decisions,
+  touched architecture notes — riding the same PR), finalizes the PR body, and parks a
+  final "ready to un-draft" gate.
+
+Every gate: answer on the dashboard (buttons + guidance box) or comment `/proceed …`,
+`/redo …` (`/redo P3 …` re-targets an earlier stage; code-stage redos hard-reset to the
+stage baseline and preserve the failed attempt under `refs/gumo/`), or `/skip` — on the
+parent ticket or any artifact subtask. Cross-repo features: one pipeline per repo,
+server first, linked via `related_to`.
 
 ## Manual requests (ClickUp as the conveyor belt)
 

@@ -42,6 +42,17 @@ Post an update at each milestone: (1) root cause identified — explain it, \
 (4) done — summary + PR link. Short, information-dense updates."""
 
 
+def _memory_write_block() -> str:
+    return """
+
+## Product memory (include in the same commit/PR)
+
+If `.gumo/memory/` exists in this repo: add a one-entry changelog file
+`.gumo/memory/changelog/<YYYY-MM-DD>-<short-slug>.md` (2-4 lines: what changed, why,
+PR link placeholder), and update any `.gumo/memory/map.md` / `architecture.md`
+section your change makes inaccurate. If `.gumo/memory/` does not exist, skip this."""
+
+
 def _test_block(target: RepoTarget) -> str:
     if not target.test_cmd:
         return """
@@ -63,7 +74,7 @@ bug when the suite makes that natural. Report test results in the PR body and th
 
 def build_fix_prompt(*, target: RepoTarget, branch: str, issue: dict, stacktrace: str,
                      clickup_task_id: str | None) -> str:
-    return f"""{_common_header(target, branch, issue, stacktrace)}{_ticket_block(clickup_task_id)}{_test_block(target)}
+    return f"""{_common_header(target, branch, issue, stacktrace)}{_ticket_block(clickup_task_id)}{_test_block(target)}{_memory_write_block()}
 
 ## Your task
 
@@ -92,7 +103,7 @@ this repository — print `NO_FIX:` followed by a 2-3 sentence explanation inste
 
 def build_phase2_prompt(*, target: RepoTarget, branch: str, issue: dict, stacktrace: str,
                         clickup_task_id: str | None, analysis: str, guidance: str) -> str:
-    return f"""{_common_header(target, branch, issue, stacktrace)}{_ticket_block(clickup_task_id)}{_test_block(target)}
+    return f"""{_common_header(target, branch, issue, stacktrace)}{_ticket_block(clickup_task_id)}{_test_block(target)}{_memory_write_block()}
 
 ## Prior analysis (from your earlier investigation)
 
@@ -173,7 +184,7 @@ followed by a 2-3 sentence explanation that says what information is missing.
 
 def build_task_implement_prompt(*, target: RepoTarget, branch: str, task: dict, request: str,
                                 clickup_task_id: str | None, analysis: str, guidance: str) -> str:
-    return f"""{_task_header(target, branch, task, request)}{_ticket_block(clickup_task_id)}{_test_block(target)}
+    return f"""{_task_header(target, branch, task, request)}{_ticket_block(clickup_task_id)}{_test_block(target)}{_memory_write_block()}
 
 ## Prior analysis (from your earlier investigation)
 

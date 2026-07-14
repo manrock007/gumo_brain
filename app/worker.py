@@ -1,15 +1,18 @@
-"""Serial job worker: grade -> ClickUp ticket -> headless Claude run -> draft PR.
+"""Serial job worker: SQLite is the queue of record; the asyncio queue is a
+wakeup signal (docs/ENGINE.md §5).
 
-Handles two job kinds:
-- sentry: production errors (grading -> fix; HITL only when Claude judges it COMPLEX)
-- task:   manually reported requests (HITL always: analysis -> awaiting_input -> implement)
+Job kinds:
+- sentry:  grade -> fix (HITL only when Claude judges it COMPLEX)
+- task:    analyse -> gate -> implement
+- feature: P0-P9 pipeline, gate after every stage (delegated to Engine)
+- memory:  product-memory bootstrap -> draft PR
 
-Also runs two background loops:
-- ClickUp poller: advances `awaiting_input` jobs when a human replies /proceed or /skip
-- Sweep: periodically grades the top unresolved Sentry issues (legacy backlog pickup)
+Background loops: ClickUp poller (gate answers by comment, on the parent task
+or any artifact subtask), sweep, stale-run reaper.
 """
 
 import asyncio
+import itertools
 import logging
 import re
 import time
@@ -17,6 +20,7 @@ import time
 from .clickup import ClickUp
 from .config import Settings
 from .db import JobStore
+from .engine import GATE_PREFIX, Engine
 from .fixer import prepare_workspace, run_claude
 from .grading import grade_issue
 from .prompts import (
@@ -30,15 +34,27 @@ from .sentry_api import SentryClient, format_stacktrace
 log = logging.getLogger("brain.worker")
 
 ACTIVE_STATUSES = ("received", "queued", "running")
+TERMINAL_STATUSES = ("pr_opened", "no_fix", "skipped", "error", "timeout")
+
+# priority classes: live sentry >= answered feature stages / tasks > sweep
+PRIO_SENTRY = 0
+PRIO_HUMAN = 1
+PRIO_SWEEP = 2
 
 QUESTION_HEADING_RE = re.compile(r"^#{1,4}\s*(?:open\s+)?questions?\b.*$", re.IGNORECASE | re.MULTILINE)
+REDO_TARGET_RE = re.compile(r"^\s*[Pp](\d)\b\s*")
+
+
+class GateConflict(Exception):
+    """The gate was already answered through the other channel."""
 
 
 def extract_questions(analysis: str) -> str:
-    """Pull the `## Questions` section out of a NEEDS_INPUT analysis for the dashboard."""
-    m = QUESTION_HEADING_RE.search(analysis or "")
-    if m:
-        rest = analysis[m.end():]
+    """Pull the `## Questions` section out of an analysis for the dashboard.
+    Takes the LAST questions heading — stage payloads may embed earlier ones."""
+    matches = list(QUESTION_HEADING_RE.finditer(analysis or ""))
+    if matches:
+        rest = analysis[matches[-1].end():]
         nxt = re.search(r"^#{1,4}\s", rest, re.MULTILINE)
         section = (rest[: nxt.start()] if nxt else rest).strip()
         if section:
@@ -50,19 +66,30 @@ class Worker:
     def __init__(self, settings: Settings, store: JobStore):
         self.settings = settings
         self.store = store
-        self.queue: asyncio.Queue[str] = asyncio.Queue()
+        self.queue: asyncio.PriorityQueue = asyncio.PriorityQueue()
+        self._seq = itertools.count()
         self.sentry = SentryClient(settings)
         self.clickup = ClickUp(settings)
+        self.engine = Engine(settings, store, self.clickup)
+
+    def _enqueue(self, job_id: str, priority: int):
+        self.queue.put_nowait((priority, next(self._seq), job_id, time.time()))
+
+    def _priority_for(self, job: dict) -> int:
+        kind = job.get("kind") or "sentry"
+        if kind == "sentry":
+            return PRIO_SWEEP if job.get("source") == "sweep" else PRIO_SENTRY
+        return PRIO_HUMAN
 
     # ---------- intake ----------
 
     def intake(self, issue_id: str, source: str, forced: bool = False,
                title: str = "", project: str = "") -> str:
-        """Guardrails + enqueue; returns a human-readable decision."""
+        """Sentry issue guardrails + enqueue; returns a human-readable decision."""
         existing = self.store.get(issue_id)
         if existing:
             if existing["status"] in ACTIVE_STATUSES:
-                return f"issue {issue_id} already {existing['status']}"
+                return f"issue {issue_id} already in progress ({existing['status']})"
             if existing["status"] == "awaiting_input":
                 return f"issue {issue_id} is awaiting human input on {existing['clickup_task_url'] or 'its ticket'}"
             if existing["status"] == "pr_opened":
@@ -72,7 +99,7 @@ class Worker:
                 return f"issue {issue_id} in cooldown ({existing['status']})"
 
         self.store.insert(issue_id, source=source, forced=forced, title=title, project=project)
-        self.queue.put_nowait(issue_id)
+        self._enqueue(issue_id, PRIO_SWEEP if source == "sweep" else PRIO_SENTRY)
         return f"issue {issue_id} queued"
 
     def intake_task(self, job_id: str, title: str, project: str, request: str,
@@ -82,7 +109,7 @@ class Worker:
         existing = self.store.get(job_id)
         if existing:
             if existing["status"] in ACTIVE_STATUSES:
-                return f"request {job_id} already {existing['status']}"
+                return f"request {job_id} already in progress ({existing['status']})"
             if existing["status"] == "awaiting_input":
                 return f"request {job_id} is awaiting your input on {existing['clickup_task_url'] or 'its ticket'}"
             if existing["status"] == "pr_opened":
@@ -96,37 +123,99 @@ class Worker:
             clickup_task_id=clickup_task_id or "",
             clickup_task_url=clickup_task_url or "",
         )
-        self.queue.put_nowait(job_id)
+        self._enqueue(job_id, PRIO_HUMAN)
         return f"request {job_id} queued"
+
+    def intake_feature(self, job_id: str, title: str, project: str, request: str,
+                       clickup_task_id: str | None = None,
+                       clickup_task_url: str | None = None,
+                       cu_list_id: str = "", owner: str = "",
+                       related_jobs: str = "") -> str:
+        """Enqueue a feature pipeline at P0."""
+        existing = self.store.get(job_id)
+        if existing:
+            if existing["status"] in ACTIVE_STATUSES:
+                return f"feature {job_id} already in progress ({existing['status']})"
+            if existing["status"] == "awaiting_input":
+                return (f"feature {job_id} is parked at its P{existing['stage']} gate — "
+                        "answer it instead of resubmitting")
+            if existing["status"] in ("error", "timeout"):
+                return (f"feature {job_id} hit {existing['status']} at P{existing['stage']} — "
+                        "use redo (dashboard re-kick or `/redo` on the ticket) to resume")
+            if existing["status"] == "pr_opened":
+                return f"feature {job_id} already shipped: {existing['pr_url']}"
+            # terminal skipped/no_fix -> fresh restart of the pipeline (atomic below)
+
+        self.store.feature_intake(
+            job_id, title=title, project=project,
+            request=request,
+            stage=0,
+            stage_attempts=0,
+            pending_redo_stage=None,
+            analysis=None,
+            question="",
+            evidence="",
+            pr_url=None,
+            clickup_task_id=clickup_task_id or "",
+            clickup_task_url=clickup_task_url or "",
+            cu_list_id=cu_list_id,
+            owner=owner,
+            related_jobs=related_jobs,
+        )
+        self._enqueue(job_id, PRIO_HUMAN)
+        return f"feature {job_id} queued at P0"
+
+    def intake_memory(self, project: str) -> str:
+        job_id = f"mem-{project}"
+        existing = self.store.get(job_id)
+        if existing and existing["status"] in ACTIVE_STATUSES:
+            return f"memory bootstrap for {project} already in progress ({existing['status']})"
+        self.store.insert(job_id, source="manual", forced=True,
+                          title=f"memory bootstrap: {project}", project=project, kind="memory")
+        self._enqueue(job_id, PRIO_HUMAN)
+        return f"memory bootstrap for {project} queued"
 
     # ---------- main loop ----------
 
     async def run_forever(self):
         await self.clickup.load_statuses()
+        # SQLite is the queue of record: re-enqueue whatever a restart dropped
+        for job in self.store.requeueable():
+            self._enqueue(job["issue_id"], self._priority_for(job))
+            log.info("startup requeue: %s (%s)", job["issue_id"], job["status"])
         log.info("worker started")
         while True:
-            issue_id = await self.queue.get()
+            _, _, job_id, queued_at = await self.queue.get()
             try:
-                await self._process(issue_id)
+                job = self.store.get(job_id)
+                if job is None or job["status"] not in ("received", "queued"):
+                    continue  # stale wakeup — the DB row moved on
+                await self._process(job, queued_at)
             except Exception as e:
-                log.exception("job %s failed", issue_id)
-                self.store.set_status(issue_id, "error", detail=str(e)[:2000])
-                row = self.store.get(issue_id) or {}
+                log.exception("job %s failed", job_id)
+                self.store.set_status(job_id, "error", detail=str(e)[:2000])
+                row = self.store.get(job_id) or {}
                 await self.clickup.comment(
                     row.get("clickup_task_id") or "",
-                    f"gumo_brain hit an internal error on this issue: {str(e)[:500]}",
+                    f"{GATE_PREFIX} internal error on this job: {str(e)[:500]}",
                 )
             finally:
                 self.queue.task_done()
 
-    async def _process(self, job_id: str):
-        row = self.store.get(job_id)
-        if row is None:
-            return
-        if (row.get("kind") or "sentry") == "task":
-            await self._process_task(row)
+    async def _process(self, job: dict, queued_at: float | None = None):
+        kind = job.get("kind") or "sentry"
+        if kind == "feature":
+            result = await self.engine.run_stage(job, queued_at)
+            if result == "requeue":  # e.g. P6 auto-skip advanced the stage
+                self._enqueue(job["issue_id"], PRIO_HUMAN)
+        elif kind == "memory":
+            await self.engine.run_memory_bootstrap(job)
+        elif kind == "task":
+            await self._process_task(job)
         else:
-            await self._process_sentry(row)
+            await self._process_sentry(job)
+
+    # ---------- sentry flow (v1) ----------
 
     async def _process_sentry(self, row: dict):
         issue_id = row["issue_id"]
@@ -174,6 +263,7 @@ class Worker:
                 self.store.set_fields(issue_id, clickup_task_id=task_id, clickup_task_url=task_url)
                 row = self.store.get(issue_id)
 
+        self.store.set_fields(issue_id, run_started_at=time.time())
         self.store.set_status(issue_id, "running")
         await self.clickup.set_status(task_id or "", "running")
 
@@ -234,6 +324,8 @@ class Worker:
                 task_id or "", f"Run ended with status `{result.status}`: {result.detail[:500]}"
             )
 
+    # ---------- task flow (v1) ----------
+
     async def _process_task(self, row: dict):
         """Manually reported request: phase 1 analysis (always parks for approval),
         phase 2 implementation after a human answers."""
@@ -247,6 +339,7 @@ class Worker:
             return
 
         task_id = row.get("clickup_task_id") or ""
+        self.store.set_fields(job_id, run_started_at=time.time())
         self.store.set_status(job_id, "running")
         await self.clickup.set_status(task_id, "running")
 
@@ -298,8 +391,13 @@ class Worker:
     # ---------- HITL: parking and answering ----------
 
     async def _park_awaiting(self, job_id: str, task_id: str, analysis: str):
-        """Post the analysis to ClickUp (the record) and park the job for a human."""
-        self.store.set_fields(job_id, analysis=analysis, question=extract_questions(analysis))
+        """Park a task/sentry job. Crash-safe ordering: DB transition (with the
+        pre-comment marker) commits BEFORE the ClickUp comment is posted."""
+        comments = await self.clickup.comments(task_id)
+        marker = comments[-1]["id"] if comments else ""
+        self.store.set_fields(job_id, analysis=analysis,
+                              question=extract_questions(analysis), comment_marker=marker)
+        self.store.set_status(job_id, "awaiting_input", detail=analysis[:2000])
         await self.clickup.comment(
             task_id,
             "**Human input needed before I change anything.**\n\n"
@@ -307,46 +405,149 @@ class Worker:
             "Reply here with `/proceed <your decision/guidance>` to continue, or `/skip` "
             "to drop this — or answer directly on the gumo_brain dashboard.",
         )
-        # record the current tail of the comment stream; only later comments count
-        comments = await self.clickup.comments(task_id)
-        marker = comments[-1]["id"] if comments else ""
-        self.store.set_fields(job_id, comment_marker=marker)
-        self.store.set_status(job_id, "awaiting_input", detail=analysis[:2000])
         await self.clickup.set_status(task_id, "awaiting_input")
 
-    async def resolve_awaiting(self, job_id: str, action: str, answer: str) -> str:
-        """Dashboard answer to an awaiting_input job. The decision is posted to the
-        ClickUp ticket first so the ticket stays the keeper of record. Returns the
-        new job status. Raises KeyError (unknown job) / ValueError (not awaiting)."""
+    async def answer_job(self, job_id: str, action: str, text: str, via: str) -> str:
+        """Single resolution path for gate answers from BOTH channels.
+        Returns the new status. Raises KeyError (unknown), ValueError (invalid
+        action/state), GateConflict (lost the CAS race)."""
         job = self.store.get(job_id)
         if job is None:
             raise KeyError(job_id)
+        kind = job.get("kind") or "sentry"
+        if kind == "feature":
+            return await self._answer_feature(job, action, text, via)
+        if action == "redo":
+            raise ValueError(f"redo is only valid for feature pipelines, not kind '{kind}'")
+        return await self._answer_v1(job, action, text, via)
+
+    async def _answer_v1(self, job: dict, action: str, text: str, via: str) -> str:
+        job_id = job["issue_id"]
         if job["status"] != "awaiting_input":
             raise ValueError(f"job is '{job['status']}', not awaiting_input")
         task_id = job.get("clickup_task_id") or ""
 
         if action == "skip":
-            note = f" — {answer}" if answer else ""
-            await self.clickup.comment(task_id, f"**Decision (via dashboard):** skip{note}")
-            marker = await self._latest_comment_id(task_id, job)
-            self.store.set_fields(job_id, comment_marker=marker, question="")
-            self.store.set_status(job_id, "skipped", detail="skipped by human via dashboard")
+            if not self.store.cas_status(job_id, ["awaiting_input"], "skipped",
+                                         question="", detail=f"skipped by human via {via}"):
+                raise GateConflict("already answered")
+            if via == "dashboard":
+                await self.clickup.comment(task_id, f"{GATE_PREFIX} Decision (via dashboard): skip"
+                                                    + (f" — {text}" if text else ""))
             await self.clickup.set_status(task_id, "skipped")
             return "skipped"
 
-        guidance = answer or "Proceed as you proposed."
-        await self.clickup.comment(task_id, f"**Decision (via dashboard):** proceed — {guidance}")
-        marker = await self._latest_comment_id(task_id, job)
-        self.store.set_fields(job_id, guidance=guidance, phase=2,
-                              comment_marker=marker, question="")
-        self.store.set_status(job_id, "queued")
-        self.queue.put_nowait(job_id)
-        log.info("job %s advanced to phase 2 via dashboard", job_id)
+        guidance = text or "Proceed as you proposed."
+        if not self.store.cas_status(job_id, ["awaiting_input"], "queued",
+                                     guidance=guidance, phase=2, question=""):
+            raise GateConflict("already answered")
+        if via == "dashboard":
+            await self.clickup.comment(task_id, f"{GATE_PREFIX} Decision (via dashboard): proceed — {guidance}")
+        else:
+            await self.clickup.comment(task_id, "Got it — proceeding with the fix now.")
+        self._enqueue(job_id, PRIO_HUMAN)
+        log.info("job %s advanced to phase 2 via %s", job_id, via)
         return "queued"
 
-    async def _latest_comment_id(self, task_id: str, job: dict) -> str:
-        comments = await self.clickup.comments(task_id)
-        return comments[-1]["id"] if comments else (job.get("comment_marker") or "")
+    async def _answer_feature(self, job: dict, action: str, text: str, via: str) -> str:
+        job_id = job["issue_id"]
+        stage = int(job.get("stage") or 0)
+        task_id = job.get("clickup_task_id") or ""
+
+        if action == "skip":
+            if not self.store.cas_status(job_id, ["awaiting_input", "error", "timeout"],
+                                         "skipped", expected_stage=stage,
+                                         question="", detail=f"pipeline aborted by human via {via}"):
+                raise GateConflict("already answered")
+            self.store.guidance_add(job_id, stage, "skip", text, via, job.get("parked_head") or "")
+            self.store.stage_run_gate_answered(job_id, stage, "skip")
+            await self.clickup.comment(task_id, f"{GATE_PREFIX} Pipeline aborted at P{stage} (via {via})."
+                                                " The branch is left intact.")
+            await self.clickup.set_status(task_id, "skipped")
+            return "skipped"
+
+        if action == "redo":
+            target_stage = stage
+            m = REDO_TARGET_RE.match(text or "")
+            if m:
+                requested = int(m.group(1))
+                if requested > stage:
+                    raise ValueError(f"cannot redo P{requested}: pipeline is only at P{stage}")
+                target_stage = requested
+                text = text[m.end():].strip()
+            if not self.store.cas_status(job_id, ["awaiting_input", "error", "timeout"],
+                                         "queued", expected_stage=stage,
+                                         stage=target_stage, question="",
+                                         pending_redo_stage=target_stage):
+                raise GateConflict("already answered")
+            self.store.guidance_add(job_id, target_stage, "redo", text, via,
+                                    job.get("parked_head") or "")
+            self.store.stage_run_gate_answered(job_id, stage, "redo")
+            if target_stage < stage:
+                await self._mark_superseded(job, target_stage)
+            await self.clickup.comment(
+                task_id, f"{GATE_PREFIX} Redoing P{target_stage} (answered via {via})."
+                         + (f" Corrections: {text[:500]}" if text else ""))
+            self._enqueue(job_id, PRIO_HUMAN)
+            return "queued"
+
+        if action != "proceed":
+            raise ValueError(f"unknown action '{action}'")
+        if job["status"] != "awaiting_input":
+            raise ValueError(f"job is '{job['status']}', not awaiting_input")
+
+        guidance = text or "Approved — continue."
+        if stage >= 9:
+            final = "pr_opened" if job.get("pr_url") else "no_fix"
+            if not self.store.cas_status(job_id, ["awaiting_input"], final,
+                                         expected_stage=stage, question="",
+                                         detail="pipeline complete — P9 approved"):
+                raise GateConflict("already answered")
+            self.store.guidance_add(job_id, stage, "proceed", guidance, via,
+                                    job.get("parked_head") or "")
+            self.store.stage_run_gate_answered(job_id, stage, "proceed")
+            await self.clickup.comment(
+                task_id, f"{GATE_PREFIX} P9 approved (via {via}) — pipeline complete. "
+                         f"{'PR ready to un-draft: ' + job['pr_url'] if job.get('pr_url') else ''}")
+            await self.clickup.set_status(task_id, final)
+            return final
+
+        if not self.store.cas_status(job_id, ["awaiting_input"], "queued",
+                                     expected_stage=stage,
+                                     stage=stage + 1, stage_attempts=0, question=""):
+            raise GateConflict("already answered")
+        self.store.guidance_add(job_id, stage, "proceed", guidance, via,
+                                job.get("parked_head") or "")
+        self.store.stage_run_gate_answered(job_id, stage, "proceed")
+        await self.clickup.comment(
+            task_id, f"{GATE_PREFIX} P{stage} approved (via {via}) — running P{stage + 1} next.")
+        self._enqueue(job_id, PRIO_HUMAN)
+        log.info("feature %s advanced to P%s via %s", job_id, stage + 1, via)
+        return "queued"
+
+    async def _mark_superseded(self, job: dict, target_stage: int):
+        """Redo of an earlier stage: banner downstream artifact mirrors so humans
+        don't edit documents that are about to be regenerated."""
+        job_id = job["issue_id"]
+        for state in self.store.artifacts_for(job_id):
+            m = re.match(r"^P(\d)-", state["artifact"])
+            if not m or int(m.group(1)) <= target_stage or not state["subtask_id"]:
+                continue
+            task = await self.clickup.get_task(state["subtask_id"])
+            if not task or task.get("missing"):
+                continue
+            desc = task.get("description") or ""
+            if desc.startswith("**SUPERSEDED"):
+                continue
+            banner = (f"**SUPERSEDED by redo of P{target_stage} — this document will be "
+                      "regenerated; edits here will be ignored.**\n\n")
+            await self.clickup.update_description(state["subtask_id"], banner + desc)
+            readback = await self.clickup.get_task(state["subtask_id"])
+            if readback and not readback.get("missing"):
+                from .artifacts import semantic_hash
+                self.store.artifact_set(job_id, state["artifact"],
+                                        synced_hash=semantic_hash(readback.get("description") or ""),
+                                        flags="superseded")
 
     def _ticket_description(self, issue: dict, row: dict) -> str:
         return (
@@ -376,36 +577,71 @@ class Worker:
                 log.exception("ClickUp poll iteration failed")
 
     async def _poll_awaiting(self):
-        for job in self.store.by_status(["awaiting_input"]):
+        # error/timeout features are included so a `/redo` re-kick works by comment too
+        for job in self.store.by_status(["awaiting_input", "error", "timeout"]):
+            is_feature = (job.get("kind") or "sentry") == "feature"
+            if job["status"] != "awaiting_input" and not is_feature:
+                continue
             task_id = job.get("clickup_task_id")
             if not task_id:
                 continue
-            comments = await self.clickup.comments(task_id)
-            marker = job.get("comment_marker") or ""
-            seen_marker = not marker
-            for c in comments:
-                if not seen_marker:
-                    seen_marker = c["id"] == marker
-                    continue
-                text = (c.get("text") or "").strip()
-                lowered = text.lower()
-                if lowered.startswith("/proceed"):
-                    guidance = text[len("/proceed"):].strip() or "Proceed as you proposed."
-                    self.store.set_fields(
-                        job["issue_id"], guidance=guidance, phase=2,
-                        comment_marker=c["id"], question="",
-                    )
-                    self.store.set_status(job["issue_id"], "queued")
-                    self.queue.put_nowait(job["issue_id"])
-                    await self.clickup.comment(task_id, "Got it — proceeding with the fix now.")
-                    log.info("issue %s advanced to phase 2 via ClickUp", job["issue_id"])
+            handled = await self._scan_verbs(job, task_id, use_marker=True)
+            if handled or not is_feature:
+                continue
+            # feature gates also accept verbs on any artifact subtask
+            gate_posted = self._latest_gate_posted(job)
+            for state in self.store.artifacts_for(job["issue_id"]):
+                if state["subtask_id"]:
+                    if await self._scan_verbs(job, state["subtask_id"], use_marker=False,
+                                              after=gate_posted):
+                        break
+
+    def _latest_gate_posted(self, job: dict) -> float:
+        runs = self.store.stage_runs_for(job["issue_id"])
+        stamps = [r["gate_posted_at"] for r in runs
+                  if r["stage"] == job.get("stage") and r["gate_posted_at"]]
+        return max(stamps) if stamps else job.get("updated_at") or 0
+
+    async def _scan_verbs(self, job: dict, source_task_id: str, use_marker: bool,
+                          after: float = 0.0) -> bool:
+        """Scan one comment stream for gate verbs; route them through answer_job
+        (CAS makes reprocessing harmless). Returns True if a verb was handled."""
+        comments = await self.clickup.comments(source_task_id)
+        marker = job.get("comment_marker") or ""
+        if use_marker and not marker:
+            # No marker (adopted ticket, or a crash before the first park set one):
+            # NEVER replay the whole history — a months-old '/proceed' must not
+            # auto-answer this gate. Fall back to a date fence at gate-post time.
+            use_marker, after = False, self._latest_gate_posted(job)
+        seen_marker = not use_marker
+        for c in comments:
+            if use_marker and not seen_marker:
+                seen_marker = c["id"] == marker
+                continue
+            if not use_marker and c.get("date", 0) <= after:
+                continue
+            text = (c.get("text") or "").strip()
+            lowered = text.lower()
+            action = None
+            payload = ""
+            for verb in ("/proceed", "/redo", "/skip"):
+                if lowered.startswith(verb):
+                    action = verb[1:]
+                    payload = text[len(verb):].strip()
                     break
-                if lowered.startswith("/skip"):
-                    self.store.set_fields(job["issue_id"], comment_marker=c["id"], question="")
-                    self.store.set_status(job["issue_id"], "skipped", detail="skipped by human via ClickUp")
-                    await self.clickup.set_status(task_id, "skipped")
-                    await self.clickup.comment(task_id, "Understood — dropping this issue.")
-                    break
+            if action is None:
+                continue
+            try:
+                await self.answer_job(job["issue_id"], action, payload, via="clickup")
+            except GateConflict:
+                pass  # answered elsewhere — fine
+            except (ValueError, KeyError) as e:
+                await self.clickup.comment(job.get("clickup_task_id") or "",
+                                           f"{GATE_PREFIX} could not apply `{text[:80]}`: {e}")
+            if use_marker:
+                self.store.set_fields(job["issue_id"], comment_marker=c["id"])
+            return True
+        return False
 
     async def sweep_forever(self):
         if not self.settings.sweep_enabled:
@@ -432,3 +668,20 @@ class Worker:
             if picked >= self.settings.sweep_top_n:
                 break
         log.info("sweep done: %d candidates enqueued (grading decides the rest)", picked)
+
+    async def reap_forever(self):
+        """A 'running' row older than any plausible live run means the process
+        died mid-run (the subprocess dies with us) — surface it instead of
+        letting the job hang forever."""
+        # memory bootstraps hold 'running' across TWO full-length runs; size for the worst
+        horizon = 2 * self.settings.claude_timeout_seconds + self.settings.reaper_grace_seconds
+        while True:
+            try:
+                for job in self.store.stale_running(horizon):
+                    log.warning("reaping stale run: %s (started %.0fs ago)",
+                                job["issue_id"], time.time() - (job["run_started_at"] or 0))
+                    self.store.set_status(job["issue_id"], "error",
+                                          detail="reaped: run went stale (process restart?) — redo to resume")
+            except Exception:
+                log.exception("reaper iteration failed")
+            await asyncio.sleep(300)

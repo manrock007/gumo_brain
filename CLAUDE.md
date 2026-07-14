@@ -1,7 +1,15 @@
 # gumo_brain — notes for Claude
 
-Self-hosted Sentry → headless Claude Code autofix service. See README.md for
-architecture; app code in `app/`, deploy wiring lives in the gumoiac repo.
+Self-hosted software-development engine (Sentry fixes, manual requests, and
+P0–P9 feature pipelines with human gates) built on headless Claude Code runs.
+README.md for the overview; **docs/ENGINE.md is the authoritative spec** for
+the feature pipeline, the artifact sync invariants (human edits always win,
+fail closed), and product memory — read it before touching app/engine.py,
+app/artifacts.py, app/worker.py or app/memory.py. App code in `app/`; deploy
+wiring lives in the gumoiac repo.
+
+Run the tests with `python -m pytest tests/ -q` (they need fastapi/httpx from
+requirements.txt plus pytest; no network, no tokens).
 
 ## Sentry PR review loop
 

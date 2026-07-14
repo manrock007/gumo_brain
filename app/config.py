@@ -84,6 +84,13 @@ class Settings(BaseSettings):
     claude_model: str = ""  # empty -> CLI default
     claude_binary: str = "claude"
 
+    # Feature pipeline (docs/ENGINE.md)
+    doc_stage_timeout_seconds: int = 900   # P0-P4 are document-only runs
+    clickup_mirror_max_chars: int = 50000  # artifact size above this -> pointer mirror
+    memory_canonical_project: str = "gumo"  # repo hosting .gumo/product (product scope)
+    stage_gates: str = ""  # future: comma list of auto-advance stages, e.g. "5,7"; empty = all gated
+    reaper_grace_seconds: int = 600
+
     # Storage
     data_dir: str = "/data"
 
