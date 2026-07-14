@@ -121,6 +121,11 @@ stage baseline and preserve the failed attempt under `refs/gumo/`), or `/skip` �
 parent ticket or any artifact subtask. Cross-repo features: one pipeline per repo,
 server first, linked via `related_to`.
 
+**Gate chat**: before deciding, interrogate the engine from the dashboard — a read-only
+run primed with the gate's documents answers questions about the work ("why option B?
+what breaks at scale?") in ~15–90s, with every exchange mirrored to the ClickUp ticket
+and its cost visible per answer (see [docs/CONVERSATIONS.md](docs/CONVERSATIONS.md)).
+
 ## Manual requests (ClickUp as the conveyor belt)
 
 Anyone with dashboard access can hand Claude a bug fix or change request. Two ways:
