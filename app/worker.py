@@ -1,5 +1,9 @@
 """Serial job worker: grade -> ClickUp ticket -> headless Claude run -> draft PR.
 
+Handles two job kinds:
+- sentry: production errors (grading -> fix; HITL only when Claude judges it COMPLEX)
+- task:   manually reported requests (HITL always: analysis -> awaiting_input -> implement)
+
 Also runs two background loops:
 - ClickUp poller: advances `awaiting_input` jobs when a human replies /proceed or /skip
 - Sweep: periodically grades the top unresolved Sentry issues (legacy backlog pickup)
@@ -7,6 +11,7 @@ Also runs two background loops:
 
 import asyncio
 import logging
+import re
 import time
 
 from .clickup import ClickUp
@@ -14,12 +19,31 @@ from .config import Settings
 from .db import JobStore
 from .fixer import prepare_workspace, run_claude
 from .grading import grade_issue
-from .prompts import build_fix_prompt, build_phase2_prompt
+from .prompts import (
+    build_fix_prompt,
+    build_phase2_prompt,
+    build_task_implement_prompt,
+    build_task_plan_prompt,
+)
 from .sentry_api import SentryClient, format_stacktrace
 
 log = logging.getLogger("brain.worker")
 
 ACTIVE_STATUSES = ("received", "queued", "running")
+
+QUESTION_HEADING_RE = re.compile(r"^#{1,4}\s*(?:open\s+)?questions?\b.*$", re.IGNORECASE | re.MULTILINE)
+
+
+def extract_questions(analysis: str) -> str:
+    """Pull the `## Questions` section out of a NEEDS_INPUT analysis for the dashboard."""
+    m = QUESTION_HEADING_RE.search(analysis or "")
+    if m:
+        rest = analysis[m.end():]
+        nxt = re.search(r"^#{1,4}\s", rest, re.MULTILINE)
+        section = (rest[: nxt.start()] if nxt else rest).strip()
+        if section:
+            return section[:1500]
+    return (analysis or "").strip()[-600:]
 
 
 class Worker:
@@ -51,6 +75,30 @@ class Worker:
         self.queue.put_nowait(issue_id)
         return f"issue {issue_id} queued"
 
+    def intake_task(self, job_id: str, title: str, project: str, request: str,
+                    clickup_task_id: str | None = None,
+                    clickup_task_url: str | None = None) -> str:
+        """Enqueue a manually reported request (bug fix / change request)."""
+        existing = self.store.get(job_id)
+        if existing:
+            if existing["status"] in ACTIVE_STATUSES:
+                return f"request {job_id} already {existing['status']}"
+            if existing["status"] == "awaiting_input":
+                return f"request {job_id} is awaiting your input on {existing['clickup_task_url'] or 'its ticket'}"
+            if existing["status"] == "pr_opened":
+                return f"request {job_id} already has a PR: {existing['pr_url']}"
+
+        self.store.insert(job_id, source="manual", forced=True,
+                          title=title, project=project, kind="task")
+        self.store.set_fields(
+            job_id,
+            request=request,
+            clickup_task_id=clickup_task_id or "",
+            clickup_task_url=clickup_task_url or "",
+        )
+        self.queue.put_nowait(job_id)
+        return f"request {job_id} queued"
+
     # ---------- main loop ----------
 
     async def run_forever(self):
@@ -71,10 +119,17 @@ class Worker:
             finally:
                 self.queue.task_done()
 
-    async def _process(self, issue_id: str):
-        row = self.store.get(issue_id)
+    async def _process(self, job_id: str):
+        row = self.store.get(job_id)
         if row is None:
             return
+        if (row.get("kind") or "sentry") == "task":
+            await self._process_task(row)
+        else:
+            await self._process_sentry(row)
+
+    async def _process_sentry(self, row: dict):
+        issue_id = row["issue_id"]
         phase = int(row.get("phase") or 1)
         forced = bool(row.get("forced"))
 
@@ -155,20 +210,7 @@ class Worker:
         log.info("issue %s -> %s %s", issue_id, result.status, result.pr_url or "")
 
         if result.status == "needs_input":
-            self.store.set_fields(issue_id, analysis=result.detail)
-            await self.clickup.comment(
-                task_id or "",
-                "**Human input needed before I fix this.**\n\n"
-                f"{result.detail}\n\n---\n"
-                "Reply here with `/proceed <your decision/guidance>` to apply the fix, "
-                "or `/skip` to drop this issue.",
-            )
-            # record the current tail of the comment stream; only later comments count
-            comments = await self.clickup.comments(task_id or "")
-            marker = comments[-1]["id"] if comments else ""
-            self.store.set_fields(issue_id, comment_marker=marker)
-            self.store.set_status(issue_id, "awaiting_input", detail=result.detail[:2000])
-            await self.clickup.set_status(task_id or "", "awaiting_input")
+            await self._park_awaiting(issue_id, task_id or "", result.detail)
             return
 
         self.store.set_status(issue_id, result.status, pr_url=result.pr_url, detail=result.detail)
@@ -191,6 +233,120 @@ class Worker:
             await self.clickup.comment(
                 task_id or "", f"Run ended with status `{result.status}`: {result.detail[:500]}"
             )
+
+    async def _process_task(self, row: dict):
+        """Manually reported request: phase 1 analysis (always parks for approval),
+        phase 2 implementation after a human answers."""
+        job_id = row["issue_id"]
+        phase = int(row.get("phase") or 1)
+        project = row.get("project") or ""
+
+        target = self.settings.repo_for_project(project)
+        if target is None:
+            self.store.set_status(job_id, "skipped", detail=f"no repo mapped for '{project}'")
+            return
+
+        task_id = row.get("clickup_task_id") or ""
+        self.store.set_status(job_id, "running")
+        await self.clickup.set_status(task_id, "running")
+
+        task_info = {
+            "id": job_id,
+            "title": row.get("title") or "untitled request",
+            "url": row.get("clickup_task_url") or "",
+            "project": project,
+        }
+        request_text = row.get("request") or row.get("title") or ""
+        branch = f"brain/{job_id}"
+
+        if phase == 2:
+            prompt = build_task_implement_prompt(
+                target=target, branch=branch, task=task_info, request=request_text,
+                clickup_task_id=task_id or None,
+                analysis=row.get("analysis") or "(analysis missing)",
+                guidance=row.get("guidance") or "(no guidance recorded)",
+            )
+            workspace = await prepare_workspace(self.settings, target, branch, keep_branch=True)
+        else:
+            prompt = build_task_plan_prompt(
+                target=target, branch=branch, task=task_info, request=request_text,
+                clickup_task_id=task_id or None,
+            )
+            workspace = await prepare_workspace(self.settings, target, branch)
+
+        log.info("running claude for request %s phase %s (%s)", job_id, phase, target.repo)
+        result = await run_claude(self.settings, target, workspace, prompt)
+        log.info("request %s -> %s %s", job_id, result.status, result.pr_url or "")
+
+        if result.status == "needs_input":
+            await self._park_awaiting(job_id, task_id, result.detail)
+            return
+
+        self.store.set_status(job_id, result.status, pr_url=result.pr_url, detail=result.detail)
+        await self.clickup.set_status(task_id, result.status)
+
+        if result.status == "pr_opened":
+            await self.clickup.comment(task_id, f"Draft PR opened: {result.pr_url}")
+        elif result.status == "no_fix":
+            analysis = result.detail.split("NO_FIX:", 1)[-1].strip()[:1500]
+            await self.clickup.comment(task_id, f"No PR opened.\n\n{analysis}")
+        else:  # error / timeout
+            await self.clickup.comment(
+                task_id, f"Run ended with status `{result.status}`: {result.detail[:500]}"
+            )
+
+    # ---------- HITL: parking and answering ----------
+
+    async def _park_awaiting(self, job_id: str, task_id: str, analysis: str):
+        """Post the analysis to ClickUp (the record) and park the job for a human."""
+        self.store.set_fields(job_id, analysis=analysis, question=extract_questions(analysis))
+        await self.clickup.comment(
+            task_id,
+            "**Human input needed before I change anything.**\n\n"
+            f"{analysis}\n\n---\n"
+            "Reply here with `/proceed <your decision/guidance>` to continue, or `/skip` "
+            "to drop this — or answer directly on the gumo_brain dashboard.",
+        )
+        # record the current tail of the comment stream; only later comments count
+        comments = await self.clickup.comments(task_id)
+        marker = comments[-1]["id"] if comments else ""
+        self.store.set_fields(job_id, comment_marker=marker)
+        self.store.set_status(job_id, "awaiting_input", detail=analysis[:2000])
+        await self.clickup.set_status(task_id, "awaiting_input")
+
+    async def resolve_awaiting(self, job_id: str, action: str, answer: str) -> str:
+        """Dashboard answer to an awaiting_input job. The decision is posted to the
+        ClickUp ticket first so the ticket stays the keeper of record. Returns the
+        new job status. Raises KeyError (unknown job) / ValueError (not awaiting)."""
+        job = self.store.get(job_id)
+        if job is None:
+            raise KeyError(job_id)
+        if job["status"] != "awaiting_input":
+            raise ValueError(f"job is '{job['status']}', not awaiting_input")
+        task_id = job.get("clickup_task_id") or ""
+
+        if action == "skip":
+            note = f" — {answer}" if answer else ""
+            await self.clickup.comment(task_id, f"**Decision (via dashboard):** skip{note}")
+            marker = await self._latest_comment_id(task_id, job)
+            self.store.set_fields(job_id, comment_marker=marker, question="")
+            self.store.set_status(job_id, "skipped", detail="skipped by human via dashboard")
+            await self.clickup.set_status(task_id, "skipped")
+            return "skipped"
+
+        guidance = answer or "Proceed as you proposed."
+        await self.clickup.comment(task_id, f"**Decision (via dashboard):** proceed — {guidance}")
+        marker = await self._latest_comment_id(task_id, job)
+        self.store.set_fields(job_id, guidance=guidance, phase=2,
+                              comment_marker=marker, question="")
+        self.store.set_status(job_id, "queued")
+        self.queue.put_nowait(job_id)
+        log.info("job %s advanced to phase 2 via dashboard", job_id)
+        return "queued"
+
+    async def _latest_comment_id(self, task_id: str, job: dict) -> str:
+        comments = await self.clickup.comments(task_id)
+        return comments[-1]["id"] if comments else (job.get("comment_marker") or "")
 
     def _ticket_description(self, issue: dict, row: dict) -> str:
         return (
@@ -236,7 +392,8 @@ class Worker:
                 if lowered.startswith("/proceed"):
                     guidance = text[len("/proceed"):].strip() or "Proceed as you proposed."
                     self.store.set_fields(
-                        job["issue_id"], guidance=guidance, phase=2, comment_marker=c["id"]
+                        job["issue_id"], guidance=guidance, phase=2,
+                        comment_marker=c["id"], question="",
                     )
                     self.store.set_status(job["issue_id"], "queued")
                     self.queue.put_nowait(job["issue_id"])
@@ -244,7 +401,7 @@ class Worker:
                     log.info("issue %s advanced to phase 2 via ClickUp", job["issue_id"])
                     break
                 if lowered.startswith("/skip"):
-                    self.store.set_fields(job["issue_id"], comment_marker=c["id"])
+                    self.store.set_fields(job["issue_id"], comment_marker=c["id"], question="")
                     self.store.set_status(job["issue_id"], "skipped", detail="skipped by human via ClickUp")
                     await self.clickup.set_status(task_id, "skipped")
                     await self.clickup.comment(task_id, "Understood — dropping this issue.")

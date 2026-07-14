@@ -1,30 +1,36 @@
 # gumo_brain
 
-Self-hosted Sentry → Claude Code autofix service. When a Sentry alert rule fires (or an
-issue is triggered manually), gumo_brain **grades** the issue, opens a **ClickUp ticket**,
-runs **headless Claude Code** (`claude -p`) in a clean clone of the owning repo, runs the
-repo's **unit tests**, and — if Claude finds a clear root cause — opens a **draft PR**.
-Complex issues go through a **human-in-the-loop** step: Claude posts its root-cause
-analysis and questions on the ClickUp ticket and waits for a `/proceed` reply.
+Self-hosted **Sentry + manual requests → Claude Code autofix** service. Work arrives two
+ways: a Sentry alert rule fires (or an issue is triggered manually), or a team member
+**submits a request** (bug fix / change request) on the dashboard. Either way gumo_brain
+opens (or adopts) a **ClickUp ticket** — the keeper of record for everything Claude and
+the humans decide — runs **headless Claude Code** (`claude -p`) in a clean clone of the
+owning repo, runs the repo's **unit tests**, and opens a **draft PR**.
+**Human-in-the-loop:** complex Sentry issues, and *every* manual request, park in
+`awaiting_input` — Claude posts root cause + fix strategy + concrete questions
+("new field on model A, or new model B?") to the ClickUp ticket, and the dashboard
+surfaces those questions in the queue so you can answer them in place.
 
 ```
-Sentry alert rule ──webhook──▶ gumo_brain (FastAPI)          ◀──manual trigger── dashboard
-                                 │ verify signature
-                                 ▼
-                               GRADING  — skip resolved/ignored/stale/low-impact issues
-                                 │ score >= threshold (or forced)
-                                 ▼
-                               ClickUp ticket created ("Sentry Autofix" list)
-                                 ▼
-                               claude -p  (headless, allow-listed tools, runs unit tests)
-                                 │
-                    ┌────────────┼──────────────┐
-                    ▼            ▼              ▼
-                draft PR    NEEDS_INPUT      NO_FIX
-                + ticket    → analysis on    → analysis on
-                + Sentry      ticket, wait     ticket + Sentry
-                  comment     for /proceed
-                              or /skip ──▶ phase 2 fix with human guidance ──▶ draft PR
+Sentry alert rule ──webhook──▶ gumo_brain (FastAPI) ◀──trigger / submit request── dashboard
+                                 │ verify signature            │
+                                 ▼                             ▼
+                               GRADING (sentry only)     ClickUp ticket created or adopted
+                                 │ score >= threshold      (title+summary, or pasted URL)
+                                 ▼                             │
+                               ClickUp ticket created          ▼
+                                 ▼                       phase 1: ANALYSIS ONLY
+                               claude -p (headless)      root cause + fix strategy
+                                 │                             │ always
+                    ┌────────────┼──────────────┐              ▼
+                    ▼            ▼              ▼        awaiting_input ◀──────────────┐
+                draft PR    NEEDS_INPUT      NO_FIX      questions on ticket +         │
+                + ticket    → awaiting_input → analysis  dashboard queue               │
+                + Sentry      (same as ──▶)    on ticket       │ answer on dashboard,  │
+                  comment                                      │ or /proceed on ticket │
+                                                               ▼                       │
+                                                         phase 2: implement ──────────-┘
+                                                         (may ask again)  └▶ draft PR
 ```
 
 Also runs a periodic **sweep** that grades the top unresolved Sentry issues of the last
@@ -33,10 +39,17 @@ Also runs a periodic **sweep** that grades the top unresolved Sentry issues of t
 ## Endpoints
 
 - `GET /` — dashboard (basic auth, user `gumo`): pending / in-progress / awaiting-input /
-  completed jobs with Sentry, ClickUp and PR links, plus a manual "Fix it" trigger that
-  accepts an issue id, short id (`GUMO-1A`) or Sentry URL and returns the ClickUp ticket.
-- `POST /api/trigger` — same, as JSON API (basic auth)
+  completed jobs with Sentry, ClickUp and PR links; a manual "Fix it" trigger (Sentry issue
+  id, short id `GUMO-1A`, or URL); a "Submit a request" form (ClickUp URL, or title+summary
+  + project); and inline answering of awaiting-input questions.
+- `POST /api/trigger` — manual Sentry fix trigger, as JSON API (basic auth)
+- `POST /api/tasks` — submit a manual request: `{project, clickup?}` to adopt an existing
+  ClickUp task by URL/id, or `{project, title, summary?}` to create one (basic auth)
+- `POST /api/jobs/{job_id}/answer` — answer an awaiting-input job from the dashboard:
+  `{action: "proceed"|"skip", answer}`; the decision is posted to the ClickUp ticket
+  first, then phase 2 runs (basic auth)
 - `GET /api/jobs` — job list (basic auth)
+- `GET /api/projects` — configured project → repo mappings (basic auth)
 - `POST /webhooks/sentry` — Sentry internal-integration webhook (HMAC signature-verified)
 - `GET /health` — liveness + queue depth (no auth)
 
@@ -49,17 +62,40 @@ users affected, event volume and recency (minus points if a human is already ass
 and must reach `GRADE_MIN_SCORE`. Manual triggers bypass grading. Skips are recorded with
 their reasons and visible on the dashboard — no ClickUp ticket is created for them.
 
-## Human-in-the-loop (`/proceed` / `/skip`)
+## Manual requests (ClickUp as the conveyor belt)
 
-When Claude judges a fix COMPLEX (product decision, several defensible options), it stops
-before changing anything and posts its analysis + concrete questions to the ClickUp ticket.
-The job parks as `awaiting_input`. Reply on the ticket:
+Anyone with dashboard access can hand Claude a bug fix or change request. Two ways:
 
-- `/proceed use option B, keep the old behaviour behind the flag` — runs phase 2: the fix,
-  with your guidance treated as the decision.
-- `/skip` — drops the issue.
+- **Title + summary** on the dashboard → a ClickUp ticket is created in the autofix list.
+- **Paste a ClickUp task URL** → that ticket is adopted as-is (its name + description
+  become the request).
 
-The service polls awaiting tickets every `CLICKUP_POLL_SECONDS`.
+Both need a **project** (picks the target repo from `REPO_MAP`). Manual requests skip
+grading and the daily cap (a human vouched for them), and always run in two phases:
+
+1. **Analysis only** — Claude explores the repo, writes up root cause / current behaviour,
+   a fix strategy (with options + trade-offs where several are defensible), and a
+   `## Questions` list. It is forbidden from changing code in this phase. The write-up
+   lands on the ClickUp ticket and the job parks as `awaiting_input`.
+2. **Implement** — after a human answers, Claude implements with the guidance treated as
+   the decision, runs the tests, and opens a draft PR (branch `brain/task-<id>`). If a new
+   decision surfaces mid-fix it can ask again, and the loop repeats.
+
+Every hand-off is a ClickUp comment, so the ticket is the full record of the work.
+
+## Human-in-the-loop (`awaiting_input`)
+
+Sentry issues Claude judges COMPLEX (product decision, several defensible options) and
+*all* manual requests park as `awaiting_input` with Claude's analysis + questions posted
+to the ClickUp ticket. Answer wherever is convenient:
+
+- **Dashboard** (primary): the awaiting-input card shows the questions in the queue
+  itself, with a reply box and Proceed/Skip buttons. Your answer is posted to the ClickUp
+  ticket as a `**Decision (via dashboard)**` comment before the job advances — ClickUp
+  stays the keeper of record.
+- **ClickUp ticket**: reply `/proceed use option B, keep the old behaviour behind the
+  flag` to run phase 2 with your guidance as the decision, or `/skip` to drop it. The
+  service polls awaiting tickets every `CLICKUP_POLL_SECONDS`.
 
 ## Unit tests
 
@@ -70,9 +106,10 @@ not runnable in-container yet — Claude is told to say so in the PR body.
 
 ## Other guardrails
 
-- One branch/PR per issue (`brain/sentry-<id>`); an issue with an open PR is never re-run.
+- One branch/PR per job (`brain/sentry-<id>` / `brain/task-<id>`); a job with an open PR
+  is never re-run.
 - Failed runs respect `ISSUE_COOLDOWN_HOURS`; `MAX_RUNS_PER_DAY` caps Claude invocations
-  (manual triggers exempt). One job runs at a time.
+  (manual triggers and requests exempt). One job runs at a time.
 - Claude gets an allow-list of tools, a hard timeout, and a prompt that treats stack-trace
   content as untrusted data. PRs are always drafts.
 - ClickUp is best-effort: an outage degrades tracking, never fixing.

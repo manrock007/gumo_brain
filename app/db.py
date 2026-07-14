@@ -4,7 +4,8 @@ from contextlib import contextmanager
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
-    issue_id TEXT PRIMARY KEY,
+    issue_id TEXT PRIMARY KEY,       -- Sentry issue id, or 'task-<clickup id>' for requests
+    kind TEXT NOT NULL DEFAULT 'sentry',  -- sentry | task (manually reported request)
     project TEXT NOT NULL DEFAULT '',
     title TEXT NOT NULL DEFAULT '',
     issue_url TEXT DEFAULT '',
@@ -15,8 +16,10 @@ CREATE TABLE IF NOT EXISTS jobs (
     source TEXT NOT NULL DEFAULT 'webhook',  -- webhook | sweep | manual
     score REAL,
     grade_reasons TEXT,
+    request TEXT DEFAULT '',         -- the human-written request (kind=task)
     analysis TEXT,                   -- phase-1 root-cause analysis (HITL flow)
-    guidance TEXT,                   -- human /proceed guidance from ClickUp
+    question TEXT DEFAULT '',        -- pending questions extracted from the analysis
+    guidance TEXT,                   -- human /proceed guidance from ClickUp/dashboard
     clickup_task_id TEXT,
     clickup_task_url TEXT,
     comment_marker TEXT DEFAULT '',  -- last ClickUp comment id we processed
@@ -28,12 +31,22 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 """
 
+MIGRATIONS = {  # column -> DDL, for databases created before the column existed
+    "kind": "TEXT NOT NULL DEFAULT 'sentry'",
+    "request": "TEXT DEFAULT ''",
+    "question": "TEXT DEFAULT ''",
+}
+
 
 class JobStore:
     def __init__(self, path: str):
         self._path = path
         with self._conn() as c:
             c.executescript(SCHEMA)
+            cols = {r["name"] for r in c.execute("PRAGMA table_info(jobs)").fetchall()}
+            for col, ddl in MIGRATIONS.items():
+                if col not in cols:
+                    c.execute(f"ALTER TABLE jobs ADD COLUMN {col} {ddl}")
 
     @contextmanager
     def _conn(self):
@@ -62,19 +75,23 @@ class JobStore:
             return row["n"]
 
     def insert(self, issue_id: str, source: str, forced: bool = False,
-               title: str = "", project: str = ""):
+               title: str = "", project: str = "", kind: str = "sentry"):
         now = time.time()
         with self._conn() as c:
             c.execute(
-                """INSERT INTO jobs (issue_id, project, title, status, source, forced, attempts, created_at, updated_at)
-                   VALUES (?, ?, ?, 'received', ?, ?, 1, ?, ?)
+                """INSERT INTO jobs (issue_id, kind, project, title, status, source, forced, attempts, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, 'received', ?, ?, 1, ?, ?)
                    ON CONFLICT(issue_id) DO UPDATE SET
                      status = 'received',
                      source = excluded.source,
                      forced = MAX(jobs.forced, excluded.forced),
+                     phase = 1,
+                     analysis = NULL,
+                     question = '',
+                     guidance = NULL,
                      attempts = jobs.attempts + 1,
                      updated_at = excluded.updated_at""",
-                (issue_id, project, title, source, int(forced), now, now),
+                (issue_id, kind, project, title, source, int(forced), now, now),
             )
 
     def set_fields(self, issue_id: str, **fields):
