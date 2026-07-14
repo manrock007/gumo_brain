@@ -73,7 +73,7 @@ class Worker:
         self.engine = Engine(settings, store, self.clickup)
 
     def _enqueue(self, job_id: str, priority: int):
-        self.queue.put_nowait((priority, next(self._seq), job_id))
+        self.queue.put_nowait((priority, next(self._seq), job_id, time.time()))
 
     def _priority_for(self, job: dict) -> int:
         kind = job.get("kind") or "sentry"
@@ -89,7 +89,7 @@ class Worker:
         existing = self.store.get(issue_id)
         if existing:
             if existing["status"] in ACTIVE_STATUSES:
-                return f"issue {issue_id} already {existing['status']}"
+                return f"issue {issue_id} already in progress ({existing['status']})"
             if existing["status"] == "awaiting_input":
                 return f"issue {issue_id} is awaiting human input on {existing['clickup_task_url'] or 'its ticket'}"
             if existing["status"] == "pr_opened":
@@ -109,7 +109,7 @@ class Worker:
         existing = self.store.get(job_id)
         if existing:
             if existing["status"] in ACTIVE_STATUSES:
-                return f"request {job_id} already {existing['status']}"
+                return f"request {job_id} already in progress ({existing['status']})"
             if existing["status"] == "awaiting_input":
                 return f"request {job_id} is awaiting your input on {existing['clickup_task_url'] or 'its ticket'}"
             if existing["status"] == "pr_opened":
@@ -135,7 +135,7 @@ class Worker:
         existing = self.store.get(job_id)
         if existing:
             if existing["status"] in ACTIVE_STATUSES:
-                return f"feature {job_id} already {existing['status']}"
+                return f"feature {job_id} already in progress ({existing['status']})"
             if existing["status"] == "awaiting_input":
                 return (f"feature {job_id} is parked at its P{existing['stage']} gate — "
                         "answer it instead of resubmitting")
@@ -154,6 +154,11 @@ class Worker:
             request=request,
             stage=0,
             stage_attempts=0,
+            pending_redo_stage=None,
+            analysis=None,
+            question="",
+            evidence="",
+            pr_url=None,
             clickup_task_id=clickup_task_id or "",
             clickup_task_url=clickup_task_url or "",
             cu_list_id=cu_list_id,
@@ -167,7 +172,7 @@ class Worker:
         job_id = f"mem-{project}"
         existing = self.store.get(job_id)
         if existing and existing["status"] in ACTIVE_STATUSES:
-            return f"memory bootstrap for {project} already {existing['status']}"
+            return f"memory bootstrap for {project} already in progress ({existing['status']})"
         self.store.insert(job_id, source="manual", forced=True,
                           title=f"memory bootstrap: {project}", project=project, kind="memory")
         self._enqueue(job_id, PRIO_HUMAN)
@@ -183,12 +188,12 @@ class Worker:
             log.info("startup requeue: %s (%s)", job["issue_id"], job["status"])
         log.info("worker started")
         while True:
-            _, _, job_id = await self.queue.get()
+            _, _, job_id, queued_at = await self.queue.get()
             try:
                 job = self.store.get(job_id)
                 if job is None or job["status"] not in ("received", "queued"):
                     continue  # stale wakeup — the DB row moved on
-                await self._process(job)
+                await self._process(job, queued_at)
             except Exception as e:
                 log.exception("job %s failed", job_id)
                 self.store.set_status(job_id, "error", detail=str(e)[:2000])
@@ -200,10 +205,10 @@ class Worker:
             finally:
                 self.queue.task_done()
 
-    async def _process(self, job: dict):
+    async def _process(self, job: dict, queued_at: float | None = None):
         kind = job.get("kind") or "sentry"
         if kind == "feature":
-            result = await self.engine.run_stage(job)
+            result = await self.engine.run_stage(job, queued_at)
             if result == "requeue":  # e.g. P6 auto-skip advanced the stage
                 self._enqueue(job["issue_id"], PRIO_HUMAN)
         elif kind == "memory":
@@ -475,7 +480,8 @@ class Worker:
                 text = text[m.end():].strip()
             if not self.store.cas_status(job_id, ["awaiting_input", "error", "timeout"],
                                          "queued", expected_stage=stage,
-                                         stage=target_stage, question=""):
+                                         stage=target_stage, question="",
+                                         pending_redo_stage=target_stage):
                 raise GateConflict("already answered")
             self.store.guidance_add(job_id, target_stage, "redo", text, via,
                                     job.get("parked_head") or "")
@@ -574,12 +580,16 @@ class Worker:
                 log.exception("ClickUp poll iteration failed")
 
     async def _poll_awaiting(self):
-        for job in self.store.by_status(["awaiting_input"]):
+        # error/timeout features are included so a `/redo` re-kick works by comment too
+        for job in self.store.by_status(["awaiting_input", "error", "timeout"]):
+            is_feature = (job.get("kind") or "sentry") == "feature"
+            if job["status"] != "awaiting_input" and not is_feature:
+                continue
             task_id = job.get("clickup_task_id")
             if not task_id:
                 continue
             handled = await self._scan_verbs(job, task_id, use_marker=True)
-            if handled or (job.get("kind") or "sentry") != "feature":
+            if handled or not is_feature:
                 continue
             # feature gates also accept verbs on any artifact subtask
             gate_posted = self._latest_gate_posted(job)
@@ -600,10 +610,16 @@ class Worker:
         """Scan one comment stream for gate verbs; route them through answer_job
         (CAS makes reprocessing harmless). Returns True if a verb was handled."""
         comments = await self.clickup.comments(source_task_id)
-        seen_marker = not use_marker or not (job.get("comment_marker") or "")
+        marker = job.get("comment_marker") or ""
+        if use_marker and not marker:
+            # No marker (adopted ticket, or a crash before the first park set one):
+            # NEVER replay the whole history — a months-old '/proceed' must not
+            # auto-answer this gate. Fall back to a date fence at gate-post time.
+            use_marker, after = False, self._latest_gate_posted(job)
+        seen_marker = not use_marker
         for c in comments:
             if use_marker and not seen_marker:
-                seen_marker = c["id"] == job.get("comment_marker")
+                seen_marker = c["id"] == marker
                 continue
             if not use_marker and c.get("date", 0) <= after:
                 continue
@@ -660,7 +676,8 @@ class Worker:
         """A 'running' row older than any plausible live run means the process
         died mid-run (the subprocess dies with us) — surface it instead of
         letting the job hang forever."""
-        horizon = self.settings.claude_timeout_seconds + self.settings.reaper_grace_seconds
+        # memory bootstraps hold 'running' across TWO full-length runs; size for the worst
+        horizon = 2 * self.settings.claude_timeout_seconds + self.settings.reaper_grace_seconds
         while True:
             try:
                 for job in self.store.stale_running(horizon):

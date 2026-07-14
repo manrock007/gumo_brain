@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     clickup_task_url TEXT,
     comment_marker TEXT DEFAULT '',  -- last ClickUp comment id we processed
     parked_head TEXT DEFAULT '',     -- branch HEAD at gate park (what the human answers against)
+    pending_redo_stage INTEGER,      -- set by a redo answer; consumed (reset) by the next run
     pr_url TEXT,
     detail TEXT,
     attempts INTEGER NOT NULL DEFAULT 0,
@@ -98,6 +99,7 @@ MIGRATIONS = {  # jobs columns added after v1 shipped -> DDL, for in-place upgra
     "cu_list_id": "TEXT DEFAULT ''",
     "run_started_at": "REAL",
     "parked_head": "TEXT DEFAULT ''",
+    "pending_redo_stage": "INTEGER",
 }
 
 
@@ -280,9 +282,13 @@ class JobStore:
             return [dict(r) for r in rows]
 
     def artifacts_clear(self, job_id: str):
+        """Full pipeline-state reset for a fresh restart. Keeps stage_runs (telemetry
+        is history) but clears guidance so a dead pipeline's redo notes can't leak
+        into the new run as binding corrections."""
         with self._conn() as c:
             c.execute("DELETE FROM artifact_state WHERE job_id = ?", (job_id,))
             c.execute("DELETE FROM stage_state WHERE job_id = ?", (job_id,))
+            c.execute("DELETE FROM guidance_log WHERE job_id = ?", (job_id,))
 
     # ---------- per-stage state ----------
 

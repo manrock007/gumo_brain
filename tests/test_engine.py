@@ -1,4 +1,4 @@
-from app.engine import extract_questions_last, parse_stage_output
+from app.engine import BUILD_GROUP_RE, extract_questions_last, parse_stage_output
 
 
 class TestParseStageOutput:
@@ -43,8 +43,27 @@ class TestParseStageOutput:
         assert marker == "done"
         assert pr == "https://github.com/manrock007/gumowebclient/pull/42"
 
+    def test_pr_line_tolerates_backticks_and_bullets(self):
+        # models often wrap the line; the regex must still find it
+        for line in (
+            "PR_URL: `https://github.com/x/y/pull/7`",
+            "- PR_URL: https://github.com/x/y/pull/7",
+            "> PR_URL:  https://github.com/x/y/pull/7",
+        ):
+            _, _, pr = parse_stage_output(f"{line}\nSTAGE_DONE:\nok\n## Questions\n1. ok?")
+            assert pr == "https://github.com/x/y/pull/7", line
+
     def test_empty(self):
         assert parse_stage_output("")[0] == "unparsed"
+
+
+class TestBuildGroupRegex:
+    def test_matches_h2_and_h3_and_case(self):
+        assert len(BUILD_GROUP_RE.findall("## Build group 1\n...\n## Build group 2\n")) == 2
+        assert len(BUILD_GROUP_RE.findall("### build group A\n#### Build Group B\n")) == 2
+
+    def test_single_group(self):
+        assert len(BUILD_GROUP_RE.findall("## Build group 1\nonly one")) == 1
 
 
 class TestExtractQuestionsLast:

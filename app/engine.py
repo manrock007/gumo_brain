@@ -38,9 +38,11 @@ log = logging.getLogger("brain.engine")
 GATE_PREFIX = "**[gumo_brain]**"
 DOC_STAGE_TOOLS = ["Read", "Grep", "Glob"]
 
-PR_LINE_RE = re.compile(r"^PR_URL:\s*(https://github\.com/[\w./-]+/pull/\d+)\s*$", re.MULTILINE)
+PR_LINE_RE = re.compile(
+    r"^[\s`*>-]*PR_URL:\s*`?(https://github\.com/[\w./-]+/pull/\d+)`?[\s`]*$", re.MULTILINE
+)
 QUESTION_HEADING_RE = re.compile(r"^#{1,4}\s*(?:open\s+)?questions?\b.*$", re.IGNORECASE | re.MULTILINE)
-BUILD_GROUP_RE = re.compile(r"^##\s*Build group\b", re.IGNORECASE | re.MULTILINE)
+BUILD_GROUP_RE = re.compile(r"^#{1,4}\s*build\s+group\b", re.IGNORECASE | re.MULTILINE)
 
 
 def parse_stage_output(text: str) -> tuple[str, str, str | None]:
@@ -122,7 +124,30 @@ class Engine:
         attempt = int(state["attempts"]) + 1
         workspace = await prepare_feature_workspace(self.settings, target, branch, stage)
 
-        # P6 auto-skips when the plan has a single build group (recorded, no gate)
+        # An explicit redo of THIS code stage rewinds to the stage baseline,
+        # preserving the rejected attempt under refs/gumo/. This keys off the
+        # pending_redo_stage flag set by the human's answer — `attempt > 1` alone
+        # also fires when the pipeline merely re-advances through this stage after
+        # an earlier-stage redo, which would hard-reset to a now-stale baseline.
+        redo_notes = self._pending_redo_notes(job_id, stage)
+        if (job.get("pending_redo_stage") == stage and stage_kind(stage) == "code"
+                and state.get("base_sha")):
+            await git(workspace, "update-ref",
+                      f"refs/gumo/{job_id}/P{stage}-attempt-{attempt - 1}", "HEAD")
+            await git(workspace, "push", "origin",
+                      f"refs/gumo/{job_id}/P{stage}-attempt-{attempt - 1}")
+            await git(workspace, "reset", "--hard", state["base_sha"])
+        if job.get("pending_redo_stage") == stage:
+            self.store.set_fields(job_id, pending_redo_stage=None)
+
+        # Fold in human edits AFTER any rewind, so they land on the baseline and
+        # can never be discarded by the reset. pull() pushes each edit to origin
+        # before advancing its synced_hash, so a mid-run crash can't lose an edit
+        # the bookkeeping already marked synced.
+        edited = await self.sync.pull(workspace, job, branch=branch)
+        await self._write_guidance_file(workspace, job)
+
+        # P6 auto-skips when the (post-pull) plan has a single build group
         if stage == 6 and not self._plan_has_multiple_groups(workspace, job_id):
             self.store.stage_run_close(run_id, "skipped_single_group")
             self.store.set_fields(job_id, stage=7, stage_attempts=0)
@@ -130,21 +155,6 @@ class Engine:
             log.info("job %s: P6 auto-skipped (single build group)", job_id)
             await self._comment(job, "P6 auto-skipped — the plan has a single build group. Queued P7.")
             return "requeue"
-
-        # fold in human edits made since the last stage; write the guidance file
-        edited = await self.sync.pull(workspace, job)
-        await self._write_guidance_file(workspace, job)
-
-        # redo of a code stage: preserve the failed attempt, reset to baseline
-        redo_notes = self._pending_redo_notes(job_id, stage)
-        if attempt > 1 and stage_kind(stage) == "code" and state.get("base_sha"):
-            await git(workspace, "update-ref",
-                      f"refs/gumo/{job_id}/P{stage}-attempt-{attempt - 1}", "HEAD")
-            await git(workspace, "push", "origin",
-                      f"refs/gumo/{job_id}/P{stage}-attempt-{attempt - 1}")
-            await git(workspace, "reset", "--hard", state["base_sha"])
-            # a redo must not lose human edits pulled above; re-pull onto the baseline
-            edited = list(set(edited) | set(await self.sync.pull(workspace, job)))
 
         code, head = await git(workspace, "rev-parse", "HEAD")
         base_sha = head.strip() if code == 0 else ""
@@ -163,12 +173,14 @@ class Engine:
         try:
             await self._after_run(job, stage, run_id, target, branch, workspace, raw, base_sha)
         finally:
-            # durability: whatever happened, nothing may exist only in the workspace
-            await self._checkpoint(workspace, branch, job_id, stage)
-            try:  # dashboard cache (base-pinned) — best-effort
+            # durability: whatever happened, nothing may exist only in the workspace.
+            # Never raise from here — a hiccup after a successful gate park must not
+            # flip the job to error and double-close the telemetry row.
+            try:
+                await self._checkpoint(workspace, branch, job_id, stage)
                 await self.memory.refresh_cache(job.get("project") or "", workspace, target.base)
             except Exception:
-                log.debug("memory cache refresh failed", exc_info=True)
+                log.exception("post-run checkpoint/cache refresh failed for %s", job_id)
 
     # ---------- post-run handling ----------
 
@@ -192,8 +204,17 @@ class Engine:
                 f"P{stage} {stage_name(stage)}: artifact",
             )
 
-        # push branch BEFORE mirroring so evidence links resolve
-        await self._checkpoint(workspace, branch, job_id, stage)
+        # push branch BEFORE mirroring so evidence links resolve. Fail closed:
+        # a gate must never advertise (diffstat, compare link) work that never
+        # reached origin, and the next stage reads origin/<branch>.
+        if not await self._checkpoint(workspace, branch, job_id, stage):
+            self.store.stage_run_close(run_id, "push_failed", **self._meta(raw))
+            self.store.set_status(job_id, "error",
+                                  detail="branch push to origin failed — stage output is only in "
+                                         "the workspace; redo after fixing connectivity/auth")
+            await self._comment(job, f"P{stage} finished but the branch push FAILED — not parking "
+                                     "a gate on unpushed work. `/redo` once resolved.")
+            return
         conflicted = await self.sync.push(workspace, job)
 
         if marker == "fail":
@@ -286,15 +307,28 @@ class Engine:
             lines.append(f"Draft PR: {pr_url}")
         return "\n".join(lines)
 
-    async def _checkpoint(self, workspace, branch, job_id, stage):
+    async def _checkpoint(self, workspace, branch, job_id, stage) -> bool:
         """Engine-owned durability: commit anything loose, always push the branch."""
         code, status = await git(workspace, "status", "--porcelain")
         if code == 0 and status.strip():
             await git(workspace, "add", "-A")
             await git(workspace, "commit", "-m", f"P{stage}: engine checkpoint (uncommitted stage output)")
-        code, out = await git(workspace, "push", "-u", "origin", branch, timeout=300)
+        ok = await self._push_branch(workspace, branch)
+        if not ok:
+            log.error("job %s: branch push failed", job_id)
+        return ok
+
+    async def _push_branch(self, workspace, branch) -> bool:
+        """Push with --force-with-lease: a code-stage redo legitimately rewrites
+        history (the rejected attempt is preserved under refs/gumo/), so a plain
+        push's non-fast-forward rejection would silently discard human-approved
+        redo work. The lease baseline is origin/<branch> fetched at stage start,
+        so a third-party push mid-run still correctly fails the lease."""
+        code, out = await git(workspace, "push", "--force-with-lease", "-u", "origin", branch,
+                              timeout=300)
         if code != 0:
-            log.error("job %s: branch push failed: %s", job_id, out[-500:])
+            log.error("push --force-with-lease origin %s failed: %s", branch, out[-500:])
+        return code == 0
 
     def _plan_has_multiple_groups(self, workspace, job_id) -> bool:
         path = artifact_path(workspace, job_id, "P4-plan.md")
@@ -409,6 +443,11 @@ class Engine:
             pr_url = found_pr or pr_url
             if marker == "fail":
                 self.store.set_status(job_id, "no_fix", detail=payload[:2000])
+                return
+            if marker == "unparsed":  # fail closed — never advance/complete on an unmarked run
+                self.store.set_status(job_id, "error",
+                                      detail=f"bootstrap run {run} ended without STAGE_DONE/"
+                                             f"STAGE_FAIL: {payload[-1500:]}")
                 return
         await self.memory.refresh_cache(project, workspace, target.base)
         self.store.set_status(job_id, "pr_opened" if pr_url else "no_fix",

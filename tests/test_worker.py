@@ -67,12 +67,15 @@ class TestIntakeGuards:
         worker.intake_feature("feat-2", title="F", project="web", request="r")
         worker.store.set_fields("feat-2", stage=5)
         worker.store.artifact_set("feat-2", "P1-prd.md", subtask_id="x", synced_hash="h")
+        worker.store.guidance_add("feat-2", 3, "redo", "old dead-pipeline note", "dashboard")
         worker.store.set_status("feat-2", "skipped")
 
         assert "queued" in worker.intake_feature("feat-2", title="F", project="web", request="r")
         row = worker.store.get("feat-2")
         assert row["stage"] == 0
         assert worker.store.artifacts_for("feat-2") == []
+        # the dead pipeline's guidance must NOT leak in as binding corrections
+        assert worker.store.guidance_for("feat-2") == []
 
     def test_priority_ordering(self, worker):
         worker.intake_task("task-p", title="T", project="web", request="r")     # PRIO_HUMAN
@@ -151,12 +154,14 @@ class TestAnswerFeature:
         assert status == "pr_opened"
         assert worker.store.get(job_id)["status"] == "pr_opened"
 
-    def test_redo_same_stage(self, worker):
+    def test_redo_same_stage_sets_pending_redo_flag(self, worker):
         job_id = self._park_feature(worker, stage=5)
         status = asyncio.run(worker.answer_job(job_id, "redo", "tighter tests", via="dashboard"))
         row = worker.store.get(job_id)
         assert status == "queued"
         assert row["stage"] == 5
+        # the flag tells the engine to rewind THIS stage to baseline (vs a mere re-advance)
+        assert row["pending_redo_stage"] == 5
         assert worker.store.guidance_for(job_id)[-1]["text"] == "tighter tests"
 
     def test_redo_targets_earlier_stage(self, worker):
@@ -164,9 +169,16 @@ class TestAnswerFeature:
         asyncio.run(worker.answer_job(job_id, "redo", "P3 wrong data model", via="clickup"))
         row = worker.store.get(job_id)
         assert row["stage"] == 3
+        assert row["pending_redo_stage"] == 3
         entry = worker.store.guidance_for(job_id)[-1]
         assert entry["stage"] == 3
         assert entry["text"] == "wrong data model"
+
+    def test_proceed_does_not_set_redo_flag(self, worker):
+        # re-advancing through a stage must NOT trigger the baseline rewind
+        job_id = self._park_feature(worker, stage=3)
+        asyncio.run(worker.answer_job(job_id, "proceed", "", via="dashboard"))
+        assert worker.store.get(job_id)["pending_redo_stage"] is None
 
     def test_redo_cannot_target_future_stage(self, worker):
         job_id = self._park_feature(worker, stage=2)

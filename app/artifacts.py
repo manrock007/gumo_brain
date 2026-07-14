@@ -103,9 +103,15 @@ class ArtifactSync:
 
     # ---------- pull: ClickUp -> git (before every stage run) ----------
 
-    async def pull(self, workspace: str, job: dict) -> list[str]:
+    async def pull(self, workspace: str, job: dict, branch: str | None = None) -> list[str]:
         """Fold human edits from ClickUp into the branch. Returns edited artifact
-        names. Never lets a missing/empty/short mirror overwrite git."""
+        names. Never lets a missing/empty/short mirror overwrite git.
+
+        Durability: when `branch` is given, a human-edit commit is pushed to
+        origin BEFORE synced_hash is advanced — otherwise a crash between the
+        local commit and the branch push would lose the edit while the hash
+        claims it is synced, and the next pull would see 'unchanged'. Without a
+        branch (tests / local-only), the hash advances immediately."""
         job_id = job["issue_id"]
         edited: list[str] = []
         if not self.clickup.enabled:
@@ -136,6 +142,13 @@ class ArtifactSync:
                 workspace, job_id, artifact, fetched,
                 f"artifact: human edit {artifact.removesuffix('.md')} (via ClickUp)",
             )
+            if committed and branch is not None:
+                code, _ = await git(workspace, "push", "--force-with-lease", "-u", "origin", branch)
+                if code != 0:
+                    # not durable — leave synced_hash unadvanced so the next pull
+                    # re-detects and re-commits this same edit (idempotent)
+                    log.error("job %s: push after pulling %s failed; will retry", job_id, artifact)
+                    continue
             self.store.artifact_set(job_id, artifact, synced_hash=fetched_hash)
             if committed:
                 edited.append(artifact)
@@ -161,11 +174,17 @@ class ArtifactSync:
                 await self._create_mirror(job, artifact, content)
                 continue
             subtask_id = state["subtask_id"]
+            truncated = "truncated" in (state["flags"] or "")
             task = await self.clickup.get_task(subtask_id)
             if task is None:
                 continue  # API failure — leave mirror + hash as-is, retry next sync
             if task.get("missing") or task.get("archived"):
                 await self._recreate_mirror(job, artifact, content)
+                continue
+            if truncated:
+                # the mirror is an intentional pointer, not an editing surface;
+                # never treat the banner as a human edit — just refresh the pointer
+                await self._put_and_fix(job_id, subtask_id, artifact, content)
                 continue
             current = task.get("description") or ""
             if (current.strip() and state["synced_hash"]
@@ -248,11 +267,13 @@ class ArtifactSync:
         if not truncated and len(got) < min(len(body), self.mirror_max_chars) * 0.5 and len(body) > 2000:
             truncated = True
             log.warning("job %s: %s readback truncated by ClickUp — switching to pointer mirror", job_id, artifact)
-            await self.clickup.update_description(
-                subtask_id,
-                f"**TRUNCATED MIRROR — full document lives in git at "
-                f"`{feature_dir(job_id)}/{artifact}`. Edit via gate comments, not here.**",
-            )
+            pointer = (f"**TRUNCATED MIRROR — full document lives in git at "
+                       f"`{feature_dir(job_id)}/{artifact}`. Edit via gate comments, not here.**")
+            await self.clickup.update_description(subtask_id, pointer)
+            # hash the POINTER readback, not the stale full-content one, else the
+            # next push() reads the banner as a 'human edit' and commits it to git
+            pb = await self.clickup.get_task(subtask_id)
+            got = pb.get("description") or pointer if pb and not pb.get("missing") else pointer
         self.store.artifact_set(
             job_id, artifact,
             synced_hash=semantic_hash(got),

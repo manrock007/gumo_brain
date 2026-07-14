@@ -211,6 +211,21 @@ class TestPushPull:
         sync.clickup.tasks[st]["description"] = "human scribbles on pointer"
         assert asyncio.run(sync.pull(workspace, job)) == []
 
+    def test_truncated_mirror_never_committed_back_as_human_edit(self, sync, job, workspace, store):
+        # regression: the pointer banner must not be mistaken for a human edit on
+        # the next push() and written into git over the real (large) artifact.
+        sync.clickup.tasks["parent1"] = {"description": "parent"}
+        big = "line of design text\n" * 400  # > 5000 chars
+        _write_artifact(workspace, "P3-design.md", big)
+        asyncio.run(sync.push(workspace, job))
+        assert "truncated" in store.artifact_get(JOB, "P3-design.md")["flags"]
+
+        # a second stage re-pushes the same artifact; must NOT clobber git with the banner
+        conflicted = asyncio.run(sync.push(workspace, job))
+        assert conflicted == []
+        assert "TRUNCATED MIRROR" not in artifact_path(workspace, JOB, "P3-design.md").read_text()
+        assert artifact_path(workspace, JOB, "P3-design.md").read_text().startswith("line of design text")
+
     def test_mirror_create_failure_flags_job_not_silent(self, sync, job, workspace, store):
         sync.clickup.tasks["parent1"] = {"description": "parent"}
         sync.clickup.tasks["__fail_create__"] = True
