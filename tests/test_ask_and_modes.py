@@ -146,6 +146,47 @@ class TestAutoAdvance:
         assert worker.engine._auto_advance_ok(job, 7, self.BOILER, None, []) is False
 
 
+class TestRequeuePropagation:
+    def test_auto_advance_requeue_reaches_the_worker(self, worker, monkeypatch, tmp_path):
+        """Regression (Seer round 3): _run_stage_inner must propagate _after_run's
+        'requeue' or a light-mode auto-advance stalls in status=queued forever."""
+        import app.engine as engine_mod
+
+        eng = worker.engine
+        worker.intake_feature("feat-rq1", title="F", project="web", request="r",
+                              gate_mode="light")
+        worker.store.set_fields("feat-rq1", stage=2)
+        job = worker.store.get("feat-rq1")
+
+        async def fake_prepare(*a, **k):
+            return str(tmp_path)
+
+        async def fake_git(*a, **k):
+            return (0, "abc123")
+
+        async def fake_pull(*a, **k):
+            return []
+
+        async def fake_after(*a, **k):
+            return "requeue"
+
+        async def anoop(*a, **k):
+            return None
+
+        monkeypatch.setattr(engine_mod, "prepare_feature_workspace", fake_prepare)
+        monkeypatch.setattr(engine_mod, "git", fake_git)
+        monkeypatch.setattr(eng.sync, "pull", fake_pull)
+        monkeypatch.setattr(eng, "_write_guidance_file", anoop)
+        monkeypatch.setattr(eng, "_invoke", anoop)
+        monkeypatch.setattr(eng, "_after_run", fake_after)
+        monkeypatch.setattr(eng, "_checkpoint", anoop)
+        monkeypatch.setattr(eng.memory, "refresh_cache", anoop)
+        monkeypatch.setattr(eng.clickup, "set_status", anoop)
+
+        result = asyncio.run(eng.run_stage(job))
+        assert result == "requeue"
+
+
 class TestChatDistillation:
     def test_proceed_records_last_engine_answer(self, worker):
         worker.intake_feature("feat-d1", title="F", project="web", request="r")

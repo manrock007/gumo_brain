@@ -250,7 +250,9 @@ class Engine:
             raw = await self._invoke(workspace, prompt, tools, timeout)
 
         try:
-            await self._after_run(job, stage, run_id, target, branch, workspace, raw, base_sha)
+            # propagate the result: a light-mode auto-advance returns "requeue",
+            # which the worker must see to re-enqueue the job (the finally still runs)
+            return await self._after_run(job, stage, run_id, target, branch, workspace, raw, base_sha)
         finally:
             # durability: whatever happened, nothing may exist only in the workspace.
             # Never raise from here — a hiccup after a successful gate park must not
