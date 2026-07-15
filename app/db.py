@@ -497,12 +497,21 @@ class JobStore:
             )
             return cur.lastrowid
 
-    def chat_last(self, job_id: str, stage: int) -> dict | None:
+    def chat_last(self, job_id: str, stage: int, attempt: int | None = None) -> dict | None:
+        """Latest turn for a stage — scoped to one ATTEMPT when given, so a
+        pending question from a redone attempt never blocks the fresh gate."""
         with self._conn() as c:
-            row = c.execute(
-                "SELECT * FROM gate_chat WHERE job_id = ? AND stage = ? ORDER BY id DESC LIMIT 1",
-                (job_id, stage),
-            ).fetchone()
+            if attempt is None:
+                row = c.execute(
+                    "SELECT * FROM gate_chat WHERE job_id = ? AND stage = ? ORDER BY id DESC LIMIT 1",
+                    (job_id, stage),
+                ).fetchone()
+            else:
+                row = c.execute(
+                    "SELECT * FROM gate_chat WHERE job_id = ? AND stage = ? AND attempt = ?"
+                    " ORDER BY id DESC LIMIT 1",
+                    (job_id, stage, attempt),
+                ).fetchone()
             return dict(row) if row else None
 
     def chat_for(self, job_id: str, stage: int | None = None) -> list[dict]:

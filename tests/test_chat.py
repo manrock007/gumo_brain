@@ -418,6 +418,19 @@ class TestChatEndpoints:
         g = c.get("/api/jobs/feat-api3/chat", headers=AUTH).json()
         assert g["limit_reached"] is True
 
+    def test_pending_scoped_per_attempt(self, client):
+        """Seer PR#8 round 4: an unanswered question from before a redo must not
+        wedge the fresh gate's chat for the stale-pending window."""
+        c, m = client
+        store = self._park_feature(m, "feat-api7")
+        store.chat_add("feat-api7", 3, 1, "human", "asked just before the redo")
+        # redo lands: same stage, new attempt
+        store.set_fields("feat-api7", stage_attempts=2)
+        g = c.get("/api/jobs/feat-api7/chat", headers=AUTH).json()
+        assert g["pending"] is False
+        r = c.post("/api/jobs/feat-api7/chat", headers=AUTH, json={"message": "fresh gate q"})
+        assert r.status_code == 202
+
     def test_turn_limit_resets_per_attempt(self, client):
         """Seer PR#8 round 3: the budget is per GATE (attempt) — a redo parks a
         new gate, so turns spent on the rejected attempt must not starve it."""

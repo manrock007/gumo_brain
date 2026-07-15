@@ -311,8 +311,11 @@ _chat_tasks: set = set()
 chat_broker = ChatBroker()
 
 
-def _chat_pending(store: JobStore, job_id: str, stage: int, timeout: float) -> bool:
-    last = store.chat_last(job_id, stage)
+def _chat_pending(store: JobStore, job_id: str, stage: int, timeout: float,
+                  attempt: int | None = None) -> bool:
+    # scoped to the current attempt: an unanswered question from before a redo
+    # must not wedge the fresh gate's chat for the whole stale-pending window
+    last = store.chat_last(job_id, stage, attempt)
     return bool(last and last["role"] == "human"
                 and time.time() - last["at"] < timeout + 60)
 
@@ -359,7 +362,7 @@ async def gate_chat_post(job_id: str, body: ChatBody):
     if store.chat_count(job_id, stage, attempt) >= settings.chat_max_turns_per_gate:
         raise HTTPException(status_code=409,
                             detail="chat limit reached for this gate — answer with proceed/redo/skip")
-    if _chat_pending(store, job_id, stage, settings.chat_timeout_seconds):
+    if _chat_pending(store, job_id, stage, settings.chat_timeout_seconds, attempt):
         raise HTTPException(status_code=409, detail="an answer is already in flight — wait for it")
 
     store.chat_add(job_id, stage, attempt, "human", message)
@@ -377,14 +380,15 @@ async def gate_chat_get(job_id: str):
     if job is None:
         raise HTTPException(status_code=404, detail=f"unknown job '{job_id}'")
     stage = int(job.get("stage") or 0)
+    attempt = max(1, int(job.get("stage_attempts") or 1))
     turns = store.chat_for(job_id, stage)
-    pending = _chat_pending(store, job_id, stage, settings.chat_timeout_seconds)
+    pending = _chat_pending(store, job_id, stage, settings.chat_timeout_seconds, attempt)
     if turns and pending:
         turns[-1]["pending"] = True
     return {
         "turns": turns,
         "pending": pending,
-        "limit_reached": store.chat_count(job_id, stage, max(1, int(job.get("stage_attempts") or 1)))
+        "limit_reached": store.chat_count(job_id, stage, attempt)
                          >= settings.chat_max_turns_per_gate,
     }
 
@@ -458,7 +462,8 @@ async def session_snapshot(job_id: str):
         # the full conversation across ALL stages (the inbox thread), plus the
         # current-stage pending/limit flags the composer needs
         "chat": store.chat_for(job_id),
-        "chat_pending": _chat_pending(store, job_id, stage, settings.chat_timeout_seconds),
+        "chat_pending": _chat_pending(store, job_id, stage, settings.chat_timeout_seconds,
+                                      max(1, int(job.get("stage_attempts") or 1))),
         "chat_limit": store.chat_count(job_id, stage, max(1, int(job.get("stage_attempts") or 1)))
                       >= settings.chat_max_turns_per_gate,
         "live": live,
