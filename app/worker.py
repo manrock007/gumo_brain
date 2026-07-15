@@ -302,24 +302,34 @@ class Worker:
         stacktrace = format_stacktrace(event)
         branch = f"brain/sentry-{issue_id}"
 
-        async with self.locks.for_repo(target.repo):  # workspace toucher
-            if phase == 2:
-                prompt = build_phase2_prompt(
-                    target=target, branch=branch, issue=issue_info, stacktrace=stacktrace,
-                    clickup_task_id=task_id,
-                    analysis=row.get("analysis") or "(analysis missing)",
-                    guidance=row.get("guidance") or "(no guidance recorded)",
-                )
-                workspace = await prepare_workspace(self.settings, target, branch, keep_branch=True)
-            else:
-                prompt = build_fix_prompt(
-                    target=target, branch=branch, issue=issue_info, stacktrace=stacktrace,
-                    clickup_task_id=task_id,
-                )
-                workspace = await prepare_workspace(self.settings, target, branch)
+        # live observation: v1 runs stream into the same broker the inbox detail
+        # pane subscribes to (session/stream), exactly like feature stages
+        broker = self.engine.stage_broker
+        broker.start(issue_id)
+        try:
+            async with self.locks.for_repo(target.repo):  # workspace toucher
+                broker.publish(issue_id, "status", "preparing the repository workspace")
+                if phase == 2:
+                    prompt = build_phase2_prompt(
+                        target=target, branch=branch, issue=issue_info, stacktrace=stacktrace,
+                        clickup_task_id=task_id,
+                        analysis=row.get("analysis") or "(analysis missing)",
+                        guidance=row.get("guidance") or "(no guidance recorded)",
+                    )
+                    workspace = await prepare_workspace(self.settings, target, branch, keep_branch=True)
+                else:
+                    prompt = build_fix_prompt(
+                        target=target, branch=branch, issue=issue_info, stacktrace=stacktrace,
+                        clickup_task_id=task_id,
+                    )
+                    workspace = await prepare_workspace(self.settings, target, branch)
 
-            log.info("running claude for issue %s phase %s (%s)", issue_id, phase, target.repo)
-            result = await run_claude(self.settings, target, workspace, prompt)
+                log.info("running claude for issue %s phase %s (%s)", issue_id, phase, target.repo)
+                result = await run_claude(
+                    self.settings, target, workspace, prompt,
+                    on_event=lambda e, d: broker.publish(issue_id, e, d))
+        finally:
+            broker.finish(issue_id)
         log.info("issue %s -> %s %s", issue_id, result.status, result.pr_url or "")
 
         if result.status == "needs_input":
@@ -375,23 +385,33 @@ class Worker:
         request_text = row.get("request") or row.get("title") or ""
         branch = f"brain/{job_id}"
 
-        if phase == 2:
-            prompt = build_task_implement_prompt(
-                target=target, branch=branch, task=task_info, request=request_text,
-                clickup_task_id=task_id or None,
-                analysis=row.get("analysis") or "(analysis missing)",
-                guidance=row.get("guidance") or "(no guidance recorded)",
-            )
-            workspace = await prepare_workspace(self.settings, target, branch, keep_branch=True)
-        else:
-            prompt = build_task_plan_prompt(
-                target=target, branch=branch, task=task_info, request=request_text,
-                clickup_task_id=task_id or None,
-            )
-            workspace = await prepare_workspace(self.settings, target, branch)
+        # live observation: stream this run to the inbox detail pane (see
+        # _process_sentry for the same wiring on the sentry path)
+        broker = self.engine.stage_broker
+        broker.start(job_id)
+        try:
+            broker.publish(job_id, "status", "preparing the repository workspace")
+            if phase == 2:
+                prompt = build_task_implement_prompt(
+                    target=target, branch=branch, task=task_info, request=request_text,
+                    clickup_task_id=task_id or None,
+                    analysis=row.get("analysis") or "(analysis missing)",
+                    guidance=row.get("guidance") or "(no guidance recorded)",
+                )
+                workspace = await prepare_workspace(self.settings, target, branch, keep_branch=True)
+            else:
+                prompt = build_task_plan_prompt(
+                    target=target, branch=branch, task=task_info, request=request_text,
+                    clickup_task_id=task_id or None,
+                )
+                workspace = await prepare_workspace(self.settings, target, branch)
 
-        log.info("running claude for request %s phase %s (%s)", job_id, phase, target.repo)
-        result = await run_claude(self.settings, target, workspace, prompt)
+            log.info("running claude for request %s phase %s (%s)", job_id, phase, target.repo)
+            result = await run_claude(
+                self.settings, target, workspace, prompt,
+                on_event=lambda e, d: broker.publish(job_id, e, d))
+        finally:
+            broker.finish(job_id)
         log.info("request %s -> %s %s", job_id, result.status, result.pr_url or "")
 
         if result.status == "needs_input":

@@ -261,6 +261,14 @@ guidance > older guidance; superseded guidance is marked.
   With nothing selected the right pane is the intake view (Sentry fix /
   request / feature pipeline + the Product brain table). Error/timeout re-kick
   lives in the gate packet.
+- **Every item kind is conversational and observable.** Sentry fixes and
+  requests get the same detail pane: their runs stream live over the same
+  broker (`run_claude` gains `on_event`), and Ask works for them too — the
+  fast lane primes from the item's record (request / analysis / question /
+  evidence) instead of stage artifacts; the slow lane is a read-only run on a
+  fresh checkout of the base branch. Steering stays feature-only (v1 runs
+  have no resumable session machinery); the gate answer box is their
+  correction channel.
 
 ### Live steering (mid-run course-correction)
 

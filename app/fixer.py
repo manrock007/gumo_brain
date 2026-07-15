@@ -475,13 +475,24 @@ async def run_claude_stream(settings: Settings, workspace: str, prompt: str,
     return RawRunResult("ok", result_text, meta)
 
 
-async def run_claude(settings: Settings, target: RepoTarget, workspace: str, prompt: str) -> FixResult:
-    """v1 contract used by sentry/task jobs: PR URL sniffing + NEEDS_INPUT/NO_FIX."""
-    raw = await run_claude_raw(
-        settings, workspace, prompt,
-        allowed_tools=BASE_ALLOWED_TOOLS + target.allow,
-        timeout=settings.claude_timeout_seconds,
-    )
+async def run_claude(settings: Settings, target: RepoTarget, workspace: str, prompt: str,
+                     on_event=None) -> FixResult:
+    """v1 contract used by sentry/task jobs: PR URL sniffing + NEEDS_INPUT/NO_FIX.
+    With on_event, the run streams live progress (tool calls / text) exactly like
+    stage runs — same return contract either way."""
+    if on_event is not None:
+        raw = await run_claude_stream(
+            settings, workspace, prompt,
+            allowed_tools=BASE_ALLOWED_TOOLS + target.allow,
+            timeout=settings.claude_timeout_seconds,
+            on_event=on_event,
+        )
+    else:
+        raw = await run_claude_raw(
+            settings, workspace, prompt,
+            allowed_tools=BASE_ALLOWED_TOOLS + target.allow,
+            timeout=settings.claude_timeout_seconds,
+        )
     if raw.status == "timeout":
         return FixResult("timeout", detail=raw.text, meta=raw.meta)
     if raw.status == "error":

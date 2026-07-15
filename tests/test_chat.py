@@ -53,6 +53,58 @@ class TestChatEngineFallbacks:
         assert last["degraded"] == 1
         assert "moved on" in last["text"]
 
+    def test_v1_chat_answers_from_the_record(self, worker, monkeypatch):
+        """Chat everywhere: a sentry item's chat routes through the v1 lanes —
+        fast lane primed from its request/analysis/question/evidence."""
+        from app import fastlane as fastlane_mod
+
+        worker.store.insert("sen-c1", source="manual", kind="sentry", title="TypeError in X")
+        worker.store.set_fields("sen-c1", project="web",
+                                analysis="root cause: id is None", question="ship the guard?")
+        worker.store.set_status("sen-c1", "awaiting_input")
+        job = worker.store.get("sen-c1")
+        worker.store.chat_add("sen-c1", 0, 1, "human", "why is id None?")
+
+        captured = {}
+
+        async def fake_fast(settings, system, messages, on_delta):
+            captured["system"] = system
+            return "ok", "because the serializer skips hydration", {"lane": "fast"}
+
+        monkeypatch.setattr(worker.engine.settings, "chat_fast_model", "m", raising=False)
+        monkeypatch.setattr(worker.engine.settings, "chat_api_key", "k", raising=False)
+        monkeypatch.setattr(fastlane_mod, "stream_answer", fake_fast)
+        import app.engine as engine_mod
+        monkeypatch.setattr(engine_mod.fastlane, "stream_answer", fake_fast)
+        asyncio.run(worker.engine.chat(job, "why is id None?"))
+        last = worker.store.chat_last("sen-c1", 0)
+        assert last["role"] == "engine"
+        assert "serializer" in last["text"]
+        assert not last["degraded"]
+        # the v1 system prompt is primed from the item's record, not stage artifacts
+        assert "root cause: id is None" in captured["system"]
+        assert "ship the guard?" in captured["system"]
+
+    def test_v1_slow_lane_reaches_the_workspace_step(self, worker, monkeypatch):
+        """The v1 slow lane checks out the BASE branch; with no workspace in tests
+        it degrades past the status guard (proving routing), never 'moved on'."""
+        import app.engine as engine_mod
+
+        worker.intake_task("task-c2", title="T", project="web", request="r")
+        worker.store.set_status("task-c2", "awaiting_input")
+        job = worker.store.get("task-c2")
+        worker.store.chat_add("task-c2", 0, 1, "human", "which file handles uploads?")
+
+        async def no_ws(*a, **k):
+            raise RuntimeError("no workspace in tests")
+
+        monkeypatch.setattr(engine_mod, "prepare_workspace", no_ws)
+        asyncio.run(worker.engine.chat(job, "which file handles uploads?"))
+        last = worker.store.chat_last("task-c2", 0)
+        assert last["role"] == "engine"
+        assert "moved on" not in last["text"]
+        assert "cannot check out" in last["text"]
+
     def test_running_job_passes_the_slow_lane_guard(self, worker, monkeypatch):
         """Seer PR#8 round 5: the endpoint admits mid-run chat, so the slow lane's
         under-lock re-validation must too — a running job at the SAME stage gets
@@ -406,14 +458,20 @@ class TestChatEndpoints:
         r = c.post("/api/jobs/feat-api1/chat", headers=AUTH, json={"message": "hi"})
         assert r.status_code == 409
 
-    def test_chat_only_for_features(self, client):
+    def test_chat_on_all_item_kinds(self, client):
+        """Chat everywhere: sentry/task items are conversational too; only
+        kinds with nothing to talk to (memory) stay 409."""
         c, m = client
         store = m.app.state.store
         m.app.state.worker.intake_task("task-api1", title="T", project="web", request="r")
         store.set_status("task-api1", "awaiting_input")
         r = c.post("/api/jobs/task-api1/chat", headers=AUTH, json={"message": "hi"})
+        assert r.status_code == 202
+        store.insert("mem-x", source="manual", kind="memory")
+        store.set_status("mem-x", "running")
+        r = c.post("/api/jobs/mem-x/chat", headers=AUTH, json={"message": "hi"})
         assert r.status_code == 409
-        assert "feature" in r.json()["detail"]
+        assert "kind" in r.json()["detail"]
 
     def test_single_flight_and_get(self, client):
         c, m = client

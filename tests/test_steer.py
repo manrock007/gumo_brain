@@ -203,10 +203,20 @@ class TestSessionRoutes:
         assert [t["role"] for t in data["chat"]] == ["human", "engine"]
         assert data["chat_pending"] is False
 
-    def test_snapshot_404_and_409(self, client):
+    def test_snapshot_serves_all_kinds(self, client):
         assert client.get("/api/jobs/nope/session", headers=AUTH).status_code == 404
-        client._main.app.state.store.insert("sen-1", source="manual", kind="sentry")
-        assert client.get("/api/jobs/sen-1/session", headers=AUTH).status_code == 409
+        store = client._main.app.state.store
+        store.insert("sen-1", source="manual", kind="sentry")
+        store.set_fields("sen-1", analysis="root cause: X", question="raise limit?")
+        store.set_status("sen-1", "awaiting_input")
+        r = client.get("/api/jobs/sen-1/session", headers=AUTH)
+        assert r.status_code == 200
+        data = r.json()
+        assert data["job"]["kind"] == "sentry"
+        assert data["job"]["analysis"] == "root cause: X"
+        assert data["runs"] == [] and data["artifacts"] == []
+        assert data["chat_available"] is True
+        assert data["steer_available"] is False  # steering stays feature-only
 
     def test_steer_endpoint_queues(self, client):
         # not running -> queued (guidance), 202
