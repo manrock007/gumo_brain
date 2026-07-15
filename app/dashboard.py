@@ -3,8 +3,10 @@
 Three intake panels (Sentry fix / request / feature pipeline P0-P9), a Product
 brain panel (per-repo memory freshness + bootstrap), and the four-column job
 queue. Feature cards carry a P0-P9 stage strip, a lazy per-stage stats table,
-and gates with Proceed / Redo / Skip. Typed gate answers survive re-renders
-(in-memory snapshot + localStorage drafts keyed `gb-draft-<job_id>`).
+and gates with Proceed / Redo / Skip, plus a per-gate chat with the engine
+(GET/POST api/jobs/{id}/chat, feature gates only). Typed gate answers and chat
+drafts survive re-renders (in-memory snapshot + localStorage drafts keyed
+`gb-draft-<job_id>` / `gb-chat-<job_id>`).
 
 NOTE: this module is one big Python string. It deliberately contains NO
 backslashes — JS regexes are built with `new RegExp` + `String.fromCharCode`
@@ -62,6 +64,17 @@ DASHBOARD_HTML = """<!doctype html>
   .answer button.redo { background:var(--warn); }
   .answer button:disabled { opacity:.5; }
   .answer .hint { margin:4px 0 0; }
+  .answer button.ask { background:var(--accent); }
+  .chat-log { display:flex; flex-direction:column; gap:6px; margin-top:6px; max-height:260px; overflow:auto; font-size:13px; }
+  .chat-log .turn { max-width:92%; align-self:flex-start; }
+  .chat-log .turn.human { align-self:flex-end; }
+  .chat-log .turn .b { white-space:pre-wrap; overflow-wrap:anywhere; border:1px solid var(--line); border-radius:8px; padding:6px 10px; background:var(--bg); }
+  .chat-log .turn.human .b { background:var(--accent); border-color:var(--accent); color:#fff; }
+  .chat-log .turn .c { font-size:11px; color:var(--muted); margin-top:1px; }
+  .chat-log .turn.human .c { text-align:right; }
+  .chat-log .turn.wait { color:var(--muted); font-size:12px; }
+  .spin { display:inline-block; width:10px; height:10px; border:2px solid var(--muted); border-top-color:transparent; border-radius:50%; margin-right:6px; vertical-align:-1px; animation:rot .9s linear infinite; }
+  @keyframes rot { to { transform:rotate(360deg); } }
   .brain { margin:0 0 24px; }
   .brain > summary { cursor:pointer; font-size:13px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); }
   .brain table, .stats-body table { border-collapse:collapse; font-size:12px; margin-top:8px; }
@@ -69,7 +82,7 @@ DASHBOARD_HTML = """<!doctype html>
   .brain th, .stats-body th { color:var(--muted); font-weight:600; }
   .brain button { padding:3px 10px; border:0; border-radius:6px; background:var(--accent); color:#fff; cursor:pointer; font:inherit; font-size:12px; }
   .brain button:disabled { opacity:.5; }
-  .ok-t { color:var(--ok); } .err-t { color:var(--err); }
+  .ok-t { color:var(--ok); } .err-t { color:var(--err); } .muted-t { color:var(--muted); }
 </style>
 </head>
 <body>
@@ -105,6 +118,10 @@ DASHBOARD_HTML = """<!doctype html>
       <input id="feat-title" placeholder="Title">
       <textarea id="feat-summary" placeholder="What should be built? Goal, users, constraints, links&hellip;"></textarea>
       <input id="feat-owner" placeholder="Owner — ClickUp user id (optional, gets gate notifications)">
+      <select id="feat-gatemode">
+        <option value="full" selected>full &mdash; pause at every stage (default)</option>
+        <option value="light">light &mdash; pause at P0/P1/P3/P9 + questions</option>
+      </select>
       <input id="feat-related" placeholder="Related pipeline job id(s) (optional, comma-separated)">
       <div class="hint">P0 Intake &rarr; P9 Ship; every stage parks below (and on ClickUp) for your Proceed / Redo / Skip.</div>
       <button id="feat-go">Start pipeline</button>
@@ -158,24 +175,43 @@ function stageStrip(j) {
   }
   const mirror = j.mirror_ok ? '' :
     '<span class="chip" title="ClickUp artifact mirror unhealthy — artifacts live in git; answer gates here">mirror off</span>';
+  const askq = j.status === 'awaiting_input' && j.gate_kind === 'ask'
+    ? '<span class="chip" title="the engine paused mid-stage to ask a question — answering resumes from the pause point">question &mdash; resumes in place</span>'
+    : '';
   return `<div class="strip">${segs}</div>
-    <div class="stagetext">P${cur} ${esc(j.stage_name || STAGE_NAMES[cur] || '')}${mirror}</div>`;
+    <div class="stagetext">P${cur} ${esc(j.stage_name || STAGE_NAMES[cur] || '')}${askq}${mirror}</div>`;
 }
 
 function answerBlock(j) {
   const id = esc(j.issue_id);
   const feature = j.kind === 'feature';
+  // STAGE_ASK gates: the engine paused mid-work to ask — 'proceed' delivers the
+  // answer and resumes in place, so the button reads Answer; Redo discards the
+  // pause point and restarts the stage.
+  const isAsk = j.gate_kind === 'ask';
+  const goLabel = isAsk ? 'Answer' : 'Proceed';
+  const redoTitle = isAsk ? ' title="restarts the stage fresh (discards the pause point)"' : '';
+  const placeholder = isAsk ? 'Your answer&hellip;' : 'Your answer / guidance&hellip;';
   const btns = feature
-    ? `<button class="go" onclick="answer('${id}','proceed',this)">Proceed</button>
-       <button class="redo" onclick="answer('${id}','redo',this)">Redo</button>
+    ? `<button class="go" onclick="answer('${id}','proceed',this)">${goLabel}</button>
+       <button class="redo"${redoTitle} onclick="answer('${id}','redo',this)">Redo</button>
        <button class="no" onclick="answer('${id}','skip',this)">Skip</button>`
-    : `<button class="go" onclick="answer('${id}','proceed',this)">Proceed</button>
+    : `<button class="go" onclick="answer('${id}','proceed',this)">${goLabel}</button>
        <button class="no" onclick="answer('${id}','skip',this)">Skip</button>`;
   const hint = feature
     ? `<div class="hint">Redo re-runs this stage with your notes as corrections &mdash; optionally prefix 'P3 ' to redo an earlier stage.</div>`
     : '';
-  return `<div class="answer"><textarea id="ans-${id}" data-job="${id}" placeholder="Your answer / guidance&hellip;"></textarea>
-    ${hint}<div class="btns">${btns}</div></div>`;
+  const chat = feature
+    ? `<details class="chat" data-key="${id}:chat" data-job="${id}" data-updated="${esc(j.updated_at)}">
+        <summary>chat with the engine</summary>
+        <div class="chat-log" id="chat-log-${id}"><div class="empty">&hellip;</div></div>
+        <textarea id="chat-in-${id}" data-draft="gb-chat-${id}" placeholder="Ask about this gate&hellip;"></textarea>
+        <div class="btns"><button class="ask" id="chat-ask-${id}" onclick="askChat('${id}',this)">Ask</button></div>
+        <div class="hint">Answers come from the gate's documents and the repo (read-only). Typically 15&ndash;90s.</div>
+      </details>`
+    : '';
+  return `<div class="answer"><textarea id="ans-${id}" data-job="${id}" data-draft="gb-draft-${id}" placeholder="${placeholder}"></textarea>
+    ${chat}${hint}<div class="btns">${btns}</div></div>`;
 }
 
 function card(j) {
@@ -217,24 +253,26 @@ function card(j) {
 // input must survive re-renders, even when the jobs payload changed) ----------
 
 function captureDrafts() {
+  // every draft-bearing textarea (gate answers gb-draft-<id>, gate chat
+  // gb-chat-<id>) carries its localStorage key in data-draft.
   const snap = {};
   let focus = null;
-  for (const t of document.querySelectorAll('.answer textarea')) {
-    snap[t.dataset.job] = t.value;
+  for (const t of document.querySelectorAll('textarea[data-draft]')) {
+    snap[t.dataset.draft] = t.value;
     if (t === document.activeElement)
-      focus = { job: t.dataset.job, start: t.selectionStart, end: t.selectionEnd };
+      focus = { key: t.dataset.draft, start: t.selectionStart, end: t.selectionEnd };
   }
   return { snap, focus };
 }
 
 function restoreDrafts(state) {
-  for (const t of document.querySelectorAll('.answer textarea')) {
-    const id = t.dataset.job;
+  for (const t of document.querySelectorAll('textarea[data-draft]')) {
+    const k = t.dataset.draft;
     // in-memory snapshot (freshest) first, then the localStorage draft
     // (survives reloads; written on every input, cleared on answered)
-    const v = state.snap[id] !== undefined ? state.snap[id] : localStorage.getItem('gb-draft-' + id);
+    const v = state.snap[k] !== undefined ? state.snap[k] : localStorage.getItem(k);
     if (v) t.value = v;
-    if (state.focus && state.focus.job === id) {
+    if (state.focus && state.focus.key === k) {
       t.focus();
       try { t.setSelectionRange(state.focus.start, state.focus.end); } catch (e) { /* ok */ }
     }
@@ -252,12 +290,14 @@ function renderJobs(jobs) {
       items.length ? items.map(card).join('') : '<div class="empty">none</div>';
   }
 
-  // re-open evidence/analysis/stats panels; stats bodies refill from cache
-  // first (no flicker), then the toggle event triggers a fresh fetch.
+  // re-open evidence/analysis/stats/chat panels; stats + chat bodies refill
+  // from cache first (no flicker), then the toggle event triggers a fetch.
   for (const d of document.querySelectorAll('details[data-key]')) {
     if (!open.has(d.dataset.key)) continue;
     if (d.classList.contains('stats') && statsCache[d.dataset.job])
       d.querySelector('.stats-body').innerHTML = statsCache[d.dataset.job];
+    if (d.classList.contains('chat') && chatCache[d.dataset.job])
+      paintChat(d.dataset.job);
     d.open = true;
   }
   restoreDrafts(drafts);
@@ -266,8 +306,8 @@ function renderJobs(jobs) {
 // persist drafts as they are typed (delegated: cards are re-created on render)
 document.addEventListener('input', (e) => {
   const t = e.target;
-  if (t && t.matches && t.matches('.answer textarea'))
-    localStorage.setItem('gb-draft-' + t.dataset.job, t.value);
+  if (t && t.matches && t.matches('textarea[data-draft]'))
+    localStorage.setItem(t.dataset.draft, t.value);
 });
 
 let lastJobs = '';
@@ -290,6 +330,7 @@ document.addEventListener('toggle', (e) => {
   const d = e.target;
   if (!d || !d.dataset || !d.dataset.key) return;
   if (d.open && d.classList.contains('stats')) loadStats(d.dataset.job); // refetch on each open
+  if (d.open && d.classList.contains('chat')) openChat(d.dataset.job);   // lazy fetch, cached
 }, true);
 
 function fmtMMSS(ms) {
@@ -312,19 +353,25 @@ function fmtWait(sec) {
 function statsTable(data) {
   const runs = data.runs || [];
   if (!runs.length) return '<div class="empty">no stage runs yet</div>';
+  const autoStages = new Set();  // stages the engine advanced without a human gate (light mode)
+  for (const g of data.guidance || []) if (g.action === 'auto') autoStages.add(Number(g.stage));
   const by = {};
   for (const r of runs) {  // aggregate per stage; runs arrive ordered, last status wins
-    const s = by[r.stage] || (by[r.stage] = { n: 0, dur: 0, cost: 0, wait: 0, status: '' });
+    const s = by[r.stage] || (by[r.stage] = { n: 0, dur: 0, cost: 0, wait: 0, status: '', gate: '' });
     s.n += 1;
     s.dur += r.duration_ms || 0;
     s.cost += r.cost_usd || 0;
     if (r.gate_posted_at && r.gate_answered_at) s.wait += Math.max(0, r.gate_answered_at - r.gate_posted_at);
     if (r.result_status) s.status = r.result_status;
+    s.gate = r.gate_action || '';  // latest run's gate_action wins ('' = never answered by a human)
   }
   const rows = Object.keys(by).map(Number).sort((a, b) => a - b).map(st => {
     const s = by[st];
+    const res = !s.gate && autoStages.has(st)
+      ? '<span class="muted-t" title="auto-advanced (light gate mode)">auto</span>'
+      : esc(s.status);
     return `<tr><td>P${st} ${esc(STAGE_NAMES[st] || '')}</td><td>${s.n}</td><td>${fmtMMSS(s.dur)}</td>
-      <td>$${s.cost.toFixed(2)}</td><td>${fmtWait(s.wait)}</td><td>${esc(s.status)}</td></tr>`;
+      <td>$${s.cost.toFixed(2)}</td><td>${fmtWait(s.wait)}</td><td>${res}</td></tr>`;
   }).join('');
   return `<table><tr><th>stage</th><th>attempts</th><th>duration</th><th>cost</th><th>gate wait</th><th>result</th></tr>${rows}</table>`;
 }
@@ -344,6 +391,116 @@ async function loadStats(id) {
   }
   statsInflight.delete(id);
   if (body()) body().innerHTML = statsCache[id];
+}
+
+// ---------- gate chat (api/jobs/{id}/chat — feature gates only) ----------
+
+const chatCache = {};      // job id -> { key: updated_at at fetch, html, pending, limit }
+const chatInflight = new Set();
+const chatPollers = {};    // job id -> 5s interval handle while an answer is pending
+
+function chatTranscript(data) {
+  const turns = data.turns || [];
+  let h = '';
+  for (const t of turns) {
+    const human = t.role === 'human';
+    let meta = '';
+    if (t.degraded) meta += '(from documents only) ';
+    if (t.cost_usd != null) meta += '$' + Number(t.cost_usd).toFixed(2);
+    h += '<div class="turn ' + (human ? 'human' : 'engine') + '"><div class="b">' + esc(t.text) + '</div>'
+      + (meta ? '<div class="c">' + esc(meta) + '</div>' : '') + '</div>';
+    if (t.pending) h += '<div class="turn wait"><span class="spin"></span>answering&hellip;</div>';
+  }
+  return h || '<div class="empty">no messages yet &mdash; ask the engine about this gate</div>';
+}
+
+function paintChat(id) {
+  const c = chatCache[id];
+  const log = document.getElementById('chat-log-' + id);
+  if (!c || !log) return;
+  log.innerHTML = c.html;
+  log.scrollTop = log.scrollHeight;
+  const box = document.getElementById('chat-in-' + id);
+  const btn = document.getElementById('chat-ask-' + id);
+  if (box) {
+    box.disabled = c.limit;
+    if (c.limit) box.placeholder = 'chat limit reached for this gate — answer with Proceed/Redo/Skip';
+  }
+  if (btn) btn.disabled = c.limit;
+}
+
+async function loadChat(id) {
+  if (chatInflight.has(id)) return;
+  chatInflight.add(id);
+  const el = document.querySelector('details.chat[data-job="' + id + '"]');
+  const log = document.getElementById('chat-log-' + id);
+  if (log && !chatCache[id]) log.innerHTML = '<div class="empty">loading&hellip;</div>';
+  try {
+    const r = await fetch('api/jobs/' + encodeURIComponent(id) + '/chat');
+    const data = await r.json();
+    if (r.ok) {
+      chatCache[id] = { key: el ? el.dataset.updated : '', html: chatTranscript(data),
+                        pending: !!data.pending, limit: !!data.limit_reached };
+      if (data.pending) startChatPoll(id); else stopChatPoll(id);
+    } else {
+      chatCache[id] = { key: '', html: '<div class="empty">Error: ' + esc(data.detail || r.status) + '</div>',
+                        pending: false, limit: false };
+      stopChatPoll(id);
+    }
+  } catch (e) {
+    chatCache[id] = { key: '', html: '<div class="empty">Error: ' + esc(String(e)) + '</div>',
+                      pending: false, limit: false };
+  }
+  chatInflight.delete(id);
+  paintChat(id);
+}
+
+function openChat(id) {
+  // cache keyed by job + updated_at: reuse only while the card has not moved
+  // on and no answer is pending; otherwise (re)fetch.
+  const el = document.querySelector('details.chat[data-job="' + id + '"]');
+  const c = chatCache[id];
+  if (c && el && c.key === el.dataset.updated && !c.pending) { paintChat(id); return; }
+  loadChat(id);
+}
+
+async function askChat(id, btn) {
+  const msg = document.getElementById('msg');
+  const box = document.getElementById('chat-in-' + id);
+  const text = box ? box.value.trim() : '';
+  if (!text) return;
+  btn.disabled = true;
+  try {
+    const r = await fetch('api/jobs/' + encodeURIComponent(id) + '/chat', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({message: text}),
+    });
+    let data = {};
+    try { data = await r.json(); } catch (e2) { /* non-JSON error body */ }
+    if (r.status === 202) {
+      if (box) box.value = '';
+      localStorage.removeItem('gb-chat-' + id);
+      loadChat(id); // shows the pending turn + starts the 5s poll
+    } else {
+      // 409 = answer already in flight / chat limit reached; 404/500 = error
+      msg.textContent = 'Chat: ' + (data.detail || r.status);
+      if (r.status === 409) loadChat(id);
+    }
+  } catch (e) { msg.textContent = 'Chat error: ' + e; }
+  btn.disabled = false;
+}
+
+function startChatPoll(id) {
+  if (chatPollers[id]) return;
+  chatPollers[id] = setInterval(() => {
+    // stop when the card left awaiting_input (the chat panel is gone)
+    if (!document.getElementById('chat-log-' + id)) { stopChatPoll(id); return; }
+    loadChat(id);
+  }, 5000);
+}
+
+function stopChatPoll(id) {
+  if (chatPollers[id]) { clearInterval(chatPollers[id]); delete chatPollers[id]; }
 }
 
 // ---------- Product brain (api/memory) ----------
@@ -463,6 +620,7 @@ async function submitFeature(ev) {
     title: document.getElementById('feat-title').value.trim(),
     summary: document.getElementById('feat-summary').value.trim(),
     owner: document.getElementById('feat-owner').value.trim(),
+    gate_mode: document.getElementById('feat-gatemode').value,
     related_to: document.getElementById('feat-related').value.trim(),
   };
   if (!body.project) { msg.textContent = 'Pick a project first.'; return false; }
@@ -503,6 +661,8 @@ async function answer(id, action, btn) {
     const data = await r.json();
     if (r.ok) {
       localStorage.removeItem('gb-draft-' + id); // answered — drop the draft
+      localStorage.removeItem('gb-chat-' + id);  // the gate chat is over too
+      stopChatPoll(id); delete chatCache[id];
       msg.textContent = { proceed: 'Answer recorded — next run queued.',
                           redo: 'Redo queued.', skip: 'Skipped.' }[action] || ('OK: ' + data.status);
       refresh(true);

@@ -47,10 +47,18 @@ End your final message with exactly one of:
   you need from the human (minimum: "1. Approve and continue to the next stage?").
   Make each question answerable in one line.
 - `STAGE_FAIL:` followed by 2-3 sentences on why this stage cannot be completed
-  (missing information, out of scope, blocked) and what would unblock it.
+  (missing information, out of scope, blocked) and what would unblock it.{ask_clause}
 
 Nothing advances without one of these markers — an unmarked output parks the
 pipeline for human triage."""
+
+ASK_CLAUSE = """
+- `STAGE_ASK:` when you hit a decision mid-work that the plan doesn't settle and
+  only the human can make (product behaviour, data semantics, a trade-off with
+  no clear winner). COMMIT what you have first, then print `STAGE_ASK:` followed
+  by 2-4 sentences of context and a `## Questions` section with the specific
+  question(s). Do NOT guess, and do NOT use STAGE_FAIL for askable questions —
+  after the human answers, your session resumes right where you stopped."""
 
 
 def _guidance_block(guidance_entries: list[dict], current_stage: int) -> str:
@@ -247,8 +255,54 @@ binding:
 {task_header}
 
 {contract}
-{OUTPUT_PROTOCOL.format(payload_desc=payload_desc)}
+{OUTPUT_PROTOCOL.format(payload_desc=payload_desc,
+                        ask_clause=ASK_CLAUSE if kind == "code" and stage != 9 else "")}
 """
+
+
+# ---------- gate chat (artifact-primed, read-only — docs/CONVERSATIONS.md §2) ----------
+
+
+def build_chat_prompt(*, target: RepoTarget, branch: str, job: dict, stage: int,
+                      message: str, transcript: list[dict],
+                      inline_artifacts: dict[str, str]) -> str:
+    convo = ""
+    for t in transcript[-8:]:
+        who = "Reviewer" if t["role"] == "human" else "You"
+        convo += f"\n{who}: {(t['text'] or '').strip()[:1200]}\n"
+    artifacts = ""
+    for name, content in inline_artifacts.items():
+        artifacts += f"\n\n### {name}\n\n{content}"
+    gate_summary = (job.get("analysis") or "").strip()[:5000]
+
+    return f"""You are the Gumo Engine, answering a human reviewer's question at the P{stage} \
+({stage_name(stage)}) gate of a feature pipeline. The pipeline is PAUSED waiting for their \
+decision; your job is to help them decide — not to do more work.
+
+You are inside a read-only checkout of `{target.repo}` on branch `{branch}`. You may Read/
+Grep/Glob the code and the artifacts under `.gumo/features/{job['issue_id']}/` to answer
+precisely. Do NOT modify, create or delete anything.
+
+## The gate summary you produced
+
+{gate_summary}
+
+## Gate artifacts (inlined; read the files for full versions)
+{artifacts if artifacts else "(none inlined — read .gumo/features/" + job['issue_id'] + "/)"}
+
+## Conversation so far
+{convo if convo else "(first question)"}
+
+## The reviewer asks
+
+{message.strip()[:4000]}
+
+Answer the question directly and concisely (under 250 words unless the question demands
+more). Cite file paths when you reference code. If answering honestly requires changing
+the work rather than explaining it, say exactly that and recommend `/redo` with the
+concrete notes you'd give. Output the answer as plain text — no STAGE markers, no
+preamble about being an AI. This conversation is context for the reviewer's decision;
+their eventual Proceed/Redo answer is what binds the pipeline."""
 
 
 # ---------- memory bootstrap (kind=memory job, two sequential runs) ----------

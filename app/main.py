@@ -3,12 +3,13 @@ import json
 import logging
 import re
 import secrets
+import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 
@@ -16,6 +17,7 @@ from .config import get_settings
 from .dashboard import DASHBOARD_HTML
 from .db import JobStore
 from .feature_prompts import stage_name
+from .fixer import ensure_session_store
 from .memory import MemoryReader
 from .sentry_api import extract_issue_ref, verify_signature
 from .worker import GateConflict, Worker
@@ -48,6 +50,8 @@ def require_auth(credentials: HTTPBasicCredentials = Depends(basic)):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Path(settings.data_dir).mkdir(parents=True, exist_ok=True)
+    if settings.session_persistence:
+        ensure_session_store(settings)
     store = JobStore(settings.db_path)
     worker = Worker(settings, store)
     tasks = [
@@ -55,6 +59,7 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(worker.poll_clickup_forever()),
         asyncio.create_task(worker.sweep_forever()),
         asyncio.create_task(worker.reap_forever()),
+        asyncio.create_task(worker.prune_sessions_forever()),
     ]
     app.state.store = store
     app.state.worker = worker
@@ -151,6 +156,7 @@ class SubmitBody(BaseModel):
     summary: str | None = None
     owner: str | None = None       # features: ClickUp user id for gate notifications
     related_to: str | None = None  # features: sibling pipeline job id(s), comma-separated
+    gate_mode: str | None = None   # features: 'full' (default) | 'light' (checkpoints + guards)
 
 
 async def _prepare_ticket(worker: Worker, body: SubmitBody, prefix: str,
@@ -242,6 +248,7 @@ async def submit_feature(body: SubmitBody):
         clickup_task_id=t["task_id"], clickup_task_url=t["task_url"],
         cu_list_id=t["list_id"], owner=(body.owner or "").strip(),
         related_jobs=(body.related_to or "").strip(),
+        gate_mode=(body.gate_mode or "").strip().lower(),
     )
     if "queued" not in decision:
         raise HTTPException(status_code=409, detail=decision)
@@ -282,7 +289,8 @@ async def answer_job(job_id: str, body: AnswerBody):
 
 @app.get("/api/features/{job_id}/stats", dependencies=[Depends(require_auth)])
 async def feature_stats(job_id: str):
-    """Per-stage telemetry — the receipts behind the 10x claim."""
+    """Per-stage telemetry — the receipts behind the 10x claim. Chat cost rides
+    gate_chat rows, never stage_runs (attempt/redo receipts stay clean)."""
     store: JobStore = app.state.store
     if store.get(job_id) is None:
         raise HTTPException(status_code=404, detail=f"unknown job '{job_id}'")
@@ -290,6 +298,71 @@ async def feature_stats(job_id: str):
         "runs": store.stage_runs_for(job_id),
         "guidance": store.guidance_for(job_id),
         "artifacts": store.artifacts_for(job_id),
+        "chat": store.chat_for(job_id),
+    }
+
+
+class ChatBody(BaseModel):
+    message: str
+
+
+_chat_tasks: set = set()
+
+
+def _chat_pending(store: JobStore, job_id: str, stage: int, timeout: float) -> bool:
+    last = store.chat_last(job_id, stage)
+    return bool(last and last["role"] == "human"
+                and time.time() - last["at"] < timeout + 60)
+
+
+@app.post("/api/jobs/{job_id}/chat", dependencies=[Depends(require_auth)])
+async def gate_chat_post(job_id: str, body: ChatBody):
+    """Ask the engine a question at a parked gate (docs/CONVERSATIONS.md §2).
+    Persist-then-poll: the message is stored and 202-acknowledged immediately;
+    a background task answers when the repo workspace frees, and the dashboard
+    picks the reply up via GET — nothing is lost if the client disconnects."""
+    message = body.message.strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="empty message")
+    store: JobStore = app.state.store
+    worker: Worker = app.state.worker
+    job = store.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"unknown job '{job_id}'")
+    if (job.get("kind") or "") != "feature":
+        raise HTTPException(status_code=409, detail="chat is available on feature gates only")
+    if job["status"] != "awaiting_input":
+        raise HTTPException(status_code=409, detail=f"job is '{job['status']}', not parked at a gate")
+    stage = int(job.get("stage") or 0)
+    if store.chat_count(job_id, stage) >= settings.chat_max_turns_per_gate:
+        raise HTTPException(status_code=409,
+                            detail="chat limit reached for this gate — answer with proceed/redo/skip")
+    if _chat_pending(store, job_id, stage, settings.chat_timeout_seconds):
+        raise HTTPException(status_code=409, detail="an answer is already in flight — wait for it")
+
+    attempt = max(1, int(job.get("stage_attempts") or 1))
+    store.chat_add(job_id, stage, attempt, "human", message)
+    task = asyncio.create_task(worker.engine.chat(job, message))
+    _chat_tasks.add(task)  # keep a strong ref — bare create_task results can be GC'd mid-flight
+    task.add_done_callback(_chat_tasks.discard)
+    return JSONResponse(status_code=202, content={"job_id": job_id, "status": "pending"})
+
+
+@app.get("/api/jobs/{job_id}/chat", dependencies=[Depends(require_auth)])
+async def gate_chat_get(job_id: str):
+    store: JobStore = app.state.store
+    job = store.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"unknown job '{job_id}'")
+    stage = int(job.get("stage") or 0)
+    turns = store.chat_for(job_id, stage)
+    pending = _chat_pending(store, job_id, stage, settings.chat_timeout_seconds)
+    if turns and pending:
+        turns[-1]["pending"] = True
+    return {
+        "turns": turns,
+        "pending": pending,
+        "limit_reached": store.chat_count(job_id, stage) >= settings.chat_max_turns_per_gate,
     }
 
 

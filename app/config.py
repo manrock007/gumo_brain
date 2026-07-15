@@ -91,6 +91,31 @@ class Settings(BaseSettings):
     stage_gates: str = ""  # future: comma list of auto-advance stages, e.g. "5,7"; empty = all gated
     reaper_grace_seconds: int = 600
 
+    # Conversational gates (docs/CONVERSATIONS.md)
+    chat_timeout_seconds: int = 300
+    chat_max_turns_per_gate: int = 10
+    # Session persistence (increment 2) — relocating the CLI config dir to the data
+    # volume is a deploy-affecting substrate change (auth + onboarding state live
+    # there). The bootstrap in fixer.ensure_session_store seeds it from the legacy
+    # location; auth via CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY env passes through
+    # regardless. OFF by default: without it, STAGE_ASK answers and code-gate chat
+    # degrade to fresh runs (labeled), and sessions die with the container.
+    session_persistence: bool = False
+    session_ttl_days: int = 14
+    max_asks_per_stage: int = 3         # STAGE_ASK resumes per (job, stage, attempt)
+    default_gate_mode: str = "full"     # full = every stage parks | light = P0/P1/P3/P9 + guards
+
+    @property
+    def claude_config_dir(self) -> str:
+        """Session transcripts live on the data volume so resume survives restarts."""
+        return f"{self.data_dir}/claude-config"
+
+    @property
+    def claude_chat_config_dir(self) -> str:
+        """Artifact-primed chats get their own config dir so concurrent invocations
+        never race the session store's .claude.json (docs/CONVERSATIONS.md §4)."""
+        return f"{self.data_dir}/claude-config-chat"
+
     # Storage
     data_dir: str = "/data"
 

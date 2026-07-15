@@ -31,9 +31,49 @@ class FixResult:
 
 class RawRunResult:
     def __init__(self, status: str, text: str, meta: dict | None = None):
-        self.status = status  # ok | error | timeout
+        self.status = status  # ok | error | timeout | session_lost
         self.text = text
         self.meta = meta or {}
+
+
+def ensure_session_store(settings: Settings):
+    """Bootstrap the relocated CLI config dir (docs/CONVERSATIONS.md §4): an empty
+    CLAUDE_CONFIG_DIR is a logged-out CLI unless auth arrives via env
+    (CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY pass through os.environ). Seed
+    credentials/onboarding state from the legacy ~/.claude location when present
+    so OAuth-file deployments survive the move. Called at startup when
+    session_persistence is on; loud on failure, never fatal."""
+    import shutil
+
+    for target_dir in (settings.claude_config_dir, settings.claude_chat_config_dir):
+        try:
+            Path(target_dir).mkdir(parents=True, exist_ok=True)
+            legacy = Path.home() / ".claude"
+            for name in (".credentials.json", ".claude.json"):
+                src = legacy / name
+                dst = Path(target_dir) / name
+                if src.is_file() and not dst.exists():
+                    shutil.copy2(src, dst)
+            legacy_json = Path.home() / ".claude.json"  # onboarding state sits beside ~/.claude
+            dst_json = Path(target_dir) / ".claude.json"
+            if legacy_json.is_file() and not dst_json.exists():
+                shutil.copy2(legacy_json, dst_json)
+        except OSError:
+            log.exception("session store bootstrap failed for %s — session "
+                          "persistence will degrade to fresh runs", target_dir)
+
+
+def session_transcript_exists(settings: Settings, session_id: str) -> bool:
+    """A resume of a missing session exits 0 with EMPTY stdout (verified on the
+    installed CLI) — never trust exit signals. Transcripts live under
+    CLAUDE_CONFIG_DIR/projects/<cwd-slug>/<session>.jsonl; glob across project
+    slugs so slug-scheme drift can't fake a loss."""
+    if not session_id or not settings.session_persistence:
+        return False
+    root = Path(settings.claude_config_dir) / "projects"
+    if not root.is_dir():
+        return False
+    return any(root.glob(f"*/{session_id}.jsonl"))
 
 
 async def _run(cmd: list[str], cwd: str | None = None, timeout: int = 300) -> tuple[int, str]:
@@ -145,21 +185,53 @@ async def prepare_feature_workspace(settings: Settings, target: RepoTarget,
 
 
 async def run_claude_raw(settings: Settings, workspace: str, prompt: str,
-                         allowed_tools: list[str], timeout: int) -> RawRunResult:
+                         allowed_tools: list[str], timeout: int,
+                         resume_session: str | None = None,
+                         disallowed_tools: list[str] | None = None,
+                         session_id: str | None = None,
+                         fork_session: bool = False,
+                         config_dir: str | None = None) -> RawRunResult:
     """Low-level headless run. Returns the CLI's result text verbatim plus the
-    telemetry envelope (cost/turns/duration) — callers own the parsing."""
+    telemetry envelope (session/cost/turns/duration) — callers own the parsing.
+
+    - resume_session continues an existing session (same working directory) with
+      full context; fork_session resumes into a NEW session id.
+    - session_id pre-assigns the id on fresh runs — the ENGINE owns identity, so
+      timeout/error runs still have a resumable id on record (the envelope is
+      only a cross-check).
+    - disallowed_tools is a hard DENY list — --allowedTools alone is additive to
+      settings-file grants, so read-only chat runs must deny the write tools.
+    - config_dir overrides the CLI config dir for this run (artifact-primed
+      chats use their own so concurrent invocations never race the session
+      store's state files)."""
+    # prompt is positional, directly after -p; option flags follow it
     cmd = [
         settings.claude_binary,
         "-p", prompt,
         "--output-format", "json",
         "--allowedTools", ",".join(allowed_tools),
     ]
+    if resume_session:
+        cmd += ["-r", resume_session]
+        if fork_session:
+            cmd += ["--fork-session"]
+    elif session_id:
+        cmd += ["--session-id", session_id]
+    if disallowed_tools:
+        cmd += ["--disallowedTools", ",".join(disallowed_tools)]
     if settings.claude_model:
         cmd += ["--model", settings.claude_model]
 
     env = os.environ.copy()
     env["GH_TOKEN"] = settings.github_token
     env["CLICKUP_TOKEN"] = settings.clickup_token  # used by the brain-ticket CLI
+    # never inherit an ambient session identity from the service's own env
+    env.pop("CLAUDE_CODE_SESSION_ID", None)
+    if config_dir:
+        env["CLAUDE_CONFIG_DIR"] = config_dir
+    elif settings.session_persistence:
+        # sessions on the data volume so resume survives restarts
+        env["CLAUDE_CONFIG_DIR"] = settings.claude_config_dir
 
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -173,18 +245,30 @@ async def run_claude_raw(settings: Settings, workspace: str, prompt: str,
     except asyncio.TimeoutError:
         proc.kill()
         log.error("claude run timed out after %ss", timeout)
-        return RawRunResult("timeout", f"timed out after {timeout}s")
+        return RawRunResult("timeout", f"timed out after {timeout}s",
+                            {"session_id": session_id})
     except asyncio.CancelledError:
         # graceful shutdown must never orphan a live claude that later pushes
         proc.kill()
         raise
 
     stdout = out.decode(errors="replace")
-    if proc.returncode != 0:
-        log.error("claude exited %s: %s", proc.returncode, err.decode(errors="replace")[-2000:])
-        return RawRunResult("error", f"claude exited {proc.returncode}: {stdout[-2000:]}")
+    stderr = err.decode(errors="replace")
 
-    meta: dict = {}
+    # a resume of a missing/pruned session exits 0 with EMPTY stdout and the error
+    # on stderr only (verified) — never let that flow into stage parsing
+    if resume_session and proc.returncode == 0 and not stdout.strip():
+        log.warning("resume of session %s found nothing: %s", resume_session, stderr[-300:])
+        return RawRunResult("session_lost", stderr[-500:], {"session_id": resume_session})
+
+    # session-id fallback when the envelope can't be parsed: a fresh run's id is
+    # engine-owned (still correct); a plain resume continues the same id; but a
+    # FORK's new id lives only in the envelope — falling back to the original
+    # would make the next chat turn resume (and pollute) the stage session, so
+    # a fork with no envelope reports no session at all.
+    fallback_sid = session_id or (None if fork_session else resume_session)
+    meta: dict = {"session_id": fallback_sid}
+    result_text = stdout
     try:
         envelope = json.loads(stdout)
         result_text = envelope.get("result", "")
@@ -192,9 +276,14 @@ async def run_claude_raw(settings: Settings, workspace: str, prompt: str,
             "cost_usd": envelope.get("total_cost_usd"),
             "num_turns": envelope.get("num_turns"),
             "duration_ms": envelope.get("duration_ms"),
+            "session_id": envelope.get("session_id") or fallback_sid,
         }
     except (json.JSONDecodeError, AttributeError):
-        result_text = stdout
+        pass  # envelope parsing is best-effort even on nonzero exits
+
+    if proc.returncode != 0:
+        log.error("claude exited %s: %s", proc.returncode, stderr[-2000:])
+        return RawRunResult("error", f"claude exited {proc.returncode}: {result_text[-2000:]}", meta)
     return RawRunResult("ok", result_text, meta)
 
 

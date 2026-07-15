@@ -16,11 +16,12 @@ import itertools
 import logging
 import re
 import time
+from pathlib import Path
 
 from .clickup import ClickUp
 from .config import Settings
 from .db import JobStore
-from .engine import GATE_PREFIX, Engine
+from .engine import GATE_PREFIX, Engine, RepoLocks
 from .fixer import prepare_workspace, run_claude
 from .grading import grade_issue
 from .prompts import (
@@ -70,7 +71,8 @@ class Worker:
         self._seq = itertools.count()
         self.sentry = SentryClient(settings)
         self.clickup = ClickUp(settings)
-        self.engine = Engine(settings, store, self.clickup)
+        self.locks = RepoLocks()
+        self.engine = Engine(settings, store, self.clickup, locks=self.locks)
 
     def _enqueue(self, job_id: str, priority: int):
         self.queue.put_nowait((priority, next(self._seq), job_id, time.time()))
@@ -130,7 +132,7 @@ class Worker:
                        clickup_task_id: str | None = None,
                        clickup_task_url: str | None = None,
                        cu_list_id: str = "", owner: str = "",
-                       related_jobs: str = "") -> str:
+                       related_jobs: str = "", gate_mode: str = "") -> str:
         """Enqueue a feature pipeline at P0."""
         existing = self.store.get(job_id)
         if existing:
@@ -146,6 +148,7 @@ class Worker:
                 return f"feature {job_id} already shipped: {existing['pr_url']}"
             # terminal skipped/no_fix -> fresh restart of the pipeline (atomic below)
 
+        mode = gate_mode if gate_mode in ("full", "light") else self.settings.default_gate_mode
         self.store.feature_intake(
             job_id, title=title, project=project,
             request=request,
@@ -156,6 +159,14 @@ class Worker:
             question="",
             evidence="",
             pr_url=None,
+            resume_session_id="",
+            resume_stage=None,
+            resume_attempt=None,
+            resume_head="",
+            resume_answer="",
+            gate_kind="",
+            ask_count=0,
+            gate_mode=mode if mode in ("full", "light") else "full",
             clickup_task_id=clickup_task_id or "",
             clickup_task_url=clickup_task_url or "",
             cu_list_id=cu_list_id,
@@ -203,17 +214,28 @@ class Worker:
                 self.queue.task_done()
 
     async def _process(self, job: dict, queued_at: float | None = None):
+        """Every workspace toucher runs under its repo's lock (chat runs and the
+        canonical product-scope reads take the same locks — see Engine.RepoLocks)."""
         kind = job.get("kind") or "sentry"
-        if kind == "feature":
-            result = await self.engine.run_stage(job, queued_at)
-            if result == "requeue":  # e.g. P6 auto-skip advanced the stage
-                self._enqueue(job["issue_id"], PRIO_HUMAN)
-        elif kind == "memory":
-            await self.engine.run_memory_bootstrap(job)
-        elif kind == "task":
-            await self._process_task(job)
-        else:
+        if kind == "sentry":
+            # a fresh sentry job's project isn't known until the issue is fetched;
+            # _process_sentry acquires the repo lock itself once it is
             await self._process_sentry(job)
+            return
+        target = self.settings.repo_for_project(job.get("project") or "")
+        if target is None:
+            self.store.set_status(job["issue_id"], "skipped",
+                                  detail=f"no repo mapped for '{job.get('project')}'")
+            return
+        async with self.locks.for_repo(target.repo):
+            if kind == "feature":
+                result = await self.engine.run_stage(job, queued_at)
+                if result == "requeue":  # e.g. P6 auto-skip advanced the stage
+                    self._enqueue(job["issue_id"], PRIO_HUMAN)
+            elif kind == "memory":
+                await self.engine.run_memory_bootstrap(job)
+            else:
+                await self._process_task(job)
 
     # ---------- sentry flow (v1) ----------
 
@@ -280,23 +302,24 @@ class Worker:
         stacktrace = format_stacktrace(event)
         branch = f"brain/sentry-{issue_id}"
 
-        if phase == 2:
-            prompt = build_phase2_prompt(
-                target=target, branch=branch, issue=issue_info, stacktrace=stacktrace,
-                clickup_task_id=task_id,
-                analysis=row.get("analysis") or "(analysis missing)",
-                guidance=row.get("guidance") or "(no guidance recorded)",
-            )
-            workspace = await prepare_workspace(self.settings, target, branch, keep_branch=True)
-        else:
-            prompt = build_fix_prompt(
-                target=target, branch=branch, issue=issue_info, stacktrace=stacktrace,
-                clickup_task_id=task_id,
-            )
-            workspace = await prepare_workspace(self.settings, target, branch)
+        async with self.locks.for_repo(target.repo):  # workspace toucher
+            if phase == 2:
+                prompt = build_phase2_prompt(
+                    target=target, branch=branch, issue=issue_info, stacktrace=stacktrace,
+                    clickup_task_id=task_id,
+                    analysis=row.get("analysis") or "(analysis missing)",
+                    guidance=row.get("guidance") or "(no guidance recorded)",
+                )
+                workspace = await prepare_workspace(self.settings, target, branch, keep_branch=True)
+            else:
+                prompt = build_fix_prompt(
+                    target=target, branch=branch, issue=issue_info, stacktrace=stacktrace,
+                    clickup_task_id=task_id,
+                )
+                workspace = await prepare_workspace(self.settings, target, branch)
 
-        log.info("running claude for issue %s phase %s (%s)", issue_id, phase, target.repo)
-        result = await run_claude(self.settings, target, workspace, prompt)
+            log.info("running claude for issue %s phase %s (%s)", issue_id, phase, target.repo)
+            result = await run_claude(self.settings, target, workspace, prompt)
         log.info("issue %s -> %s %s", issue_id, result.status, result.pr_url or "")
 
         if result.status == "needs_input":
@@ -475,10 +498,14 @@ class Worker:
                     raise ValueError(f"cannot redo P{requested}: pipeline is only at P{stage}")
                 target_stage = requested
                 text = text[m.end():].strip()
+            # a redo at an ask-gate discards the pending resume: fresh restart
             if not self.store.cas_status(job_id, ["awaiting_input", "error", "timeout"],
                                          "queued", expected_stage=stage,
                                          stage=target_stage, question="",
-                                         pending_redo_stage=target_stage):
+                                         pending_redo_stage=target_stage,
+                                         gate_kind="", resume_session_id="",
+                                         resume_stage=None, resume_attempt=None,
+                                         resume_head="", resume_answer="", ask_count=0):
                 raise GateConflict("already answered")
             self.store.guidance_add(job_id, target_stage, "redo", text, via,
                                     job.get("parked_head") or "")
@@ -495,6 +522,26 @@ class Worker:
             raise ValueError(f"unknown action '{action}'")
         if job["status"] != "awaiting_input":
             raise ValueError(f"job is '{job['status']}', not awaiting_input")
+
+        # STAGE_ASK gate: 'proceed' is the ANSWER — a distinct transition that
+        # keeps the stage and attempt so the session resumes in place. It
+        # explicitly bypasses the P9 terminal branch (asks never occur at P9).
+        if (job.get("gate_kind") or "") == "ask":
+            answer = text or "Proceed as you suggested."
+            if not self.store.cas_status(job_id, ["awaiting_input"], "queued",
+                                         expected_stage=stage,
+                                         question="", resume_answer=answer):
+                raise GateConflict("already answered")
+            self.store.guidance_add(job_id, stage, "answer", answer, via,
+                                    job.get("parked_head") or "")
+            self.store.stage_run_gate_answered(job_id, stage, "answer")
+            self._distill_chat(job, stage)
+            await self.clickup.comment(
+                task_id, f"{GATE_PREFIX} Answer received (via {via}) — resuming P{stage} "
+                         "where it stopped.")
+            self._enqueue(job_id, PRIO_HUMAN)
+            log.info("feature %s ask answered, resuming P%s via %s", job_id, stage, via)
+            return "queued"
 
         guidance = text or "Approved — continue."
         if stage >= 9:
@@ -514,16 +561,30 @@ class Worker:
 
         if not self.store.cas_status(job_id, ["awaiting_input"], "queued",
                                      expected_stage=stage,
-                                     stage=stage + 1, stage_attempts=0, question=""):
+                                     stage=stage + 1, stage_attempts=0, question="",
+                                     ask_count=0):
             raise GateConflict("already answered")
         self.store.guidance_add(job_id, stage, "proceed", guidance, via,
                                 job.get("parked_head") or "")
         self.store.stage_run_gate_answered(job_id, stage, "proceed")
+        self._distill_chat(job, stage)
         await self.clickup.comment(
             task_id, f"{GATE_PREFIX} P{stage} approved (via {via}) — running P{stage + 1} next.")
         self._enqueue(job_id, PRIO_HUMAN)
         log.info("feature %s advanced to P%s via %s", job_id, stage + 1, via)
         return "queued"
+
+    def _distill_chat(self, job: dict, stage: int):
+        """A gate conversation must outlive its gate (docs/CONVERSATIONS.md §4):
+        record the last engine answer as guidance so later stages and P9's ADR
+        pass see what the clarification concluded."""
+        turns = self.store.chat_for(job["issue_id"], stage)
+        last_engine = next((t for t in reversed(turns)
+                            if t["role"] == "engine" and not t.get("degraded")), None)
+        if last_engine:
+            self.store.guidance_add(job["issue_id"], stage, "chat",
+                                    (last_engine["text"] or "")[:1500], "engine",
+                                    job.get("parked_head") or "")
 
     async def _mark_superseded(self, job: dict, target_stage: int):
         """Redo of an earlier stage: banner downstream artifact mirrors so humans
@@ -630,6 +691,22 @@ class Worker:
                     payload = text[len(verb):].strip()
                     break
             if action is None:
+                # engine-authored comments (gate posts, chat mirrors) are inert
+                if text.startswith(GATE_PREFIX):
+                    if use_marker:
+                        self.store.set_fields(job["issue_id"], comment_marker=c["id"])
+                    continue
+                # a human replied conversationally — never drop it silently
+                # (docs/CONVERSATIONS.md §2): nudge once per comment, keep scanning
+                if (use_marker and job["status"] == "awaiting_input"
+                        and (job.get("kind") or "") == "feature" and text):
+                    await self.clickup.comment(
+                        job.get("clickup_task_id") or "",
+                        f"{GATE_PREFIX} I only act on `/proceed`, `/redo` or `/skip` here — "
+                        f"did you mean `/proceed {text[:120]}`? "
+                        "(For back-and-forth questions, use the chat box on the dashboard.)",
+                    )
+                    self.store.set_fields(job["issue_id"], comment_marker=c["id"])
                 continue
             try:
                 await self.answer_job(job["issue_id"], action, payload, via="clickup")
@@ -668,6 +745,49 @@ class Worker:
             if picked >= self.settings.sweep_top_n:
                 break
         log.info("sweep done: %d candidates enqueued (grading decides the rest)", picked)
+
+    async def prune_sessions_forever(self):
+        """Daily janitor for session transcripts (docs/CONVERSATIONS.md §4):
+        prune by file mtime with a keep-set — never by job terminal status alone,
+        which misses abandoned gates and unattributed v1 traffic."""
+        if not self.settings.session_persistence:
+            return
+        while True:
+            await asyncio.sleep(86400)
+            try:
+                self._prune_sessions()
+            except Exception:
+                log.exception("session janitor failed")
+
+    def _prune_sessions(self):
+        keep: set[str] = set()
+        for j in self.store.by_status(["received", "queued", "running", "awaiting_input"]):
+            if j.get("resume_session_id"):
+                keep.add(j["resume_session_id"])
+            for r in self.store.stage_runs_for(j["issue_id"]):
+                if r.get("session_id"):
+                    keep.add(r["session_id"])
+            for t in self.store.chat_for(j["issue_id"]):
+                if t.get("session_id"):
+                    keep.add(t["session_id"])
+        cutoff = time.time() - self.settings.session_ttl_days * 86400
+        pruned = 0
+        # both session stores: the stage/fork store AND the artifact-primed chat
+        # store — chats write their transcripts to the second one
+        for config_dir in (self.settings.claude_config_dir,
+                           self.settings.claude_chat_config_dir):
+            root = Path(config_dir) / "projects"
+            if not root.is_dir():
+                continue
+            for f in root.glob("*/*.jsonl"):
+                try:
+                    if f.stem not in keep and f.stat().st_mtime < cutoff:
+                        f.unlink()
+                        pruned += 1
+                except OSError:
+                    continue
+        if pruned:
+            log.info("session janitor pruned %d transcripts", pruned)
 
     async def reap_forever(self):
         """A 'running' row older than any plausible live run means the process
