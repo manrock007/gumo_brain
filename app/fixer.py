@@ -350,6 +350,7 @@ async def run_claude_stream(settings: Settings, workspace: str, prompt: str,
 
     result_env: dict | None = None
     saw_event = False
+    text_parts: list = []  # assistant text, for the no-envelope fallback (see below)
 
     async def _pump():
         nonlocal result_env, saw_event
@@ -370,6 +371,7 @@ async def run_claude_stream(settings: Settings, workspace: str, prompt: str,
                                                         block.get("input") or {}))
                     elif block.get("type") == "text" and (block.get("text") or "").strip():
                         on_event("delta", block["text"])
+                        text_parts.append(block["text"])
             elif etype == "result":
                 result_env = ev
 
@@ -394,8 +396,11 @@ async def run_claude_stream(settings: Settings, workspace: str, prompt: str,
                                      return_when=asyncio.FIRST_COMPLETED)
         if not done:
             raise asyncio.TimeoutError  # nothing finished within the budget
-        if steer_task is not None and steer_task in done and pump_task not in done:
-            # human interrupted mid-run: stop the CLI, keep the session resumable
+        if interrupt_event is not None and interrupt_event.is_set():
+            # human steered — honor it even when the pump finished in the SAME event
+            # loop wakeup (both tasks in `done`); deciding on the event's own state
+            # rather than task-set membership keeps the steer note from being
+            # silently orphaned when a run happens to complete as the steer arrives.
             await _reap()
             log.info("claude stream run interrupted by steer (session %s)", session_id)
             return RawRunResult("interrupted", "interrupted by human steer",
@@ -450,7 +455,12 @@ async def run_claude_stream(settings: Settings, workspace: str, prompt: str,
                             f"claude exited {proc.returncode}: {(result_text or stderr)[-2000:]}",
                             meta)
     if result_env is None:
-        # exit 0 with no result envelope — treat like an unparsable raw run
+        # exit 0 but the CLI never emitted a result envelope. If it produced
+        # assistant text, mirror run_claude_raw's fallback (return the text as ok)
+        # rather than failing a run that actually did work; a truly empty stream
+        # (no text at all) stays an error, same as an unparsable raw run.
+        if text_parts:
+            return RawRunResult("ok", "".join(text_parts), meta)
         return RawRunResult("error", "stream ended without a result envelope", meta)
     return RawRunResult("ok", result_text, meta)
 

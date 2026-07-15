@@ -178,6 +178,33 @@ class TestRunClaudeStream:
         assert raw.status == "ok"
         assert raw.text == "the answer"
 
+    def test_steer_wins_over_simultaneous_completion(self, tmp_path):
+        """Seer PR#6 round 1: when the steer event is set as the run also
+        completes (both tasks done in one wakeup), the steer must win so the note
+        is never silently orphaned. Decided on the event state, not task membership."""
+        s = _settings(tmp_path, _fake_claude(tmp_path, STREAM_SCRIPT))
+
+        async def run():
+            ev = asyncio.Event()
+            ev.set()  # steered before/at completion
+            return await run_claude_stream(s, str(tmp_path), "q", ["Read"], 30,
+                                           session_id="engine-uuid", interrupt_event=ev)
+
+        raw = asyncio.run(run())
+        assert raw.status == "interrupted"
+        assert raw.meta["session_id"] == "engine-uuid"
+
+    def test_exit0_no_envelope_with_text_is_ok(self, tmp_path):
+        """Seer PR#6 round 1: contract parity with run_claude_raw — exit 0 with no
+        result envelope but WITH assistant text returns ok+text (a stage that did
+        work must not be failed), while a truly empty stream stays an error."""
+        body = ("echo '{\"type\":\"assistant\",\"message\":{\"content\":"
+                "[{\"type\":\"text\",\"text\":\"STAGE_DONE: shipped\"}]}}'")
+        s = _settings(tmp_path, _fake_claude(tmp_path, body))
+        raw = asyncio.run(run_claude_stream(s, str(tmp_path), "q", ["Read"], 30))
+        assert raw.status == "ok"
+        assert "STAGE_DONE" in raw.text
+
 
 class TestJanitorBothStores:
     def _mk_transcript(self, config_dir: str, sid: str, age_days: float):
