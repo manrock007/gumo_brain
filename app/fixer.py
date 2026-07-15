@@ -382,7 +382,9 @@ async def run_claude_stream(settings: Settings, workspace: str, prompt: str,
 
     async def _reap():  # kill + drain both readers + the child; leaves no zombie
         pump_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
+        # the pump may already have finished with an exception (e.g. an over-long
+        # line); consume it here so cleanup never re-raises what we're handling
+        with contextlib.suppress(Exception, asyncio.CancelledError):
             await pump_task
         proc.kill()
         stderr_task.cancel()
@@ -405,7 +407,15 @@ async def run_claude_stream(settings: Settings, workspace: str, prompt: str,
             log.info("claude stream run interrupted by steer (session %s)", session_id)
             return RawRunResult("interrupted", "interrupted by human steer",
                                 {"session_id": session_id or resume_session})
-        pump_task.result()  # pump finished — re-raise any pump exception
+        try:
+            pump_task.result()  # pump finished — surface any pump exception
+        except Exception:
+            # a pump-level failure (e.g. an over-long line -> ValueError from
+            # readline) must still reap the child, or it leaks as a zombie
+            await _reap()
+            log.exception("claude stream pump failed")
+            return RawRunResult("error", "stream pump failed",
+                                {"session_id": session_id or resume_session})
         try:
             # stdout is closed; a healthy CLI exits promptly — never wait forever
             await asyncio.wait_for(proc.wait(), timeout=30)

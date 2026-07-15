@@ -109,6 +109,52 @@ class TestSteerReenqueue:
         assert j["resume_head"] == "headsha999"
         assert j["steer_note"] == ""
 
+    def test_reenqueue_survives_comment_failure(self, store, tmp_path, monkeypatch):
+        """Seer PR#6 round 2: a failing best-effort _comment after the run is closed
+        'interrupted' and the job requeued must NOT propagate — otherwise run_stage's
+        handler flips the job to error and re-closes the run 'exception', losing the
+        steer resume."""
+        import app.engine as engine_mod
+
+        w = _persist_worker(store, tmp_path)
+        eng = w.engine
+        w.intake_feature("feat-r2", title="F", project="web", request="r")
+        store.set_fields("feat-r2", stage=5, steer_note="switch to a queue")
+        store.set_status("feat-r2", "running")
+        run_id = store.stage_run_open("feat-r2", 5, 1)
+        job = store.get("feat-r2")
+
+        async def truthy(*a, **k):
+            return True
+
+        async def fake_git(ws, *args):
+            return (0, "headsha999")
+
+        async def boom(*a, **k):
+            raise RuntimeError("clickup down")
+
+        monkeypatch.setattr(eng, "_checkpoint", truthy)
+        monkeypatch.setattr(engine_mod, "git", fake_git)
+        monkeypatch.setattr(eng.clickup, "comment", boom)  # _comment must swallow it
+
+        raw = RawRunResult("interrupted", "partial", {"session_id": "sess-live"})
+        out = asyncio.run(eng._steer_reenqueue(job, 5, run_id, 1, str(tmp_path),
+                                               "brain/feat-feat-r2", raw,
+                                               lambda e, d: None))
+        assert out == "requeue"
+        j = store.get("feat-r2")
+        assert j["status"] == "queued"          # not flipped to error
+        assert j["gate_kind"] == "steer"
+        assert store.stage_runs_for("feat-r2")[-1]["result_status"] == "interrupted"
+
+    def test_stage_run_close_first_close_wins(self, store):
+        """Seer PR#6 round 2: a second close must not overwrite the first — so a
+        late 'exception' can't corrupt an 'interrupted' (or any) final status."""
+        rid = store.stage_run_open("feat-cl", 5, 1)
+        store.stage_run_close(rid, "interrupted")
+        store.stage_run_close(rid, "exception")  # ignored — already closed
+        assert store.stage_runs_for("feat-cl")[-1]["result_status"] == "interrupted"
+
     def test_resume_intended_accepts_steer(self, store, tmp_path):
         eng = _persist_worker(store, tmp_path).engine
         job = {"gate_kind": "steer", "resume_session_id": "s", "resume_stage": 5,

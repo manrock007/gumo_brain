@@ -440,12 +440,16 @@ class JobStore:
                         cost_usd: float | None = None, num_turns: int | None = None,
                         duration_ms: float | None = None, session_id: str | None = None):
         with self._conn() as c:
+            # first close wins: an already-closed run keeps its status, so a
+            # late exception in the same flow (e.g. run_stage's generic handler
+            # firing after _steer_reenqueue already closed the run 'interrupted')
+            # can't overwrite good telemetry with 'exception'.
             c.execute(
                 """UPDATE stage_runs SET ended_at = ?, result_status = ?,
                      cost_usd = COALESCE(?, cost_usd), num_turns = COALESCE(?, num_turns),
                      duration_ms = COALESCE(?, duration_ms),
                      session_id = COALESCE(?, session_id)
-                   WHERE id = ?""",
+                   WHERE id = ? AND ended_at IS NULL""",
                 (time.time(), result_status, cost_usd, num_turns, duration_ms, session_id, run_id),
             )
 
