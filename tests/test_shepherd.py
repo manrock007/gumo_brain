@@ -91,6 +91,29 @@ class TestShepherdStates:
         asyncio.run(w._shepherd_pr(pr))
         assert store.prs_for("feat-s1")[0]["state"] == "approved"
 
+    def test_failed_reactions_call_retries_not_no_reactions(self, store, tmp_path, monkeypatch):
+        """Seer PR#11 round 3: a failed reactions call (None) must not read as
+        'no reactions' — the pass retries later instead of misjudging approval."""
+        w = _worker(store, tmp_path)
+        pr = _pr(store, rounds=1)
+        gh = GH(pr=OPEN_PR,
+                comments=[{"id": 1, "body": "@sentry review"}],
+                reviews=[{"id": 42, "body": FINDING_BODY}])
+
+        async def fail_reactions(repo, comment_id):
+            return None
+
+        gh.get_comment_reactions = fail_reactions
+        w.engine.github = gh
+
+        async def boom(*a, **k):
+            raise AssertionError("must not proceed to findings on an unknown reaction state")
+
+        monkeypatch.setattr(w, "_shepherd_fix", boom)
+        asyncio.run(w._shepherd_pr(pr))
+        assert gh.posted == []
+        assert store.prs_for("feat-s1")[0]["review_rounds"] == 1
+
     def test_review_in_flight_waits(self, store, tmp_path):
         """No findings, no 🎉 (👀 pending): the shepherd must not re-trigger."""
         w = _worker(store, tmp_path)

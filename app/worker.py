@@ -896,7 +896,9 @@ class Worker:
         triggers = [c for c in comments
                     if (c.get("body") or "").strip().startswith("@sentry review")]
         if triggers:
-            reactions = await gh.get_comment_reactions(repo, triggers[-1]["id"]) or []
+            reactions = await gh.get_comment_reactions(repo, triggers[-1]["id"])
+            if reactions is None:
+                return  # unknown ≠ no reactions — retry next pass, same as get_pr
             if any(r.get("content") == "hooray" for r in reactions):
                 self.store.pr_set(url, state="approved", detail="Sentry clean pass")
                 await self._shepherd_notify(
