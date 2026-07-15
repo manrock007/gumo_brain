@@ -418,6 +418,21 @@ class TestChatEndpoints:
         g = c.get("/api/jobs/feat-api3/chat", headers=AUTH).json()
         assert g["limit_reached"] is True
 
+    def test_turn_limit_resets_per_attempt(self, client):
+        """Seer PR#8 round 3: the budget is per GATE (attempt) — a redo parks a
+        new gate, so turns spent on the rejected attempt must not starve it."""
+        c, m = client
+        store = self._park_feature(m, "feat-api6")
+        for i in range(m.settings.chat_max_turns_per_gate):
+            store.chat_add("feat-api6", 3, 1, "human", f"q{i}")
+            store.chat_add("feat-api6", 3, 1, "engine", f"a{i}")
+        # redo: the stage re-runs and parks again as attempt 2
+        store.set_fields("feat-api6", stage_attempts=2)
+        g = c.get("/api/jobs/feat-api6/chat", headers=AUTH).json()
+        assert g["limit_reached"] is False
+        r = c.post("/api/jobs/feat-api6/chat", headers=AUTH, json={"message": "fresh gate q"})
+        assert r.status_code == 202
+
     def test_stale_pending_clears_after_timeout(self, client):
         c, m = client
         store = self._park_feature(m, "feat-api4")

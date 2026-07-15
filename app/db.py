@@ -518,10 +518,20 @@ class JobStore:
                 ).fetchall()
             return [dict(r) for r in rows]
 
-    def chat_count(self, job_id: str, stage: int) -> int:
+    def chat_count(self, job_id: str, stage: int, attempt: int | None = None) -> int:
+        """Human turns for a stage — per ATTEMPT when given: the turn budget is
+        per gate (chat_max_turns_per_GATE), and a redo parks a NEW gate, so spent
+        turns from a rejected attempt must not starve the fresh one."""
         with self._conn() as c:
-            row = c.execute(
-                "SELECT COUNT(*) AS n FROM gate_chat WHERE job_id = ? AND stage = ? AND role = 'human'",
-                (job_id, stage),
-            ).fetchone()
+            if attempt is None:
+                row = c.execute(
+                    "SELECT COUNT(*) AS n FROM gate_chat WHERE job_id = ? AND stage = ? AND role = 'human'",
+                    (job_id, stage),
+                ).fetchone()
+            else:
+                row = c.execute(
+                    "SELECT COUNT(*) AS n FROM gate_chat"
+                    " WHERE job_id = ? AND stage = ? AND attempt = ? AND role = 'human'",
+                    (job_id, stage, attempt),
+                ).fetchone()
             return row["n"]

@@ -353,13 +353,15 @@ async def gate_chat_post(job_id: str, body: ChatBody):
         raise HTTPException(status_code=409,
                             detail=f"job is '{job['status']}' — chat needs a parked or running stage")
     stage = int(job.get("stage") or 0)
-    if store.chat_count(job_id, stage) >= settings.chat_max_turns_per_gate:
+    attempt = max(1, int(job.get("stage_attempts") or 1))
+    # the turn budget is per GATE: count only this attempt's turns, so a redo
+    # (new attempt, new gate) starts with a fresh allotment
+    if store.chat_count(job_id, stage, attempt) >= settings.chat_max_turns_per_gate:
         raise HTTPException(status_code=409,
                             detail="chat limit reached for this gate — answer with proceed/redo/skip")
     if _chat_pending(store, job_id, stage, settings.chat_timeout_seconds):
         raise HTTPException(status_code=409, detail="an answer is already in flight — wait for it")
 
-    attempt = max(1, int(job.get("stage_attempts") or 1))
     store.chat_add(job_id, stage, attempt, "human", message)
     chat_broker.start(job_id)  # new turn: reset the stream buffer
     task = asyncio.create_task(_chat_answer(job, message))
@@ -382,7 +384,8 @@ async def gate_chat_get(job_id: str):
     return {
         "turns": turns,
         "pending": pending,
-        "limit_reached": store.chat_count(job_id, stage) >= settings.chat_max_turns_per_gate,
+        "limit_reached": store.chat_count(job_id, stage, max(1, int(job.get("stage_attempts") or 1)))
+                         >= settings.chat_max_turns_per_gate,
     }
 
 
@@ -456,7 +459,8 @@ async def session_snapshot(job_id: str):
         # current-stage pending/limit flags the composer needs
         "chat": store.chat_for(job_id),
         "chat_pending": _chat_pending(store, job_id, stage, settings.chat_timeout_seconds),
-        "chat_limit": store.chat_count(job_id, stage) >= settings.chat_max_turns_per_gate,
+        "chat_limit": store.chat_count(job_id, stage, max(1, int(job.get("stage_attempts") or 1)))
+                      >= settings.chat_max_turns_per_gate,
         "live": live,
         # steering interrupts in place only with session persistence; otherwise the
         # note is queued to the next checkpoint (still useful, just not immediate)
