@@ -473,11 +473,7 @@ async function refresh(force) {
   try {
     const jobs = await (await fetch('api/jobs')).json();
     const sig = JSON.stringify(jobs);
-    if (force || sig !== lastJobs) {
-      lastJobs = sig; jobsCache = jobs; renderInbox();
-      // a selected non-feature item renders from the jobs row — keep it fresh
-      if (sel) { const j = jobsCache.find(x => x.issue_id === sel); if (j && j.kind !== 'feature') renderV1Detail(j); }
-    }
+    if (force || sig !== lastJobs) { lastJobs = sig; jobsCache = jobs; renderInbox(); }
   } catch (e) { document.getElementById('msg').textContent = 'refresh failed: ' + e; }
 }
 
@@ -543,21 +539,15 @@ function resetDetail(id) {
 }
 
 async function loadDetail(id) {
-  const j = jobsCache.find(x => x.issue_id === id);
-  if (j && j.kind !== 'feature') { renderV1Detail(j); return; }
   try {
     const r = await fetch('api/jobs/' + encodeURIComponent(id) + '/session');
-    if (!r.ok) {
-      if (r.status === 404) closeItem();
-      if (r.status === 409) { const jj = jobsCache.find(x => x.issue_id === id); if (jj) renderV1Detail(jj); }
-      return;
-    }
+    if (!r.ok) { if (r.status === 404) closeItem(); return; }
     const data = await r.json();
     const sig = JSON.stringify(data);
     if (sig === lastSnap) return;
     lastSnap = sig;
-    renderFeatureDetail(data);
-    if (data.live) startStageStream(id);
+    renderDetail(data);
+    if (data.live) startStageStream(id);  // feature stages AND v1 runs stream
   } catch (e) { /* keep the last frame */ }
 }
 
@@ -669,44 +659,71 @@ function convoThread(data) {
 
 function gatePacket(data) {
   const j = data.job;
+  const feature = j.kind === 'feature';
   if (j.status !== 'awaiting_input' && j.status !== 'error' && j.status !== 'timeout') return '';
   const id = esc(j.issue_id);
   if (j.status !== 'awaiting_input') {
+    // re-kick (redo) exists only for feature pipelines
+    if (!feature) return `<div class="gate"><div class="g-h">${esc(j.status)}</div>
+      <div class="q">${esc((j.detail || '(no detail)').slice(0, 600))}</div></div>`;
     return `<div class="gate"><div class="g-h">Stage ${j.status} — re-kick</div>
       <div class="answer"><div class="btns">
       <button class="redo" onclick="answer('${id}','redo',this)">Re-kick (redo)</button></div></div></div>`;
   }
-  const isAsk = j.gate_kind === 'ask';
+  const isAsk = feature && j.gate_kind === 'ask';
   const goLabel = isAsk ? 'Answer' : 'Proceed';
-  return `<div class="gate"><div class="g-h">${isAsk ? 'The engine asks — resumes in place' : 'Gate — P' + j.stage + ' ' + esc(j.stage_name || '')}</div>
-    <div class="q">${esc(j.question || '(see analysis)')}</div>
+  const head = isAsk ? 'The engine asks — resumes in place'
+    : (feature ? 'Gate — P' + j.stage + ' ' + esc(j.stage_name || '') : 'Needs your input');
+  const btns = feature
+    ? `<button class="go" onclick="answer('${id}','proceed',this)">${goLabel}</button>
+       <button class="redo" onclick="answer('${id}','redo',this)">Redo</button>
+       <button class="no" onclick="answer('${id}','skip',this)">Skip</button>`
+    : `<button class="go" onclick="answer('${id}','proceed',this)">Proceed</button>
+       <button class="no" onclick="answer('${id}','skip',this)">Skip</button>`;
+  const hint = feature
+    ? `<div class="hint">Redo re-runs this stage with your notes as corrections &mdash; optionally prefix 'P3 ' to redo an earlier stage.</div>`
+    : '';
+  return `<div class="gate"><div class="g-h">${head}</div>
+    <div class="q">${esc(j.question || (j.detail || '(see analysis)').slice(0, 500))}</div>
     ${j.evidence ? `<details class="sub" data-key="g-ev"><summary>evidence</summary><pre>${linkify(j.evidence)}</pre></details>` : ''}
     ${j.analysis ? `<details class="sub" data-key="g-an"><summary>full analysis</summary><pre>${esc(j.analysis)}</pre></details>` : ''}
     <div class="answer"><textarea id="ans-${id}" data-draft="gb-draft-${id}" placeholder="Your answer / guidance&hellip;"></textarea>
-    <div class="hint">Redo re-runs this stage with your notes as corrections &mdash; optionally prefix 'P3 ' to redo an earlier stage.</div>
-    <div class="btns">
-      <button class="go" onclick="answer('${id}','proceed',this)">${goLabel}</button>
-      <button class="redo" onclick="answer('${id}','redo',this)">Redo</button>
-      <button class="no" onclick="answer('${id}','skip',this)">Skip</button>
-    </div></div></div>`;
+    ${hint}<div class="btns">${btns}</div></div></div>`;
 }
 
-function renderFeatureDetail(data) {
+function renderDetail(data) {
   const j = data.job;
+  const feature = j.kind === 'feature';
   let links = '';
+  if (j.issue_url) links += `<a href="${esc(j.issue_url)}" target="_blank">Sentry</a>`;
   if (j.clickup_task_url) links += `<a href="${esc(j.clickup_task_url)}" target="_blank">ClickUp</a>`;
   if (j.pr_url) links += `<a href="${esc(j.pr_url)}" target="_blank">PR</a>`;
-  const sub = `P${j.stage} ${esc(j.stage_name || '')} &middot; ${esc(j.project)} &middot; ${esc(j.gate_mode)} gates`
-    + `<span style="margin-left:auto"><details class="sub" style="margin:0" data-key="d-stats"><summary>stats</summary></details></span>`;
-  dHeader(j.title, j.status, links, sub, Number(j.stage) || 0, true, data.live);
+  let sub;
+  if (feature) {
+    sub = `P${j.stage} ${esc(j.stage_name || '')} &middot; ${esc(j.project)} &middot; ${esc(j.gate_mode)} gates`
+      + `<span style="margin-left:auto"><details class="sub" style="margin:0" data-key="d-stats"><summary>stats</summary></details></span>`;
+  } else {
+    const score = j.score != null ? ` &middot; score ${esc(String(j.score))}` : '';
+    const phase = j.kind === 'task' && j.phase > 1 ? ' &middot; phase 2' : '';
+    sub = `${esc(KIND_LABEL[j.kind] || j.kind)} &middot; ${esc(j.project)}${score}${phase}`;
+  }
+  dHeader(j.title, j.status, links, sub, Number(j.stage) || 0, feature, data.live);
 
   const st = threadState();
-  document.getElementById('d-thread').innerHTML =
-    '<div class="daydiv">&mdash; pipeline &mdash;</div>'
-    + stageCards(data)
-    + '<div class="daydiv">&mdash; conversation &mdash;</div>'
-    + (convoThread(data) || '<div class="lead">no messages yet &mdash; ask the engine anything about this work</div>')
-    + gatePacket(data);
+  const pipeline = feature
+    ? '<div class="daydiv">&mdash; pipeline &mdash;</div>' + stageCards(data)
+    : '';
+  // v1 items have no stage cards — the live run gets its own activity box
+  // (the feature live-slot lives inside the current stage card instead)
+  const activity = (!feature && data.live)
+    ? '<div class="daydiv">&mdash; live activity &mdash;</div>'
+      + '<div class="stage live"><div class="inner" id="live-slot" style="border-top:0"></div></div>'
+    : '';
+  const convo = data.chat_available
+    ? '<div class="daydiv">&mdash; conversation &mdash;</div>'
+      + (convoThread(data) || '<div class="lead">no messages yet &mdash; ask the engine anything about this work</div>')
+    : '';
+  document.getElementById('d-thread').innerHTML = pipeline + activity + convo + gatePacket(data);
   restoreThread(st);
 
   // re-seat the persistent live log + streaming chat bubble after the rebuild
@@ -733,17 +750,18 @@ function renderFeatureDetail(data) {
     sd.addEventListener('toggle', () => { if (sd.open) loadHeaderStats(j.issue_id, sd); });
   }
 
-  // composer state — the backend's steer_available flag is the single source of
-  // truth: steering interrupts a RUNNING stage; at a gate the answer box (with
-  // Redo notes) is the correction channel, so the Steer tab disables there.
+  // composer state — the backend's flags are the single source of truth:
+  // chat_available gates the whole composer (kind-based); steer_available
+  // gates the Steer tab (feature + running only — the answer box is the
+  // correction channel at gates, and v1 items have no resumable runs).
+  document.getElementById('composer').style.display = data.chat_available ? '' : 'none';
   const steerTab = document.getElementById('tab-steer');
-  steerTab.style.display = '';
+  steerTab.style.display = feature ? '' : 'none';
   steerTab.disabled = !data.steer_available;
-  if (steerTab.disabled && composerMode === 'steer') setMode('ask');
+  if ((steerTab.disabled || !feature) && composerMode === 'steer') setMode('ask');
   updateComposerHint(data);
   const send = document.getElementById('c-send');
   send.disabled = composerMode === 'ask' && (data.chat_limit || data.chat_pending);
-  document.getElementById('composer').style.display = '';
 }
 
 async function loadHeaderStats(id, det) {
@@ -782,37 +800,8 @@ function statsTable(data) {
   return `<table><tr><th>stage</th><th>attempts</th><th>duration</th><th>cost</th><th>gate wait</th><th>result</th></tr>${rows}</table>`;
 }
 
-// non-feature (sentry / request / memory) detail: question + evidence + answer
-function renderV1Detail(j) {
-  const id = esc(j.issue_id);
-  let links = '';
-  if (j.issue_url) links += `<a href="${esc(j.issue_url)}" target="_blank">Sentry</a>`;
-  if (j.clickup_task_url) links += `<a href="${esc(j.clickup_task_url)}" target="_blank">ClickUp</a>`;
-  if (j.pr_url) links += `<a href="${esc(j.pr_url)}" target="_blank">PR</a>`;
-  const score = j.score != null ? ` &middot; score ${j.score}` : '';
-  const phase = j.kind === 'task' && j.phase > 1 ? ' &middot; phase 2' : '';
-  dHeader(j.title || j.issue_id, j.status, links,
-          `${esc(KIND_LABEL[j.kind] || j.kind)} &middot; ${esc(j.project)}${score}${phase}`, 0, false, false);
-  const st = threadState();
-  let h = '';
-  if (j.status === 'awaiting_input') {
-    h += `<div class="gate"><div class="g-h">Needs your input</div>
-      <div class="q">${esc(j.question || (j.detail || '').slice(0, 500))}</div>
-      ${j.evidence ? `<details class="sub" data-key="g-ev"><summary>evidence</summary><pre>${linkify(j.evidence)}</pre></details>` : ''}
-      ${j.analysis ? `<details class="sub" data-key="g-an"><summary>full analysis</summary><pre>${esc(j.analysis)}</pre></details>` : ''}
-      <div class="answer"><textarea id="ans-${id}" data-draft="gb-draft-${id}" placeholder="Your answer / guidance&hellip;"></textarea>
-      <div class="btns">
-        <button class="go" onclick="answer('${id}','proceed',this)">Proceed</button>
-        <button class="no" onclick="answer('${id}','skip',this)">Skip</button>
-      </div></div></div>`;
-  } else {
-    h += `<div class="lead">${esc(STATUS_LABEL[j.status] || j.status)}${j.detail ? ' &mdash; ' + esc(String(j.detail).slice(0, 600)) : ''}</div>`;
-    if (j.analysis) h += `<details class="sub" data-key="g-an"><summary>analysis</summary><pre>${esc(j.analysis)}</pre></details>`;
-  }
-  document.getElementById('d-thread').innerHTML = h;
-  restoreThread(st);
-  document.getElementById('composer').style.display = 'none';  // chat is feature-only
-}
+// (non-feature items render through renderDetail too — the session snapshot
+// serves all kinds; chat_available / steer_available flags shape the composer)
 
 // ---------- live stage stream (api/jobs/{id}/session/stream) ----------
 

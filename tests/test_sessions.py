@@ -222,6 +222,34 @@ class TestRunClaudeStream:
         assert "STAGE_DONE" in raw.text
 
 
+class TestV1RunStreaming:
+    def test_run_claude_streams_with_on_event(self, tmp_path):
+        """Chat everywhere: v1 sentry/task runs stream live progress through
+        on_event with the same FixResult contract as the raw path."""
+        from app.config import RepoTarget
+        from app.fixer import run_claude
+
+        s = _settings(tmp_path, _fake_claude(tmp_path, STREAM_SCRIPT))
+        target = RepoTarget(repo="o/r", base="main")
+        events = []
+        res = asyncio.run(run_claude(s, target, str(tmp_path), "fix it",
+                                     on_event=lambda e, d: events.append((e, d))))
+        assert res.status == "no_fix"  # 'the answer' has no PR_URL/NEEDS_INPUT
+        assert ("status", "Read app/x.py") in events
+        assert ("delta", "the answer") in events
+
+    def test_run_claude_without_on_event_unchanged(self, tmp_path):
+        from app.config import RepoTarget
+        from app.fixer import run_claude
+
+        s = _settings(tmp_path, _fake_claude(
+            tmp_path, "echo '{\"result\": \"NEEDS_INPUT: which limit?\"}'"))
+        target = RepoTarget(repo="o/r", base="main")
+        res = asyncio.run(run_claude(s, target, str(tmp_path), "fix it"))
+        assert res.status == "needs_input"
+        assert "which limit?" in res.detail
+
+
 class TestJanitorBothStores:
     def _mk_transcript(self, config_dir: str, sid: str, age_days: float):
         d = Path(config_dir) / "projects" / "-some-workspace"

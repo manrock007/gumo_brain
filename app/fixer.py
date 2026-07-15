@@ -64,14 +64,17 @@ def ensure_session_store(settings: Settings):
                           "persistence will degrade to fresh runs", target_dir)
 
 
-def session_transcript_exists(settings: Settings, session_id: str) -> bool:
+def session_transcript_exists(settings: Settings, session_id: str,
+                              config_dir: str | None = None) -> bool:
     """A resume of a missing session exits 0 with EMPTY stdout (verified on the
     installed CLI) — never trust exit signals. Transcripts live under
-    CLAUDE_CONFIG_DIR/projects/<cwd-slug>/<session>.jsonl; glob across project
-    slugs so slug-scheme drift can't fake a loss."""
+    <config dir>/projects/<cwd-slug>/<session>.jsonl; glob across project
+    slugs so slug-scheme drift can't fake a loss. config_dir picks WHICH store
+    to search — the default stage store, or the dedicated chat store for runs
+    that were invoked with config_dir=claude_chat_config_dir."""
     if not session_id or not settings.session_persistence:
         return False
-    root = Path(settings.claude_config_dir) / "projects"
+    root = Path(config_dir or settings.claude_config_dir) / "projects"
     if not root.is_dir():
         return False
     return any(root.glob(f"*/{session_id}.jsonl"))
@@ -93,15 +96,19 @@ async def _run(cmd: list[str], cwd: str | None = None, timeout: int = 300) -> tu
 
 
 async def prepare_workspace(settings: Settings, target: RepoTarget, branch: str,
-                            keep_branch: bool = False) -> str:
+                            keep_branch: bool = False,
+                            workspace_root: str | None = None) -> str:
     """Clone (or refresh) the repo and check out a clean branch off the base.
 
     keep_branch=True (phase 2) reuses the existing branch if it exists so the
     fix lands on the same branch the analysis referenced.
+    workspace_root overrides the clone location — read-only chat runs use their
+    own clone so they never contend with the job holding the main workspace.
     """
+    root = workspace_root or settings.workspaces_dir
     name = target.repo.split("/")[-1]
-    workspace = str(Path(settings.workspaces_dir) / name)
-    Path(settings.workspaces_dir).mkdir(parents=True, exist_ok=True)
+    workspace = str(Path(root) / name)
+    Path(root).mkdir(parents=True, exist_ok=True)
 
     if not Path(workspace, ".git").exists():
         code, out = await _run(
@@ -475,13 +482,24 @@ async def run_claude_stream(settings: Settings, workspace: str, prompt: str,
     return RawRunResult("ok", result_text, meta)
 
 
-async def run_claude(settings: Settings, target: RepoTarget, workspace: str, prompt: str) -> FixResult:
-    """v1 contract used by sentry/task jobs: PR URL sniffing + NEEDS_INPUT/NO_FIX."""
-    raw = await run_claude_raw(
-        settings, workspace, prompt,
-        allowed_tools=BASE_ALLOWED_TOOLS + target.allow,
-        timeout=settings.claude_timeout_seconds,
-    )
+async def run_claude(settings: Settings, target: RepoTarget, workspace: str, prompt: str,
+                     on_event=None) -> FixResult:
+    """v1 contract used by sentry/task jobs: PR URL sniffing + NEEDS_INPUT/NO_FIX.
+    With on_event, the run streams live progress (tool calls / text) exactly like
+    stage runs — same return contract either way."""
+    if on_event is not None:
+        raw = await run_claude_stream(
+            settings, workspace, prompt,
+            allowed_tools=BASE_ALLOWED_TOOLS + target.allow,
+            timeout=settings.claude_timeout_seconds,
+            on_event=on_event,
+        )
+    else:
+        raw = await run_claude_raw(
+            settings, workspace, prompt,
+            allowed_tools=BASE_ALLOWED_TOOLS + target.allow,
+            timeout=settings.claude_timeout_seconds,
+        )
     if raw.status == "timeout":
         return FixResult("timeout", detail=raw.text, meta=raw.meta)
     if raw.status == "error":

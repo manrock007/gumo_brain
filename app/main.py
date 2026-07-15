@@ -347,14 +347,14 @@ async def gate_chat_post(job_id: str, body: ChatBody):
     job = store.get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail=f"unknown job '{job_id}'")
-    if (job.get("kind") or "") != "feature":
-        raise HTTPException(status_code=409, detail="chat is available on feature pipelines only")
+    if (job.get("kind") or "") not in ("feature", "sentry", "task"):
+        raise HTTPException(status_code=409, detail="chat is not available for this item kind")
     # chat is available while parked at a gate AND mid-run (the inbox conversation):
-    # the fast lane answers from persisted artifacts without touching the repo; a
+    # the fast lane answers from the item's record without touching the repo; a
     # code-reading escalation queues on the repo lock and lands via persist-then-poll.
     if job["status"] not in ("awaiting_input", "running"):
         raise HTTPException(status_code=409,
-                            detail=f"job is '{job['status']}' — chat needs a parked or running stage")
+                            detail=f"job is '{job['status']}' — chat needs a parked or running item")
     stage = int(job.get("stage") or 0)
     attempt = max(1, int(job.get("stage_attempts") or 1))
     # the turn budget is per GATE: count only this attempt's turns, so a redo
@@ -427,19 +427,20 @@ SESSION_ARTIFACT_MAX = 24000  # per-artifact body cap in the session snapshot pa
 
 @app.get("/api/jobs/{job_id}/session", dependencies=[Depends(require_auth)])
 async def session_snapshot(job_id: str):
-    """Everything the session page shows for one feature job: meta, the P0-P9
-    stage timeline, gate decisions, the current branch artifacts, and whether a
-    run is live / steerable right now. Read-only; the live activity comes over
-    the SSE stream, this is the durable frame around it."""
+    """Everything the detail pane shows for one item: meta, the stage timeline
+    (features), gate decisions, the current branch artifacts, the conversation,
+    and whether a run is live / steerable right now. All kinds — sentry/task
+    items just have empty runs/artifacts and chat primed from their record.
+    Read-only; the live activity comes over the SSE stream."""
     store: JobStore = app.state.store
     worker: Worker = app.state.worker
     job = store.get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail=f"unknown job '{job_id}'")
-    if (job.get("kind") or "") != "feature":
-        raise HTTPException(status_code=409, detail="the session view is for feature pipelines only")
+    kind = job.get("kind") or "sentry"
+    feature = kind == "feature"
     stage = int(job.get("stage") or 0)
-    names = [a["artifact"] for a in store.artifacts_for(job_id)]
+    names = [a["artifact"] for a in store.artifacts_for(job_id)] if feature else []
     bodies = store.artifact_contents(job_id, names) if names else {}
     artifacts = [{"name": n, "content": (bodies.get(n) or "")[:SESSION_ARTIFACT_MAX],
                   "truncated": len(bodies.get(n) or "") > SESSION_ARTIFACT_MAX}
@@ -448,15 +449,18 @@ async def session_snapshot(job_id: str):
     return {
         "job": {
             "issue_id": job_id, "title": job.get("title") or job_id,
-            "status": job["status"], "project": job.get("project") or "",
-            "stage": stage, "stage_name": stage_name(stage),
+            "kind": kind, "status": job["status"], "project": job.get("project") or "",
+            "stage": stage, "stage_name": stage_name(stage) if feature else "",
+            "phase": job.get("phase"), "score": job.get("score"),
             "gate_mode": job.get("gate_mode") or "full", "owner": job.get("owner") or "",
             "pr_url": job.get("pr_url") or "", "clickup_task_url": job.get("clickup_task_url") or "",
+            "issue_url": job.get("issue_url") or "",
             "question": job.get("question") or "", "gate_kind": job.get("gate_kind") or "",
             "evidence": job.get("evidence") or "", "analysis": job.get("analysis") or "",
+            "detail": (job.get("detail") or "")[:2000],
             "updated_at": job.get("updated_at"),
         },
-        "runs": store.stage_runs_for(job_id),
+        "runs": store.stage_runs_for(job_id) if feature else [],
         "guidance": store.guidance_for(job_id),
         "artifacts": artifacts,
         # the full conversation across ALL stages (the inbox thread), plus the
@@ -466,10 +470,10 @@ async def session_snapshot(job_id: str):
                                       max(1, int(job.get("stage_attempts") or 1))),
         "chat_limit": store.chat_count(job_id, stage, max(1, int(job.get("stage_attempts") or 1)))
                       >= settings.chat_max_turns_per_gate,
+        "chat_available": kind in ("feature", "sentry", "task"),
         "live": live,
-        # steering interrupts in place only with session persistence; otherwise the
-        # note is queued to the next checkpoint (still useful, just not immediate)
-        "steer_available": job["status"] == "running",
+        # steering rides the feature stage-resume machinery — feature-only
+        "steer_available": feature and job["status"] == "running",
         "steer_immediate": bool(settings.session_persistence),
     }
 

@@ -53,6 +53,132 @@ class TestChatEngineFallbacks:
         assert last["degraded"] == 1
         assert "moved on" in last["text"]
 
+    def test_v1_chat_answers_from_the_record(self, worker, monkeypatch):
+        """Chat everywhere: a sentry item's chat routes through the v1 lanes —
+        fast lane primed from its request/analysis/question/evidence."""
+        from app import fastlane as fastlane_mod
+
+        worker.store.insert("sen-c1", source="manual", kind="sentry", title="TypeError in X")
+        worker.store.set_fields("sen-c1", project="web",
+                                analysis="root cause: id is None", question="ship the guard?")
+        worker.store.set_status("sen-c1", "awaiting_input")
+        job = worker.store.get("sen-c1")
+        worker.store.chat_add("sen-c1", 0, 1, "human", "why is id None?")
+
+        captured = {}
+
+        async def fake_fast(settings, system, messages, on_delta):
+            captured["system"] = system
+            return "ok", "because the serializer skips hydration", {"lane": "fast"}
+
+        monkeypatch.setattr(worker.engine.settings, "chat_fast_model", "m", raising=False)
+        monkeypatch.setattr(worker.engine.settings, "chat_api_key", "k", raising=False)
+        monkeypatch.setattr(fastlane_mod, "stream_answer", fake_fast)
+        import app.engine as engine_mod
+        monkeypatch.setattr(engine_mod.fastlane, "stream_answer", fake_fast)
+        asyncio.run(worker.engine.chat(job, "why is id None?"))
+        last = worker.store.chat_last("sen-c1", 0)
+        assert last["role"] == "engine"
+        assert "serializer" in last["text"]
+        assert not last["degraded"]
+        # the v1 system prompt is primed from the item's record, not stage artifacts
+        assert "root cause: id is None" in captured["system"]
+        assert "ship the guard?" in captured["system"]
+
+    def test_v1_slow_lane_reaches_the_workspace_step(self, worker, monkeypatch):
+        """The v1 slow lane checks out the BASE branch; with no workspace in tests
+        it degrades past the status guard (proving routing), never 'moved on'."""
+        import app.engine as engine_mod
+
+        worker.intake_task("task-c2", title="T", project="web", request="r")
+        worker.store.set_status("task-c2", "awaiting_input")
+        job = worker.store.get("task-c2")
+        worker.store.chat_add("task-c2", 0, 1, "human", "which file handles uploads?")
+
+        async def no_ws(*a, **k):
+            raise RuntimeError("no workspace in tests")
+
+        monkeypatch.setattr(engine_mod, "prepare_workspace", no_ws)
+        asyncio.run(worker.engine.chat(job, "which file handles uploads?"))
+        last = worker.store.chat_last("task-c2", 0)
+        assert last["role"] == "engine"
+        assert "moved on" not in last["text"]
+        assert "cannot check out" in last["text"]
+
+    def test_v1_followup_resumes_the_chat_session(self, store, tmp_path, monkeypatch):
+        """Seer PR#9 round 3: v1 chat transcripts live in the CHAT config store —
+        the resume lookup must search there, or every follow-up starts fresh."""
+        import os
+        from pathlib import Path
+
+        import app.engine as engine_mod
+        from app.config import Settings
+        from app.fixer import RawRunResult
+        from app.worker import Worker
+
+        s = Settings(data_dir=str(tmp_path), dashboard_password="test",
+                     session_persistence=True)
+        w = Worker(s, store)
+        # a prior engine turn with a session whose transcript lives in the CHAT store
+        d = Path(s.claude_chat_config_dir) / "projects" / "-ws"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "v1-sess-1.jsonl").write_text("{}")
+        w.intake_task("task-c9", title="T", project="web", request="r")
+        store.set_status("task-c9", "awaiting_input")
+        job = store.get("task-c9")
+        store.chat_add("task-c9", 0, 1, "human", "q1")
+        store.chat_add("task-c9", 0, 1, "engine", "a1", session_id="v1-sess-1")
+        store.chat_add("task-c9", 0, 1, "human", "follow-up?")
+
+        async def fake_ws(*a, **k):
+            return str(tmp_path)
+
+        captured = {}
+
+        async def fake_stream(settings, workspace, prompt, **k):
+            captured["resume"] = k.get("resume_session")
+            return RawRunResult("ok", "resumed answer", {"session_id": "v1-sess-1"})
+
+        async def fake_git(*a, **k):
+            return (0, "")
+
+        monkeypatch.setattr(engine_mod, "prepare_workspace", fake_ws)
+        monkeypatch.setattr(engine_mod, "run_claude_stream", fake_stream)
+        monkeypatch.setattr(engine_mod, "git", fake_git)
+        asyncio.run(w.engine.chat(job, "follow-up?"))
+        assert captured["resume"] == "v1-sess-1"  # continuity, not a fresh session
+        assert store.chat_last("task-c9", 0)["text"] == "resumed answer"
+
+    def test_v1_slow_lane_does_not_wait_on_the_main_repo_lock(self, worker, monkeypatch):
+        """Seer PR#9 round 1: a v1 item holds the MAIN repo lock for its whole
+        run and lands terminal right after, so a chat waiting on that lock could
+        never answer mid-run. The v1 slow lane uses its own clone + chat lock —
+        it must complete while the main lock is held."""
+        import app.engine as engine_mod
+
+        worker.intake_task("task-c3", title="T", project="web", request="r")
+        worker.store.set_status("task-c3", "running")
+        job = worker.store.get("task-c3")
+        worker.store.chat_add("task-c3", 0, 1, "human", "what does the run change?")
+
+        async def no_ws(*a, **k):
+            raise RuntimeError("no workspace in tests")
+
+        monkeypatch.setattr(engine_mod, "prepare_workspace", no_ws)
+        target = worker.settings.repo_for_project("web")
+
+        async def run():
+            async with worker.engine.locks.for_repo(target.repo):  # the running job
+                # must finish promptly despite the held main lock
+                await asyncio.wait_for(
+                    worker.engine.chat(job, "what does the run change?"), timeout=5)
+
+        asyncio.run(run())
+        last = worker.store.chat_last("task-c3", 0)
+        assert last["role"] == "engine"
+        assert "moved on" not in last["text"]
+        assert "cannot check out" in last["text"]  # got past the lock + guard
+
     def test_running_job_passes_the_slow_lane_guard(self, worker, monkeypatch):
         """Seer PR#8 round 5: the endpoint admits mid-run chat, so the slow lane's
         under-lock re-validation must too — a running job at the SAME stage gets
@@ -406,14 +532,20 @@ class TestChatEndpoints:
         r = c.post("/api/jobs/feat-api1/chat", headers=AUTH, json={"message": "hi"})
         assert r.status_code == 409
 
-    def test_chat_only_for_features(self, client):
+    def test_chat_on_all_item_kinds(self, client):
+        """Chat everywhere: sentry/task items are conversational too; only
+        kinds with nothing to talk to (memory) stay 409."""
         c, m = client
         store = m.app.state.store
         m.app.state.worker.intake_task("task-api1", title="T", project="web", request="r")
         store.set_status("task-api1", "awaiting_input")
         r = c.post("/api/jobs/task-api1/chat", headers=AUTH, json={"message": "hi"})
+        assert r.status_code == 202
+        store.insert("mem-x", source="manual", kind="memory")
+        store.set_status("mem-x", "running")
+        r = c.post("/api/jobs/mem-x/chat", headers=AUTH, json={"message": "hi"})
         assert r.status_code == 409
-        assert "feature" in r.json()["detail"]
+        assert "kind" in r.json()["detail"]
 
     def test_single_flight_and_get(self, client):
         c, m = client
