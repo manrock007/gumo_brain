@@ -880,17 +880,21 @@ class Engine:
         job_id = job["issue_id"]
         if target is None:
             return "(no repo is mapped for this project — cannot answer from code)", {}, True
-        publish("status", "waiting for the repository workspace")
+        publish("status", "preparing a read-only workspace")
 
-        async with self.locks.for_repo(target.repo):
-            # re-validate under the lock: the item may have finished while queued
+        # a DEDICATED clone + lock, NOT the main repo lock: a v1 item holds the
+        # main lock for its entire run and lands terminal right after — waiting
+        # on it would make mid-run chat unreachable. Chat reads the BASE branch,
+        # so its own clone is always safe; the chat lock only serializes chats.
+        async with self.locks.for_repo(f"chat:{target.repo}"):
             fresh = self.store.get(job_id)
             if not fresh or fresh["status"] not in ("awaiting_input", "running"):
                 return ("This was answered before I got to it — the item has moved on. "
                         "This question stays on the record."), {}, True
             try:
-                workspace = await prepare_workspace(self.settings, target,
-                                                    f"brain/chat-{job_id}")
+                workspace = await prepare_workspace(
+                    self.settings, target, f"brain/chat-{job_id}",
+                    workspace_root=f"{self.settings.workspaces_dir}/chat")
             except Exception as e:
                 return (f"(cannot check out the repository to answer from code: "
                         f"{str(e)[:200]} — answering is limited to the record)"), {}, True

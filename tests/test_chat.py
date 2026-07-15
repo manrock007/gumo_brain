@@ -105,6 +105,36 @@ class TestChatEngineFallbacks:
         assert "moved on" not in last["text"]
         assert "cannot check out" in last["text"]
 
+    def test_v1_slow_lane_does_not_wait_on_the_main_repo_lock(self, worker, monkeypatch):
+        """Seer PR#9 round 1: a v1 item holds the MAIN repo lock for its whole
+        run and lands terminal right after, so a chat waiting on that lock could
+        never answer mid-run. The v1 slow lane uses its own clone + chat lock —
+        it must complete while the main lock is held."""
+        import app.engine as engine_mod
+
+        worker.intake_task("task-c3", title="T", project="web", request="r")
+        worker.store.set_status("task-c3", "running")
+        job = worker.store.get("task-c3")
+        worker.store.chat_add("task-c3", 0, 1, "human", "what does the run change?")
+
+        async def no_ws(*a, **k):
+            raise RuntimeError("no workspace in tests")
+
+        monkeypatch.setattr(engine_mod, "prepare_workspace", no_ws)
+        target = worker.settings.repo_for_project("web")
+
+        async def run():
+            async with worker.engine.locks.for_repo(target.repo):  # the running job
+                # must finish promptly despite the held main lock
+                await asyncio.wait_for(
+                    worker.engine.chat(job, "what does the run change?"), timeout=5)
+
+        asyncio.run(run())
+        last = worker.store.chat_last("task-c3", 0)
+        assert last["role"] == "engine"
+        assert "moved on" not in last["text"]
+        assert "cannot check out" in last["text"]  # got past the lock + guard
+
     def test_running_job_passes_the_slow_lane_guard(self, worker, monkeypatch):
         """Seer PR#8 round 5: the endpoint admits mid-run chat, so the slow lane's
         under-lock re-validation must too — a running job at the SAME stage gets

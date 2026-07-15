@@ -93,15 +93,19 @@ async def _run(cmd: list[str], cwd: str | None = None, timeout: int = 300) -> tu
 
 
 async def prepare_workspace(settings: Settings, target: RepoTarget, branch: str,
-                            keep_branch: bool = False) -> str:
+                            keep_branch: bool = False,
+                            workspace_root: str | None = None) -> str:
     """Clone (or refresh) the repo and check out a clean branch off the base.
 
     keep_branch=True (phase 2) reuses the existing branch if it exists so the
     fix lands on the same branch the analysis referenced.
+    workspace_root overrides the clone location — read-only chat runs use their
+    own clone so they never contend with the job holding the main workspace.
     """
+    root = workspace_root or settings.workspaces_dir
     name = target.repo.split("/")[-1]
-    workspace = str(Path(settings.workspaces_dir) / name)
-    Path(settings.workspaces_dir).mkdir(parents=True, exist_ok=True)
+    workspace = str(Path(root) / name)
+    Path(root).mkdir(parents=True, exist_ok=True)
 
     if not Path(workspace, ".git").exists():
         code, out = await _run(
