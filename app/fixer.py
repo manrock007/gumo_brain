@@ -1,6 +1,7 @@
 """Workspace management and the headless Claude Code invocation."""
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -374,6 +375,8 @@ async def run_claude_stream(settings: Settings, workspace: str, prompt: str,
     except asyncio.TimeoutError:
         proc.kill()
         stderr_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await stderr_task  # reap the reader — a bare cancel leaves it pending
         log.error("claude stream run timed out after %ss", timeout)
         return RawRunResult("timeout", f"timed out after {timeout}s",
                             {"session_id": session_id})
@@ -381,6 +384,8 @@ async def run_claude_stream(settings: Settings, workspace: str, prompt: str,
         # graceful shutdown must never orphan a live claude that later pushes
         proc.kill()
         stderr_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await stderr_task
         raise
     try:
         stderr = (await asyncio.wait_for(stderr_task, timeout=10)).decode(errors="replace")

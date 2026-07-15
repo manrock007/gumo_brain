@@ -126,6 +126,20 @@ class TestRunClaudeStream:
         assert raw.status == "error"
         assert raw.meta["session_id"] == "s-9"
 
+    def test_timeout_reaps_the_stderr_reader(self, tmp_path):
+        """Seer PR#4 round 1: a timed-out run must await the cancelled stderr
+        reader — a bare cancel leaves a pending task that warns at shutdown."""
+        s = _settings(tmp_path, _fake_claude(tmp_path, "sleep 30"))
+
+        async def run():
+            raw = await run_claude_stream(s, str(tmp_path), "q", ["Read"], 1)
+            leftovers = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+            return raw, leftovers
+
+        raw, leftovers = asyncio.run(run())
+        assert raw.status == "timeout"
+        assert leftovers == []
+
 
 class TestJanitorBothStores:
     def _mk_transcript(self, config_dir: str, sid: str, age_days: float):
