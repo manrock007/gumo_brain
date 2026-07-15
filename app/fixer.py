@@ -261,7 +261,13 @@ async def run_claude_raw(settings: Settings, workspace: str, prompt: str,
         log.warning("resume of session %s found nothing: %s", resume_session, stderr[-300:])
         return RawRunResult("session_lost", stderr[-500:], {"session_id": resume_session})
 
-    meta: dict = {"session_id": session_id or resume_session}
+    # session-id fallback when the envelope can't be parsed: a fresh run's id is
+    # engine-owned (still correct); a plain resume continues the same id; but a
+    # FORK's new id lives only in the envelope — falling back to the original
+    # would make the next chat turn resume (and pollute) the stage session, so
+    # a fork with no envelope reports no session at all.
+    fallback_sid = session_id or (None if fork_session else resume_session)
+    meta: dict = {"session_id": fallback_sid}
     result_text = stdout
     try:
         envelope = json.loads(stdout)
@@ -270,7 +276,7 @@ async def run_claude_raw(settings: Settings, workspace: str, prompt: str,
             "cost_usd": envelope.get("total_cost_usd"),
             "num_turns": envelope.get("num_turns"),
             "duration_ms": envelope.get("duration_ms"),
-            "session_id": envelope.get("session_id") or session_id or resume_session,
+            "session_id": envelope.get("session_id") or fallback_sid,
         }
     except (json.JSONDecodeError, AttributeError):
         pass  # envelope parsing is best-effort even on nonzero exits

@@ -760,9 +760,6 @@ class Worker:
                 log.exception("session janitor failed")
 
     def _prune_sessions(self):
-        root = Path(self.settings.claude_config_dir) / "projects"
-        if not root.is_dir():
-            return
         keep: set[str] = set()
         for j in self.store.by_status(["received", "queued", "running", "awaiting_input"]):
             if j.get("resume_session_id"):
@@ -775,13 +772,20 @@ class Worker:
                     keep.add(t["session_id"])
         cutoff = time.time() - self.settings.session_ttl_days * 86400
         pruned = 0
-        for f in root.glob("*/*.jsonl"):
-            try:
-                if f.stem not in keep and f.stat().st_mtime < cutoff:
-                    f.unlink()
-                    pruned += 1
-            except OSError:
+        # both session stores: the stage/fork store AND the artifact-primed chat
+        # store — chats write their transcripts to the second one
+        for config_dir in (self.settings.claude_config_dir,
+                           self.settings.claude_chat_config_dir):
+            root = Path(config_dir) / "projects"
+            if not root.is_dir():
                 continue
+            for f in root.glob("*/*.jsonl"):
+                try:
+                    if f.stem not in keep and f.stat().st_mtime < cutoff:
+                        f.unlink()
+                        pruned += 1
+                except OSError:
+                    continue
         if pruned:
             log.info("session janitor pruned %d transcripts", pruned)
 

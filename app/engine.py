@@ -697,6 +697,15 @@ class Engine:
             # output is the value there; everything else is artifact-primed (cheap).
             resume_sid, fork_new = self._chat_session_for(job, stage)
             if resume_sid:
+                convo = ""
+                if fork_new:
+                    # a fresh fork has no memory of earlier chat turns (e.g. after a
+                    # lost fork id) — re-prime it from the recorded transcript
+                    for t in self.store.chat_for(job_id, stage)[:-1][-6:]:
+                        who = "Reviewer" if t["role"] == "human" else "You"
+                        convo += f"\n{who}: {(t['text'] or '').strip()[:600]}"
+                    if convo:
+                        convo = f"\n\nConversation so far at this gate:{convo}\n"
                 prompt = (
                     f"PAUSE — you are at the P{stage} gate of this stage run, in READ-ONLY "
                     f"mode, answering the human reviewer's question below. This is a copy of "
@@ -705,7 +714,7 @@ class Engine:
                     f"delete anything. Answer directly and concisely (under 250 words unless "
                     f"the question demands more); cite files when referencing code; if an "
                     f"honest answer requires changing the work, say so and recommend /redo "
-                    f"with concrete notes.\n\nThe reviewer asks:\n\n{message.strip()[:4000]}"
+                    f"with concrete notes.{convo}\n\nThe reviewer asks:\n\n{message.strip()[:4000]}"
                 )
                 async with self.locks.claude_global:  # shares the session store
                     raw = await run_claude_raw(
