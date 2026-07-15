@@ -140,7 +140,48 @@ amendments are folded in:
   while parked, the resume message says ignored files (node_modules, build
   outputs) may have changed — re-run installs before trusting earlier results.
 
-## 5. What deliberately stays the same
+## 5. Two-lane instant-messaging chat (as built)
+
+The v2.1 chat is async (a full tool run per reply, tens of seconds). This
+increment adds the instant-messaging feel on the same contract:
+
+- **Fast lane (default when enabled)**: a direct **streaming Messages API
+  call** primed with the gate bundle — the job row (gate summary, questions,
+  evidence, title), the DB-cached artifact bodies (`artifact_state.content`,
+  refreshed on every artifact write and every stage push, capped 60k), the
+  last 5 guidance entries, and the gate transcript. First tokens in ~1-2s.
+  No subprocess, no workspace, no locks.
+- **Self-escalation**: the fast lane has no repository access and is
+  instructed to open its reply with `NEED_CODE_RUN: <reason>` when the
+  question needs code. A holdback buffer keeps the marker off the wire; the
+  engine then runs the existing slow lane. Fast-lane **errors also fall
+  through** to the slow lane — the feature can only add latency, never
+  subtract answers.
+- **Slow lane streams too**: chat tool runs now use `--output-format
+  stream-json` (`run_claude_stream`, same return contract and session-id
+  fallback rules as `run_claude_raw`) and surface each tool call as a
+  `status` line ("Read app/billing.py") plus the answer text as it lands.
+  Stage runs are untouched (still `json` mode).
+- **Transport**: `GET /api/jobs/{id}/chat/stream` (SSE: `delta`/`status`/
+  `done`, `:ping` heartbeats). An in-memory per-job **ChatBroker** buffers
+  the current turn so late/reconnecting subscribers replay then follow live;
+  single-process like every lock here. `POST .../chat` starts the turn's
+  buffer; the background task `finish()`es it in a `finally`. **Persist-then-
+  poll remains the contract** — the stream is pure UX and the 5s dashboard
+  poll still delivers if SSE dies. The dashboard renders a live bubble
+  (re-attached across transcript repaints) and tags fast-lane turns.
+- **Config**: `chat_fast_model` (empty = disabled → behavior identical to
+  v2.1) + a key from `CHAT_API_KEY` (falling back to `ANTHROPIC_API_KEY`).
+  The key is used only for fast-lane HTTP calls; CLI runs keep their own
+  auth. `chat_api_base` / `chat_fast_timeout_seconds` / `chat_fast_max_tokens`
+  complete the knobs. Fast-lane turns persist `lane='fast'` on `gate_chat`
+  (num_turns=1, duration_ms; no CLI cost envelope).
+- **Invariants kept**: read-only chat (the fast lane can't even reach the
+  repo; the slow lane keeps the DENY list + residue reset), INSERT-only
+  transcript, turn caps, single-flight per gate, cancellation tombstones,
+  ClickUp mirroring of every exchange.
+
+## 6. What deliberately stays the same
 
 Git as truth; artifact mirrors and human-wins sync; fail-closed parsing; the
 three verbs; ClickUp phone-answering; single-writer CAS gates; per-stage

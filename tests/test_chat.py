@@ -124,7 +124,7 @@ class TestChatConfigStoreLock:
 
         monkeypatch.setattr(engine_mod, "prepare_feature_workspace", fake_prepare)
         monkeypatch.setattr(engine_mod, "git", fake_git)
-        monkeypatch.setattr(engine_mod, "run_claude_raw", fake_raw)
+        monkeypatch.setattr(engine_mod, "run_claude_stream", fake_raw)
         asyncio.run(eng.chat(job, "q?"))
         assert worker.store.chat_last(job_id, 3)["degraded"] == 0
         return seen
@@ -148,6 +148,197 @@ class TestChatConfigStoreLock:
         assert seen["config_dir"] == s.claude_chat_config_dir
         assert seen["chat_global"] is True     # dedicated chat store
         assert seen["claude_global"] is False  # stage runs stay unblocked
+
+
+class TestTwoLaneDispatch:
+    """docs/CONVERSATIONS.md §5: fast lane answers when it can, escalates on
+    NEED_CODE_RUN, and errors fall through — chat never loses an answer to the
+    fast lane."""
+
+    def _worker(self, tmp_path):
+        from app.config import Settings
+        from app.db import JobStore
+        from app.worker import Worker
+
+        s = Settings(data_dir=str(tmp_path), dashboard_password="test",
+                     chat_fast_model="claude-sonnet-5", chat_api_key="k-test")
+        return Worker(s, JobStore(str(tmp_path / "brain.db")))
+
+    def _gate(self, worker, job_id):
+        worker.intake_feature(job_id, title="F", project="web", request="r")
+        worker.store.set_fields(job_id, stage=3, stage_attempts=1,
+                                analysis="chose option B", question="1. ok?")
+        worker.store.set_status(job_id, "awaiting_input")
+        worker.store.chat_add(job_id, 3, 1, "human", "why B?")
+        return worker.store.get(job_id)
+
+    def test_fast_lane_ok_skips_slow_lane(self, tmp_path, monkeypatch):
+        import app.engine as engine_mod
+
+        w = self._worker(tmp_path)
+        job = self._gate(w, "feat-2l1")
+        events = []
+
+        async def fake_fast(settings, system, messages, on_delta):
+            on_delta("because "); on_delta("B avoids a migration")
+            return "ok", "because B avoids a migration", {"lane": "fast", "duration_ms": 900}
+
+        async def no_slow(*a, **k):
+            raise AssertionError("slow lane must not run on a fast-lane answer")
+
+        monkeypatch.setattr(engine_mod.fastlane, "stream_answer", fake_fast)
+        monkeypatch.setattr(w.engine, "_chat_inner", no_slow)
+        asyncio.run(w.engine.chat(job, "why B?",
+                                  publish=lambda e, d: events.append((e, d))))
+        last = w.store.chat_last("feat-2l1", 3)
+        assert last["role"] == "engine"
+        assert last["lane"] == "fast"
+        assert last["degraded"] == 0
+        assert "migration" in last["text"]
+        assert ("delta", "because ") in events
+
+    def test_escalation_reaches_slow_lane(self, tmp_path, monkeypatch):
+        import app.engine as engine_mod
+
+        w = self._worker(tmp_path)
+        job = self._gate(w, "feat-2l2")
+        events, called = [], {}
+
+        async def fake_fast(settings, system, messages, on_delta):
+            return "escalate", "NEED_CODE_RUN: must read billing code", {"lane": "fast"}
+
+        async def fake_slow(job_, stage, message, target, publish=None):
+            called["slow"] = True
+            return "from the code: yes", {"session_id": "s1"}, False
+
+        monkeypatch.setattr(engine_mod.fastlane, "stream_answer", fake_fast)
+        monkeypatch.setattr(w.engine, "_chat_inner", fake_slow)
+        asyncio.run(w.engine.chat(job, "does it handle refunds?",
+                                  publish=lambda e, d: events.append((e, d))))
+        assert called.get("slow") is True
+        last = w.store.chat_last("feat-2l2", 3)
+        assert last["text"] == "from the code: yes"
+        assert last["lane"] == ""
+        statuses = [d for e, d in events if e == "status"]
+        assert any("code run" in s for s in statuses)
+
+    def test_fast_error_falls_through(self, tmp_path, monkeypatch):
+        import app.engine as engine_mod
+
+        w = self._worker(tmp_path)
+        job = self._gate(w, "feat-2l3")
+
+        async def fake_fast(settings, system, messages, on_delta):
+            return "error", "HTTP 529: overloaded", {"lane": "fast"}
+
+        async def fake_slow(job_, stage, message, target, publish=None):
+            return "slow lane answer", {}, False
+
+        monkeypatch.setattr(engine_mod.fastlane, "stream_answer", fake_fast)
+        monkeypatch.setattr(w.engine, "_chat_inner", fake_slow)
+        asyncio.run(w.engine.chat(job, "why B?"))
+        assert w.store.chat_last("feat-2l3", 3)["text"] == "slow lane answer"
+
+    def test_disabled_without_model_goes_straight_to_slow(self, worker, monkeypatch):
+        # the default worker fixture has chat_fast_model="" -> disabled
+        called = {}
+
+        async def fake_slow(job_, stage, message, target, publish=None):
+            called["slow"] = True
+            return "answer", {}, False
+
+        async def no_fast(*a, **k):
+            raise AssertionError("fast lane must not run when disabled")
+
+        import app.engine as engine_mod
+
+        worker.intake_feature("feat-2l4", title="F", project="web", request="r")
+        worker.store.set_fields("feat-2l4", stage=3, stage_attempts=1)
+        worker.store.set_status("feat-2l4", "awaiting_input")
+        worker.store.chat_add("feat-2l4", 3, 1, "human", "q?")
+        monkeypatch.setattr(engine_mod.fastlane, "stream_answer", no_fast)
+        monkeypatch.setattr(worker.engine, "_chat_inner", fake_slow)
+        asyncio.run(worker.engine.chat(worker.store.get("feat-2l4"), "q?"))
+        assert called.get("slow") is True
+
+
+class TestChatBroker:
+    def test_replay_then_live_then_done(self):
+        from app.chatstream import ChatBroker
+
+        async def run():
+            b = ChatBroker()
+            b.start("j1")
+            b.publish("j1", "delta", "hel")
+            b.publish("j1", "status", "reading x")
+            got = []
+
+            async def consume():
+                async for ev in b.subscribe("j1"):
+                    got.append(ev)
+
+            task = asyncio.create_task(consume())
+            await asyncio.sleep(0.01)      # subscriber replays, then waits live
+            b.publish("j1", "delta", "lo")
+            b.finish("j1")
+            await asyncio.wait_for(task, timeout=2)
+            return got
+
+        got = asyncio.run(run())
+        assert got == [("delta", "hel"), ("status", "reading x"),
+                       ("delta", "lo"), ("done", "")]
+
+    def test_subscribe_after_finish_replays_and_ends(self):
+        from app.chatstream import ChatBroker
+
+        async def run():
+            b = ChatBroker()
+            b.start("j2")
+            b.publish("j2", "delta", "answer")
+            b.finish("j2")
+            return [ev async for ev in b.subscribe("j2")]
+
+        got = asyncio.run(run())
+        assert got == [("delta", "answer"), ("done", "")]
+
+    def test_no_turn_yields_done_immediately(self):
+        from app.chatstream import ChatBroker
+
+        async def run():
+            return [ev async for ev in ChatBroker().subscribe("nope")]
+
+        assert asyncio.run(run()) == [("done", "")]
+
+    def test_new_turn_closes_previous_subscribers(self):
+        from app.chatstream import ChatBroker
+
+        async def run():
+            b = ChatBroker()
+            b.start("j3")
+            got = []
+
+            async def consume():
+                async for ev in b.subscribe("j3"):
+                    got.append(ev)
+
+            task = asyncio.create_task(consume())
+            await asyncio.sleep(0.01)
+            b.start("j3")  # next POST — old stream must end, not leak
+            await asyncio.wait_for(task, timeout=2)
+            return got
+
+        assert asyncio.run(run()) == [("done", "")]
+
+    def test_delta_coalescing_past_cap(self):
+        import app.chatstream as cs
+
+        b = cs.ChatBroker()
+        b.start("j4")
+        for i in range(cs.MAX_EVENTS + 50):
+            b.publish("j4", "delta", "x")
+        t = b._turns["j4"]
+        assert len(t["events"]) == cs.MAX_EVENTS
+        assert t["events"][-1][1].endswith("x" * 50)
 
 
 @pytest.fixture()
@@ -242,3 +433,28 @@ class TestChatEndpoints:
         r = c.get("/api/features/feat-api5/stats", headers=AUTH)
         assert r.status_code == 200
         assert len(r.json()["chat"]) == 1
+
+    def test_chat_stream_replays_and_ends(self, client):
+        """SSE endpoint (docs/CONVERSATIONS.md §5): a finished turn replays its
+        buffered events and terminates with done — a late subscriber never hangs."""
+        c, m = client
+        self._park_feature(m, "feat-api6")
+        m.chat_broker.start("feat-api6")
+        m.chat_broker.publish("feat-api6", "delta", "hi there")
+        m.chat_broker.publish("feat-api6", "status", "Read app/x.py")
+        m.chat_broker.finish("feat-api6")
+        r = c.get("/api/jobs/feat-api6/chat/stream", headers=AUTH)
+        assert r.status_code == 200
+        assert r.headers["content-type"].startswith("text/event-stream")
+        assert "event: delta" in r.text and '"t": "hi there"' in r.text
+        assert "event: status" in r.text
+        assert r.text.rstrip().endswith('data: {"t": ""}')  # done is last
+        assert c.get("/api/jobs/none/chat/stream", headers=AUTH).status_code == 404
+
+    def test_post_starts_stream_turn(self, client):
+        c, m = client
+        self._park_feature(m, "feat-api7")
+        r = c.post("/api/jobs/feat-api7/chat", headers=AUTH, json={"message": "why?"})
+        assert r.status_code == 202
+        # the broker turn exists the moment the POST returns (started before the task)
+        assert "feat-api7" in m.chat_broker._turns

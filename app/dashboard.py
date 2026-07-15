@@ -405,6 +405,7 @@ function chatTranscript(data) {
   for (const t of turns) {
     const human = t.role === 'human';
     let meta = '';
+    if (t.lane === 'fast') meta += '⚡ ';
     if (t.degraded) meta += '(from documents only) ';
     if (t.cost_usd != null) meta += '$' + Number(t.cost_usd).toFixed(2);
     h += '<div class="turn ' + (human ? 'human' : 'engine') + '"><div class="b">' + esc(t.text) + '</div>'
@@ -419,6 +420,9 @@ function paintChat(id) {
   const log = document.getElementById('chat-log-' + id);
   if (!c || !log) return;
   log.innerHTML = c.html;
+  // a live-streaming bubble survives transcript repaints: re-attach the node
+  const s = chatStreams[id];
+  if (s && s.live) log.appendChild(s.live);
   log.scrollTop = log.scrollHeight;
   const box = document.getElementById('chat-in-' + id);
   const btn = document.getElementById('chat-ask-' + id);
@@ -441,7 +445,7 @@ async function loadChat(id) {
     if (r.ok) {
       chatCache[id] = { key: el ? el.dataset.updated : '', html: chatTranscript(data),
                         pending: !!data.pending, limit: !!data.limit_reached };
-      if (data.pending) startChatPoll(id); else stopChatPoll(id);
+      if (data.pending) startChatPoll(id); else { stopChatPoll(id); stopChatStream(id); }
     } else {
       chatCache[id] = { key: '', html: '<div class="empty">Error: ' + esc(data.detail || r.status) + '</div>',
                         pending: false, limit: false };
@@ -480,6 +484,7 @@ async function askChat(id, btn) {
     if (r.status === 202) {
       if (box) box.value = '';
       localStorage.removeItem('gb-chat-' + id);
+      startChatStream(id); // live tokens via SSE; polling stays as the fallback
       loadChat(id); // shows the pending turn + starts the 5s poll
     } else {
       // 409 = answer already in flight / chat limit reached; 404/500 = error
@@ -501,6 +506,53 @@ function startChatPoll(id) {
 
 function stopChatPoll(id) {
   if (chatPollers[id]) { clearInterval(chatPollers[id]); delete chatPollers[id]; }
+}
+
+// ---------- live answer stream (api/jobs/{id}/chat/stream, SSE) ----------
+// Instant-messaging feel: the fast lane streams first tokens in ~1-2s; slow
+// (code-reading) runs stream progress lines. Losing the stream costs nothing —
+// the 5s poll above still delivers the persisted reply.
+
+const chatStreams = {};    // job id -> { es: EventSource, live: bubble element }
+
+function startChatStream(id) {
+  stopChatStream(id);
+  if (typeof EventSource === 'undefined') return;
+  const log = document.getElementById('chat-log-' + id);
+  if (!log) return;
+  const live = document.createElement('div');
+  live.className = 'turn engine';
+  live.innerHTML = '<div class="b"></div><div class="c"><span class="spin"></span>engine &middot; thinking&hellip;</div>';
+  log.appendChild(live);
+  log.scrollTop = log.scrollHeight;
+  const es = new EventSource('api/jobs/' + encodeURIComponent(id) + '/chat/stream');
+  chatStreams[id] = { es: es, live: live };
+  es.addEventListener('delta', (e) => {
+    let t = '';
+    try { t = JSON.parse(e.data).t || ''; } catch (e2) { return; }
+    const b = live.querySelector('.b');
+    if (b) { b.textContent += t; }
+    const c = live.querySelector('.c');
+    if (c) c.innerHTML = 'engine &middot; answering&hellip;';
+    log.scrollTop = log.scrollHeight;
+  });
+  es.addEventListener('status', (e) => {
+    let t = '';
+    try { t = JSON.parse(e.data).t || ''; } catch (e2) { return; }
+    const c = live.querySelector('.c');
+    if (c) { c.textContent = 'engine · ' + t; }
+    log.scrollTop = log.scrollHeight;
+  });
+  es.addEventListener('done', () => { stopChatStream(id); loadChat(id); });
+  es.onerror = () => { stopChatStream(id); };  // 5s polling remains the fallback
+}
+
+function stopChatStream(id) {
+  const s = chatStreams[id];
+  if (!s) return;
+  delete chatStreams[id];
+  try { s.es.close(); } catch (e) { /* already closed */ }
+  if (s.live && s.live.parentNode) s.live.parentNode.removeChild(s.live);
 }
 
 // ---------- Product brain (api/memory) ----------

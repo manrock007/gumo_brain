@@ -9,10 +9,11 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 
+from .chatstream import ChatBroker
 from .config import get_settings
 from .dashboard import DASHBOARD_HTML
 from .db import JobStore
@@ -307,12 +308,26 @@ class ChatBody(BaseModel):
 
 
 _chat_tasks: set = set()
+chat_broker = ChatBroker()
 
 
 def _chat_pending(store: JobStore, job_id: str, stage: int, timeout: float) -> bool:
     last = store.chat_last(job_id, stage)
     return bool(last and last["role"] == "human"
                 and time.time() - last["at"] < timeout + 60)
+
+
+async def _chat_answer(job: dict, message: str):
+    """Background turn: the engine streams progress into the broker; finish()
+    fires no matter how the turn ends so no SSE subscriber ever hangs."""
+    job_id = job["issue_id"]
+    try:
+        await app.state.worker.engine.chat(
+            job, message,
+            publish=lambda event, data: chat_broker.publish(job_id, event, data),
+        )
+    finally:
+        chat_broker.finish(job_id)
 
 
 @app.post("/api/jobs/{job_id}/chat", dependencies=[Depends(require_auth)])
@@ -342,7 +357,8 @@ async def gate_chat_post(job_id: str, body: ChatBody):
 
     attempt = max(1, int(job.get("stage_attempts") or 1))
     store.chat_add(job_id, stage, attempt, "human", message)
-    task = asyncio.create_task(worker.engine.chat(job, message))
+    chat_broker.start(job_id)  # new turn: reset the stream buffer
+    task = asyncio.create_task(_chat_answer(job, message))
     _chat_tasks.add(task)  # keep a strong ref — bare create_task results can be GC'd mid-flight
     task.add_done_callback(_chat_tasks.discard)
     return JSONResponse(status_code=202, content={"job_id": job_id, "status": "pending"})
@@ -364,6 +380,29 @@ async def gate_chat_get(job_id: str):
         "pending": pending,
         "limit_reached": store.chat_count(job_id, stage) >= settings.chat_max_turns_per_gate,
     }
+
+
+@app.get("/api/jobs/{job_id}/chat/stream", dependencies=[Depends(require_auth)])
+async def gate_chat_stream(job_id: str):
+    """SSE stream of the in-flight chat turn (docs/CONVERSATIONS.md §5):
+    'delta' (answer text chunks), 'status' (progress lines), 'done'. A late or
+    reconnecting subscriber replays the buffered turn first. Pure UX on top of
+    persist-then-poll — if this stream dies, the polling GET still delivers."""
+    store: JobStore = app.state.store
+    if store.get(job_id) is None:
+        raise HTTPException(status_code=404, detail=f"unknown job '{job_id}'")
+
+    async def _events():
+        max_s = settings.chat_timeout_seconds + settings.chat_fast_timeout_seconds + 120
+        async for event, data in chat_broker.subscribe(job_id, max_seconds=max_s):
+            if event == "ping":
+                yield ": ping\n\n"
+            else:
+                yield f"event: {event}\ndata: {json.dumps({'t': data})}\n\n"
+
+    return StreamingResponse(_events(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache",
+                                      "X-Accel-Buffering": "no"})
 
 
 @app.get("/api/memory", dependencies=[Depends(require_auth)])

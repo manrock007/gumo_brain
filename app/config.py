@@ -1,4 +1,5 @@
 import json
+import os
 from functools import lru_cache
 
 from pydantic_settings import BaseSettings
@@ -104,6 +105,27 @@ class Settings(BaseSettings):
     session_ttl_days: int = 14
     max_asks_per_stage: int = 3         # STAGE_ASK resumes per (job, stage, attempt)
     default_gate_mode: str = "full"     # full = every stage parks | light = P0/P1/P3/P9 + guards
+
+    # Two-lane gate chat (docs/CONVERSATIONS.md §5). The fast lane answers from
+    # the gate bundle via a direct streaming API call (first tokens ~1-2s) and
+    # escalates itself to the tool-run slow lane when the question needs the
+    # repository. OFF unless chat_fast_model is set AND a key is available; the
+    # key comes from CHAT_API_KEY (its own env var, falling back to
+    # ANTHROPIC_API_KEY) and is used ONLY for fast-lane HTTP calls — CLI runs
+    # keep their own auth untouched.
+    chat_fast_model: str = ""           # e.g. "claude-sonnet-5"; empty = disabled
+    chat_api_key: str = ""
+    chat_api_base: str = "https://api.anthropic.com"
+    chat_fast_timeout_seconds: int = 90
+    chat_fast_max_tokens: int = 1500
+
+    @property
+    def effective_chat_api_key(self) -> str:
+        return self.chat_api_key or os.environ.get("ANTHROPIC_API_KEY", "")
+
+    @property
+    def chat_fast_enabled(self) -> bool:
+        return bool(self.chat_fast_model and self.effective_chat_api_key)
 
     @property
     def claude_config_dir(self) -> str:

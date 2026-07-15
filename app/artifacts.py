@@ -95,6 +95,8 @@ class ArtifactSync:
         if old is not None and normalize(old) == new:
             return False  # idempotent under replay: identical content is a no-op
         path.write_text(new)
+        # keep the fast-lane bundle cache current with every artifact write
+        self.store.artifact_content_set(job_id, artifact, new)
         await git(workspace, "add", str(path))
         code, out = await git(workspace, "commit", "-m", message)
         if code != 0 and "nothing to commit" not in out:
@@ -164,11 +166,16 @@ class ArtifactSync:
         warning)."""
         job_id = job["issue_id"]
         conflicted: list[str] = []
+        contents: dict[str, str] = {}
+        # refresh the fast-lane bundle cache for EVERY branch artifact first —
+        # code stages write artifacts directly in the workspace (no commit_file),
+        # and this must happen even when ClickUp mirroring is disabled
+        for artifact in list_artifacts(workspace, job_id):
+            contents[artifact] = normalize(artifact_path(workspace, job_id, artifact).read_text())
+            self.store.artifact_content_set(job_id, artifact, contents[artifact])
         if not self.clickup.enabled or not job.get("clickup_task_id"):
             return conflicted
-        for artifact in list_artifacts(workspace, job_id):
-            path = artifact_path(workspace, job_id, artifact)
-            content = normalize(path.read_text())
+        for artifact, content in contents.items():
             state = self.store.artifact_get(job_id, artifact)
             if state is None or not state["subtask_id"]:
                 await self._create_mirror(job, artifact, content)

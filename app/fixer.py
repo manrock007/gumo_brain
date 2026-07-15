@@ -1,6 +1,7 @@
 """Workspace management and the headless Claude Code invocation."""
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -184,33 +185,21 @@ async def prepare_feature_workspace(settings: Settings, target: RepoTarget,
     return workspace
 
 
-async def run_claude_raw(settings: Settings, workspace: str, prompt: str,
-                         allowed_tools: list[str], timeout: int,
-                         resume_session: str | None = None,
-                         disallowed_tools: list[str] | None = None,
-                         session_id: str | None = None,
-                         fork_session: bool = False,
-                         config_dir: str | None = None) -> RawRunResult:
-    """Low-level headless run. Returns the CLI's result text verbatim plus the
-    telemetry envelope (session/cost/turns/duration) — callers own the parsing.
-
-    - resume_session continues an existing session (same working directory) with
-      full context; fork_session resumes into a NEW session id.
-    - session_id pre-assigns the id on fresh runs — the ENGINE owns identity, so
-      timeout/error runs still have a resumable id on record (the envelope is
-      only a cross-check).
-    - disallowed_tools is a hard DENY list — --allowedTools alone is additive to
-      settings-file grants, so read-only chat runs must deny the write tools.
-    - config_dir overrides the CLI config dir for this run (artifact-primed
-      chats use their own so concurrent invocations never race the session
-      store's state files)."""
+def _claude_cmd_env(settings: Settings, prompt: str, allowed_tools: list[str],
+                    resume_session: str | None, disallowed_tools: list[str] | None,
+                    session_id: str | None, fork_session: bool,
+                    config_dir: str | None, output_format: str = "json"):
+    """Shared command/env assembly for the raw and streaming runners — one
+    place owns the flag order and the env hygiene."""
     # prompt is positional, directly after -p; option flags follow it
     cmd = [
         settings.claude_binary,
         "-p", prompt,
-        "--output-format", "json",
+        "--output-format", output_format,
         "--allowedTools", ",".join(allowed_tools),
     ]
+    if output_format == "stream-json":
+        cmd += ["--verbose"]  # the CLI requires it with -p + stream-json
     if resume_session:
         cmd += ["-r", resume_session]
         if fork_session:
@@ -232,6 +221,31 @@ async def run_claude_raw(settings: Settings, workspace: str, prompt: str,
     elif settings.session_persistence:
         # sessions on the data volume so resume survives restarts
         env["CLAUDE_CONFIG_DIR"] = settings.claude_config_dir
+    return cmd, env
+
+
+async def run_claude_raw(settings: Settings, workspace: str, prompt: str,
+                         allowed_tools: list[str], timeout: int,
+                         resume_session: str | None = None,
+                         disallowed_tools: list[str] | None = None,
+                         session_id: str | None = None,
+                         fork_session: bool = False,
+                         config_dir: str | None = None) -> RawRunResult:
+    """Low-level headless run. Returns the CLI's result text verbatim plus the
+    telemetry envelope (session/cost/turns/duration) — callers own the parsing.
+
+    - resume_session continues an existing session (same working directory) with
+      full context; fork_session resumes into a NEW session id.
+    - session_id pre-assigns the id on fresh runs — the ENGINE owns identity, so
+      timeout/error runs still have a resumable id on record (the envelope is
+      only a cross-check).
+    - disallowed_tools is a hard DENY list — --allowedTools alone is additive to
+      settings-file grants, so read-only chat runs must deny the write tools.
+    - config_dir overrides the CLI config dir for this run (artifact-primed
+      chats use their own so concurrent invocations never race the session
+      store's state files)."""
+    cmd, env = _claude_cmd_env(settings, prompt, allowed_tools, resume_session,
+                               disallowed_tools, session_id, fork_session, config_dir)
 
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -244,12 +258,15 @@ async def run_claude_raw(settings: Settings, workspace: str, prompt: str,
         out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
         proc.kill()
+        await proc.wait()  # reap — kill alone leaves a zombie
         log.error("claude run timed out after %ss", timeout)
         return RawRunResult("timeout", f"timed out after {timeout}s",
                             {"session_id": session_id})
     except asyncio.CancelledError:
         # graceful shutdown must never orphan a live claude that later pushes
         proc.kill()
+        with contextlib.suppress(asyncio.CancelledError):
+            await proc.wait()
         raise
 
     stdout = out.decode(errors="replace")
@@ -284,6 +301,129 @@ async def run_claude_raw(settings: Settings, workspace: str, prompt: str,
     if proc.returncode != 0:
         log.error("claude exited %s: %s", proc.returncode, stderr[-2000:])
         return RawRunResult("error", f"claude exited {proc.returncode}: {result_text[-2000:]}", meta)
+    return RawRunResult("ok", result_text, meta)
+
+
+def _tool_status(name: str, tool_input: dict) -> str:
+    """One human-readable line per tool call for the chat stream."""
+    for key in ("file_path", "path", "pattern", "command", "query", "url"):
+        val = tool_input.get(key)
+        if val:
+            return f"{name} {str(val)[:120]}"
+    return name
+
+
+async def run_claude_stream(settings: Settings, workspace: str, prompt: str,
+                            allowed_tools: list[str], timeout: int,
+                            resume_session: str | None = None,
+                            disallowed_tools: list[str] | None = None,
+                            session_id: str | None = None,
+                            fork_session: bool = False,
+                            config_dir: str | None = None,
+                            on_event=None) -> RawRunResult:
+    """run_claude_raw with live progress (docs/CONVERSATIONS.md §5): the CLI
+    runs in stream-json mode and each event is surfaced through on_event as it
+    happens — ("status", "Read app/x.py") per tool call, ("delta", text) per
+    assistant text block. The RETURN contract is identical to run_claude_raw
+    (same statuses, same meta, same session-id fallback rules); on_event is
+    best-effort UX and never affects the result."""
+    on_event = on_event or (lambda event, data: None)
+    cmd, env = _claude_cmd_env(settings, prompt, allowed_tools, resume_session,
+                               disallowed_tools, session_id, fork_session,
+                               config_dir, output_format="stream-json")
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        cwd=workspace,
+        env=env,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        limit=2 ** 20,  # stream-json lines can carry whole documents; 64KB default is too small
+    )
+
+    result_env: dict | None = None
+    saw_event = False
+
+    async def _pump():
+        nonlocal result_env, saw_event
+        async for raw_line in proc.stdout:
+            line = raw_line.decode(errors="replace").strip()
+            if not line:
+                continue
+            saw_event = True
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            etype = ev.get("type")
+            if etype == "assistant":
+                for block in ((ev.get("message") or {}).get("content") or []):
+                    if block.get("type") == "tool_use":
+                        on_event("status", _tool_status(block.get("name") or "tool",
+                                                        block.get("input") or {}))
+                    elif block.get("type") == "text" and (block.get("text") or "").strip():
+                        on_event("delta", block["text"])
+            elif etype == "result":
+                result_env = ev
+
+    stderr_task = asyncio.create_task(proc.stderr.read())
+    try:
+        await asyncio.wait_for(_pump(), timeout=timeout)
+        try:
+            # stdout is closed; a healthy CLI exits promptly — never wait forever
+            await asyncio.wait_for(proc.wait(), timeout=30)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+    except asyncio.TimeoutError:
+        proc.kill()
+        stderr_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await stderr_task  # reap the reader — a bare cancel leaves it pending
+        await proc.wait()      # reap the child — kill alone leaves a zombie
+        log.error("claude stream run timed out after %ss", timeout)
+        return RawRunResult("timeout", f"timed out after {timeout}s",
+                            {"session_id": session_id})
+    except asyncio.CancelledError:
+        # graceful shutdown must never orphan a live claude that later pushes
+        proc.kill()
+        stderr_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await stderr_task
+        with contextlib.suppress(asyncio.CancelledError):
+            await proc.wait()
+        raise
+    try:
+        stderr = (await asyncio.wait_for(stderr_task, timeout=10)).decode(errors="replace")
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        stderr = ""
+
+    # same contract as run_claude_raw: a resume of a missing/pruned session
+    # exits 0 having produced NOTHING — never let that flow into parsing
+    if resume_session and proc.returncode == 0 and not saw_event:
+        log.warning("resume of session %s found nothing: %s", resume_session, stderr[-300:])
+        return RawRunResult("session_lost", stderr[-500:], {"session_id": resume_session})
+
+    fallback_sid = session_id or (None if fork_session else resume_session)
+    meta: dict = {"session_id": fallback_sid}
+    result_text = ""
+    if result_env is not None:
+        result_text = result_env.get("result") or ""
+        meta = {
+            "cost_usd": result_env.get("total_cost_usd"),
+            "num_turns": result_env.get("num_turns"),
+            "duration_ms": result_env.get("duration_ms"),
+            "session_id": result_env.get("session_id") or fallback_sid,
+        }
+
+    if proc.returncode != 0:
+        log.error("claude (stream) exited %s: %s", proc.returncode, stderr[-2000:])
+        return RawRunResult("error",
+                            f"claude exited {proc.returncode}: {(result_text or stderr)[-2000:]}",
+                            meta)
+    if result_env is None:
+        # exit 0 with no result envelope — treat like an unparsable raw run
+        return RawRunResult("error", "stream ended without a result envelope", meta)
     return RawRunResult("ok", result_text, meta)
 
 
