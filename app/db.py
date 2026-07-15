@@ -294,6 +294,16 @@ class JobStore:
         with self._conn() as c:
             return {r["issue_id"] for r in c.execute("SELECT issue_id FROM jobs").fetchall()}
 
+    def job_for_clickup_task(self, task_id: str) -> dict | None:
+        """The job a ClickUp ticket belongs to — the intake scan's dedupe:
+        engine-created tickets and already-adopted ones both have a row."""
+        if not task_id:
+            return None
+        with self._conn() as c:
+            row = c.execute("SELECT * FROM jobs WHERE clickup_task_id = ? LIMIT 1",
+                            (str(task_id),)).fetchone()
+            return dict(row) if row else None
+
     def requeueable(self) -> list[dict]:
         """Jobs that must be re-enqueued on startup — SQLite is the queue of record."""
         return self.by_status(["received", "queued"])

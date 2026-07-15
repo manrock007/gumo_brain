@@ -270,6 +270,27 @@ guidance > older guidance; superseded guidance is marked.
   have no resumable session machinery); the gate answer box is their
   correction channel.
 
+### ClickUp intake (tickets as the front door)
+
+The autofix list doubles as an intake channel — the ClickUp mirror of the
+dashboard forms, for anyone who lives in ClickUp (and for driving the engine
+without dashboard credentials). The poller (`_poll_intake`, every
+`clickup_poll_seconds`, gated by `clickup_intake_enabled`) adopts any
+human-created top-level task whose name starts with a directive:
+
+- `[fix] <title>` / `[bug]` / `[task]` — the 2-phase request flow; the task
+  description needs a `project: <slug>` line, the rest becomes the request.
+- `[feature] <title>` — the P0–P9 pipeline, same description format.
+- `[sentry <issue id>] <title>` — a forced sentry run; the run adopts this
+  ticket instead of creating its own.
+
+Engine-created tickets never match (their names start `[<project>] …`).
+Idempotent by construction: every adopted ticket's job row points back at it
+(`job_for_clickup_task`), and a rejected one (unmapped project, missing issue
+id, duplicate) is pinned by a `cu-<task id>` skipped row carrying the reason —
+one explanatory comment, never a re-scan loop. Everything after adoption is
+the ordinary flow: status sync, gate comments, `/proceed`-family verbs.
+
 ### Live steering (mid-run course-correction)
 
 A human can interrupt a *running* stage from the session view. With session

@@ -78,6 +78,38 @@ class ClickUp:
             log.exception("ClickUp get_task failed for %s", task_id)
             return None
 
+    async def list_tasks(self, list_id: str | None = None) -> list[dict] | None:
+        """Open (non-closed) top-level tasks in a list — the intake scan reads
+        this. Paginates a few pages so ordering quirks can't hide a fresh
+        ticket behind engine-created ones. None on failure; callers treat None
+        as 'unknown', never as 'empty'."""
+        if not self.enabled:
+            return None
+        out: list[dict] = []
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                for page in range(3):  # 300 open tasks — far beyond the working set
+                    r = await client.get(
+                        f"{API}/list/{list_id or self._list_id}/task",
+                        headers=self._headers,
+                        params={"page": page, "order_by": "created"},
+                    )
+                    r.raise_for_status()
+                    tasks = r.json().get("tasks", [])
+                    for d in tasks:
+                        out.append({
+                            "id": str(d["id"]),
+                            "name": d.get("name", ""),
+                            "url": d.get("url", ""),
+                            "list_id": str((d.get("list") or {}).get("id") or ""),
+                        })
+                    if len(tasks) < 100:  # short page = last page
+                        return out
+            return out
+        except Exception:
+            log.exception("ClickUp list_tasks failed")
+            return None
+
     async def create_task(self, name: str, description: str,
                           list_id: str | None = None,
                           parent: str | None = None) -> tuple[str, str] | None:

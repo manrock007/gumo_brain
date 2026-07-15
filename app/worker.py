@@ -53,6 +53,12 @@ PRIO_SWEEP = 2
 QUESTION_HEADING_RE = re.compile(r"^#{1,4}\s*(?:open\s+)?questions?\b.*$", re.IGNORECASE | re.MULTILINE)
 REDO_TARGET_RE = re.compile(r"^\s*[Pp](\d)\b\s*")
 
+# ClickUp intake: '[fix] title', '[feature] title', '[sentry 123456] title'
+INTAKE_RE = re.compile(r"^\s*\[\s*(fix|task|bug|feature|sentry)(?:\s+([A-Za-z0-9_-]+))?\s*\]\s*(.+)$",
+                       re.IGNORECASE)
+PROJECT_LINE_RE = re.compile(r"^\s*\**project\**\s*[:=]\s*\**\s*([A-Za-z0-9_-]+)\**\s*$",
+                             re.IGNORECASE | re.MULTILINE)
+
 
 class GateConflict(Exception):
     """The gate was already answered through the other channel."""
@@ -684,6 +690,10 @@ class Worker:
                 await self._poll_awaiting()
             except Exception:
                 log.exception("ClickUp poll iteration failed")
+            try:
+                await self._poll_intake()
+            except Exception:
+                log.exception("ClickUp intake scan failed")
 
     async def _poll_awaiting(self):
         # error/timeout features are included so a `/redo` re-kick works by comment too
@@ -767,6 +777,96 @@ class Worker:
                 self.store.set_fields(job["issue_id"], comment_marker=c["id"])
             return True
         return False
+
+    # ---------- ClickUp as an intake channel ----------
+
+    async def _poll_intake(self):
+        """Adopt human-created tickets in the autofix list: '[fix] …' /
+        '[bug] …' / '[task] …' queue the 2-phase request flow, '[feature] …'
+        the P0-P9 pipeline, '[sentry <issue id>] …' a forced sentry run — the
+        ClickUp mirror of the dashboard's intake forms. Engine-created tickets
+        never match (their names start '[<project>] …') and every adopted or
+        rejected ticket gets a job row, so the scan is idempotent."""
+        if not self.settings.clickup_intake_enabled:
+            return
+        tasks = await self.clickup.list_tasks()
+        for t in tasks or []:
+            m = INTAKE_RE.match(t.get("name") or "")
+            if not m:
+                continue
+            if self.store.job_for_clickup_task(t["id"]):
+                continue  # already adopted (or engine-created)
+            kind = m.group(1).lower()
+            arg = (m.group(2) or "").strip()
+            title = m.group(3).strip()
+            full = await self.clickup.get_task(t["id"])  # list payloads omit bodies
+            desc = (full or {}).get("description") or ""
+            try:
+                await self._intake_from_clickup(t, kind, arg, title, desc)
+            except Exception:
+                log.exception("clickup intake failed for ticket %s", t["id"])
+
+    async def _intake_from_clickup(self, t: dict, kind: str, arg: str,
+                                   title: str, desc: str):
+        task_id, task_url = t["id"], t.get("url") or ""
+
+        def reject(why: str) -> str:
+            # a skipped row pins the ticket so the scan never re-processes it
+            # (and the inbox shows WHY the adoption failed)
+            job_id = f"cu-{task_id}"
+            self.store.insert(job_id, source="clickup", forced=True,
+                              title=title, project="", kind="task")
+            self.store.set_fields(job_id, clickup_task_id=task_id,
+                                  clickup_task_url=task_url)
+            self.store.set_status(job_id, "skipped", detail=why)
+            return why
+
+        if kind == "sentry":
+            if not arg.isdigit():
+                why = reject("a sentry adoption needs the numeric issue id: "
+                             "'[sentry 123456] title'")
+                await self.clickup.comment(task_id, f"{GATE_PREFIX} could not adopt: {why}")
+                return
+            decision = self.intake(arg, source="clickup", forced=True, title=title)
+            if "queued" in decision:
+                # attach BEFORE any await so the run adopts this ticket instead
+                # of creating its own
+                self.store.set_fields(arg, clickup_task_id=task_id,
+                                      clickup_task_url=task_url)
+            else:
+                reject(decision)  # pin the ticket, or the scan re-comments forever
+            await self.clickup.comment(task_id, f"{GATE_PREFIX} 📥 {decision}")
+            log.info("clickup intake: sentry %s from ticket %s (%s)", arg, task_id, decision)
+            return
+
+        pm = PROJECT_LINE_RE.search(desc)
+        project = (pm.group(1) if pm else "").strip()
+        if self.settings.repo_for_project(project) is None:
+            why = reject(f"no repo mapped for project '{project or '(missing)'}' — put a "
+                         "'project: <slug>' line in the task description")
+            await self.clickup.comment(task_id, f"{GATE_PREFIX} could not adopt: {why}")
+            return
+        request = PROJECT_LINE_RE.sub("", desc).strip() or title
+
+        if kind == "feature":
+            job_id = f"feat-{task_id}"
+            decision = self.intake_feature(
+                job_id, title=title, project=project, request=request,
+                clickup_task_id=task_id, clickup_task_url=task_url,
+                cu_list_id=t.get("list_id") or self.settings.clickup_list_id)
+            adopted_as = ("FEATURE PIPELINE (P0 Intake → P9 Ship) — each stage posts its "
+                          "artifact as a subtask and parks here for your `/proceed`, "
+                          "`/redo` or `/skip`")
+        else:  # fix / bug / task — the 2-phase request flow
+            job_id = f"task-{task_id}"
+            decision = self.intake_task(
+                job_id, title=title, project=project, request=request,
+                clickup_task_id=task_id, clickup_task_url=task_url)
+            adopted_as = ("change request — I analyse the code first and post my plan + "
+                          "questions here; reply `/proceed <guidance>` or `/skip`")
+        await self.clickup.comment(
+            task_id, f"{GATE_PREFIX} 📥 adopted as a {adopted_as}. ({decision})")
+        log.info("clickup intake: %s %s from ticket %s (%s)", kind, job_id, task_id, decision)
 
     async def sweep_forever(self):
         if not self.settings.sweep_enabled:

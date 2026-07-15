@@ -65,6 +65,9 @@ class Settings(BaseSettings):
     clickup_token: str = ""
     clickup_list_id: str = "901615853762"  # "Sentry Autofix" list in Gumo Space
     clickup_poll_seconds: int = 120  # how often to check awaiting-input tickets
+    # ClickUp as an INTAKE channel: tasks named '[fix] …', '[feature] …' or
+    # '[sentry <id>] …' in the autofix list are adopted and queued
+    clickup_intake_enabled: bool = True
 
     # Dashboard basic auth (user "gumo"); dashboard + trigger disabled if empty
     dashboard_password: str = ""
