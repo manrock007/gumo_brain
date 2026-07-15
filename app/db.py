@@ -497,12 +497,21 @@ class JobStore:
             )
             return cur.lastrowid
 
-    def chat_last(self, job_id: str, stage: int) -> dict | None:
+    def chat_last(self, job_id: str, stage: int, attempt: int | None = None) -> dict | None:
+        """Latest turn for a stage — scoped to one ATTEMPT when given, so a
+        pending question from a redone attempt never blocks the fresh gate."""
         with self._conn() as c:
-            row = c.execute(
-                "SELECT * FROM gate_chat WHERE job_id = ? AND stage = ? ORDER BY id DESC LIMIT 1",
-                (job_id, stage),
-            ).fetchone()
+            if attempt is None:
+                row = c.execute(
+                    "SELECT * FROM gate_chat WHERE job_id = ? AND stage = ? ORDER BY id DESC LIMIT 1",
+                    (job_id, stage),
+                ).fetchone()
+            else:
+                row = c.execute(
+                    "SELECT * FROM gate_chat WHERE job_id = ? AND stage = ? AND attempt = ?"
+                    " ORDER BY id DESC LIMIT 1",
+                    (job_id, stage, attempt),
+                ).fetchone()
             return dict(row) if row else None
 
     def chat_for(self, job_id: str, stage: int | None = None) -> list[dict]:
@@ -518,10 +527,20 @@ class JobStore:
                 ).fetchall()
             return [dict(r) for r in rows]
 
-    def chat_count(self, job_id: str, stage: int) -> int:
+    def chat_count(self, job_id: str, stage: int, attempt: int | None = None) -> int:
+        """Human turns for a stage — per ATTEMPT when given: the turn budget is
+        per gate (chat_max_turns_per_GATE), and a redo parks a NEW gate, so spent
+        turns from a rejected attempt must not starve the fresh one."""
         with self._conn() as c:
-            row = c.execute(
-                "SELECT COUNT(*) AS n FROM gate_chat WHERE job_id = ? AND stage = ? AND role = 'human'",
-                (job_id, stage),
-            ).fetchone()
+            if attempt is None:
+                row = c.execute(
+                    "SELECT COUNT(*) AS n FROM gate_chat WHERE job_id = ? AND stage = ? AND role = 'human'",
+                    (job_id, stage),
+                ).fetchone()
+            else:
+                row = c.execute(
+                    "SELECT COUNT(*) AS n FROM gate_chat"
+                    " WHERE job_id = ? AND stage = ? AND attempt = ? AND role = 'human'",
+                    (job_id, stage, attempt),
+                ).fetchone()
             return row["n"]

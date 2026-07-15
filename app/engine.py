@@ -868,9 +868,12 @@ class Engine:
         publish("status", "waiting for the repository workspace")
 
         async with self.locks.for_repo(target.repo):
-            # re-validate under the lock: the gate may have been answered while queued
+            # re-validate under the lock: the gate may have been answered while queued.
+            # Both parked AND running are answerable (mid-run asks queue on the repo
+            # lock and land here once it frees) — matching the endpoint's guard; only
+            # a stage advance or a terminal status means the question's moment passed.
             fresh = self.store.get(job_id)
-            if (not fresh or fresh["status"] != "awaiting_input"
+            if (not fresh or fresh["status"] not in ("awaiting_input", "running")
                     or int(fresh.get("stage") or 0) != stage):
                 return ("The gate was answered before I got to this — the pipeline has "
                         "moved on. This question stays on the record."), {}, True

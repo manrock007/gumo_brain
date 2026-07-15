@@ -53,6 +53,28 @@ class TestChatEngineFallbacks:
         assert last["degraded"] == 1
         assert "moved on" in last["text"]
 
+    def test_running_job_passes_the_slow_lane_guard(self, worker, monkeypatch):
+        """Seer PR#8 round 5: the endpoint admits mid-run chat, so the slow lane's
+        under-lock re-validation must too — a running job at the SAME stage gets
+        past the status check (no 'moved on' tombstone)."""
+        import app.engine as engine_mod
+
+        worker.intake_feature("feat-c5", title="F", project="web", request="r")
+        worker.store.set_fields("feat-c5", stage=2, stage_attempts=1)
+        worker.store.set_status("feat-c5", "running")
+        job = dict(worker.store.get("feat-c5"))
+        worker.store.chat_add("feat-c5", 2, 1, "human", "how far along is the build?")
+
+        async def no_ws(*a, **k):  # past the guard, stop at the workspace step
+            raise RuntimeError("no workspace in tests")
+
+        monkeypatch.setattr(engine_mod, "prepare_feature_workspace", no_ws)
+        asyncio.run(worker.engine.chat(job, "how far along is the build?"))
+        last = worker.store.chat_last("feat-c5", 2)
+        assert last["role"] == "engine"
+        assert "moved on" not in last["text"]
+        assert "cannot check out" in last["text"]  # reached the step AFTER the guard
+
 
 class TestChatCancellation:
     def test_cancelled_chat_leaves_tombstone_engine_turn(self, worker, monkeypatch):
@@ -375,7 +397,12 @@ class TestChatEndpoints:
         store = self._park_feature(m)
         r = c.post("/api/jobs/feat-api1/chat", headers=AUTH, json={"message": "  "})
         assert r.status_code == 400
+        # mid-run chat is allowed (the inbox conversation) — 202, not 409
         store.set_status("feat-api1", "running")
+        r = c.post("/api/jobs/feat-api1/chat", headers=AUTH, json={"message": "hi"})
+        assert r.status_code == 202
+        # but a finished job has no one to talk to
+        store.set_status("feat-api1", "pr_opened")
         r = c.post("/api/jobs/feat-api1/chat", headers=AUTH, json={"message": "hi"})
         assert r.status_code == 409
 
@@ -412,6 +439,34 @@ class TestChatEndpoints:
         assert "limit" in r.json()["detail"]
         g = c.get("/api/jobs/feat-api3/chat", headers=AUTH).json()
         assert g["limit_reached"] is True
+
+    def test_pending_scoped_per_attempt(self, client):
+        """Seer PR#8 round 4: an unanswered question from before a redo must not
+        wedge the fresh gate's chat for the stale-pending window."""
+        c, m = client
+        store = self._park_feature(m, "feat-api7")
+        store.chat_add("feat-api7", 3, 1, "human", "asked just before the redo")
+        # redo lands: same stage, new attempt
+        store.set_fields("feat-api7", stage_attempts=2)
+        g = c.get("/api/jobs/feat-api7/chat", headers=AUTH).json()
+        assert g["pending"] is False
+        r = c.post("/api/jobs/feat-api7/chat", headers=AUTH, json={"message": "fresh gate q"})
+        assert r.status_code == 202
+
+    def test_turn_limit_resets_per_attempt(self, client):
+        """Seer PR#8 round 3: the budget is per GATE (attempt) — a redo parks a
+        new gate, so turns spent on the rejected attempt must not starve it."""
+        c, m = client
+        store = self._park_feature(m, "feat-api6")
+        for i in range(m.settings.chat_max_turns_per_gate):
+            store.chat_add("feat-api6", 3, 1, "human", f"q{i}")
+            store.chat_add("feat-api6", 3, 1, "engine", f"a{i}")
+        # redo: the stage re-runs and parks again as attempt 2
+        store.set_fields("feat-api6", stage_attempts=2)
+        g = c.get("/api/jobs/feat-api6/chat", headers=AUTH).json()
+        assert g["limit_reached"] is False
+        r = c.post("/api/jobs/feat-api6/chat", headers=AUTH, json={"message": "fresh gate q"})
+        assert r.status_code == 202
 
     def test_stale_pending_clears_after_timeout(self, client):
         c, m = client

@@ -247,13 +247,20 @@ guidance > older guidance; superseded guidance is marked.
   (`status` tool calls, `delta` text, `done`); its own broker so a gate chat
   never clobbers it.
 - `POST /api/jobs/{id}/session/steer` — `{note}`. Mid-run course-correction.
-- Dashboard: stage strip (P0–P9), gate packet per stage class (doc: artifact
-  + questions; code: diffstat + compare link; P7: results table), Proceed /
-  Redo / Skip with a guidance box, **typed input survives re-renders**
-  (per-card keyed updates + draft preservation), Product brain panel (memory
-  freshness + bootstrap), error/timeout re-kick. Clicking a feature card opens
-  the full-screen **live session view** (`#/job/<id>`): live activity stream,
-  stage timeline, current artifact, and a steer console.
+- Dashboard: an **inbox + split view**. The left pane lists every job (newest
+  activity first; All / Active / Awaiting-you filters; mini stage strip on
+  features). Selecting a row (`#/job/<id>`) opens the right pane — that item's
+  whole world: the per-stage work thread (each stage collapsible with
+  attempts/duration/cost + its artifact; the current stage streams live tool
+  calls/text over SSE), the full conversation with the engine, the gate packet
+  when parked (question / evidence / analysis + Proceed / Redo / Skip with a
+  guidance box), and a composer with an explicit **Ask / Steer** toggle. Ask
+  works mid-run AND at gates (fast lane answers from persisted artifacts; a
+  code-run escalation queues on the repo lock, persist-then-poll). **Typed
+  input survives re-renders** (stable composer DOM + localStorage drafts).
+  With nothing selected the right pane is the intake view (Sentry fix /
+  request / feature pipeline + the Product brain table). Error/timeout re-kick
+  lives in the gate packet.
 
 ### Live steering (mid-run course-correction)
 
