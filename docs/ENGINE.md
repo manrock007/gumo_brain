@@ -241,11 +241,33 @@ guidance > older guidance; superseded guidance is marked.
 - `GET /api/jobs` — feature rows carry `stage`, `stage_name`, `mirror_ok`.
 - `GET /api/features/{id}/stats` — stage_runs rows.
 - `GET /api/memory/{project}`, `POST /api/memory/{project}/bootstrap`.
+- `GET /api/jobs/{id}/session` — live-session snapshot: meta, stage timeline,
+  gate decisions, current artifacts, live/steerable flags.
+- `GET /api/jobs/{id}/session/stream` — SSE of the running stage's activity
+  (`status` tool calls, `delta` text, `done`); its own broker so a gate chat
+  never clobbers it.
+- `POST /api/jobs/{id}/session/steer` — `{note}`. Mid-run course-correction.
 - Dashboard: stage strip (P0–P9), gate packet per stage class (doc: artifact
   + questions; code: diffstat + compare link; P7: results table), Proceed /
   Redo / Skip with a guidance box, **typed input survives re-renders**
-  (per-card keyed updates + draft preservation), per-job detail view, Product
-  brain panel (memory freshness + bootstrap), error/timeout re-kick.
+  (per-card keyed updates + draft preservation), Product brain panel (memory
+  freshness + bootstrap), error/timeout re-kick. Clicking a feature card opens
+  the full-screen **live session view** (`#/job/<id>`): live activity stream,
+  stage timeline, current artifact, and a steer console.
+
+### Live steering (mid-run course-correction)
+
+A human can interrupt a *running* stage from the session view. With session
+persistence on, the engine trips a per-job interrupt event; `run_claude_stream`
+stops the CLI and returns `interrupted` with the (engine-owned) session id. The
+engine checkpoints the work-in-progress to origin and arms a resume of that same
+session — reusing the STAGE_ASK machinery, keyed `gate_kind='steer'`, with the
+note as `resume_answer` — then re-enqueues. The resumed run continues where it
+stopped, keeping the work that still applies. A steer does **not** consume the
+STAGE_ASK ask budget. With persistence off (no resume), or when the job is not
+running, the note is recorded as guidance for the next checkpoint (the safe
+fallback). Fail-closed: if the checkpoint push or session id is missing, the
+steer degrades to a fresh re-run carrying the note as guidance — never lost.
 
 ## 7. Guardrails
 

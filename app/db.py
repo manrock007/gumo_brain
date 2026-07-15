@@ -133,9 +133,10 @@ MIGRATIONS = {  # table -> columns added after that table first shipped (in-plac
         "resume_attempt": "INTEGER",
         "resume_head": "TEXT DEFAULT ''",
         "resume_answer": "TEXT DEFAULT ''",
-        "gate_kind": "TEXT DEFAULT ''",
+        "gate_kind": "TEXT DEFAULT ''",  # '' = normal | 'ask' = STAGE_ASK | 'steer' = mid-run interrupt
         "ask_count": "INTEGER NOT NULL DEFAULT 0",
         "gate_mode": "TEXT NOT NULL DEFAULT 'full'",
+        "steer_note": "TEXT DEFAULT ''",  # human's live steer, moved into resume_answer on interrupt
     },
     "stage_runs": {
         "session_id": "TEXT DEFAULT ''",

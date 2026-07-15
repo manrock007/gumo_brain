@@ -405,6 +405,97 @@ async def gate_chat_stream(job_id: str):
                                       "X-Accel-Buffering": "no"})
 
 
+# ---------- live session page (drop in, observe, steer mid-run) ----------
+
+class SteerBody(BaseModel):
+    note: str
+
+
+SESSION_ARTIFACT_MAX = 24000  # per-artifact body cap in the session snapshot payload
+
+
+@app.get("/api/jobs/{job_id}/session", dependencies=[Depends(require_auth)])
+async def session_snapshot(job_id: str):
+    """Everything the session page shows for one feature job: meta, the P0-P9
+    stage timeline, gate decisions, the current branch artifacts, and whether a
+    run is live / steerable right now. Read-only; the live activity comes over
+    the SSE stream, this is the durable frame around it."""
+    store: JobStore = app.state.store
+    worker: Worker = app.state.worker
+    job = store.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"unknown job '{job_id}'")
+    if (job.get("kind") or "") != "feature":
+        raise HTTPException(status_code=409, detail="the session view is for feature pipelines only")
+    stage = int(job.get("stage") or 0)
+    names = [a["artifact"] for a in store.artifacts_for(job_id)]
+    bodies = store.artifact_contents(job_id, names) if names else {}
+    artifacts = [{"name": n, "content": (bodies.get(n) or "")[:SESSION_ARTIFACT_MAX],
+                  "truncated": len(bodies.get(n) or "") > SESSION_ARTIFACT_MAX}
+                 for n in names]
+    live = job["status"] == "running" or worker.engine.stage_broker.active(job_id)
+    return {
+        "job": {
+            "issue_id": job_id, "title": job.get("title") or job_id,
+            "status": job["status"], "project": job.get("project") or "",
+            "stage": stage, "stage_name": stage_name(stage),
+            "gate_mode": job.get("gate_mode") or "full", "owner": job.get("owner") or "",
+            "pr_url": job.get("pr_url") or "", "clickup_task_url": job.get("clickup_task_url") or "",
+            "question": job.get("question") or "", "gate_kind": job.get("gate_kind") or "",
+            "updated_at": job.get("updated_at"),
+        },
+        "runs": store.stage_runs_for(job_id),
+        "guidance": store.guidance_for(job_id),
+        "artifacts": artifacts,
+        "live": live,
+        # steering interrupts in place only with session persistence; otherwise the
+        # note is queued to the next checkpoint (still useful, just not immediate)
+        "steer_available": job["status"] == "running",
+        "steer_immediate": bool(settings.session_persistence),
+    }
+
+
+@app.get("/api/jobs/{job_id}/session/stream", dependencies=[Depends(require_auth)])
+async def session_stream(job_id: str):
+    """SSE of the running stage's live activity — 'status' (tool calls / progress),
+    'delta' (assistant text), 'done'. Reconnecting subscribers replay the buffered
+    run. Keyed on its own broker so a gate chat never clobbers the stage stream."""
+    store: JobStore = app.state.store
+    if store.get(job_id) is None:
+        raise HTTPException(status_code=404, detail=f"unknown job '{job_id}'")
+    broker = app.state.worker.engine.stage_broker
+
+    async def _events():
+        max_s = settings.claude_timeout_seconds + 120
+        async for event, data in broker.subscribe(job_id, max_seconds=max_s):
+            if event == "ping":
+                yield ": ping\n\n"
+            else:
+                yield f"event: {event}\ndata: {json.dumps({'t': data})}\n\n"
+
+    return StreamingResponse(_events(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache",
+                                      "X-Accel-Buffering": "no"})
+
+
+@app.post("/api/jobs/{job_id}/session/steer", dependencies=[Depends(require_auth)])
+async def session_steer(job_id: str, body: SteerBody):
+    """Course-correct a running stage. Interrupts the CLI and resumes its session
+    with the note folded in when possible; otherwise records it as guidance for
+    the next checkpoint. 202 either way with which path was taken."""
+    note = body.note.strip()
+    if not note:
+        raise HTTPException(status_code=400, detail="empty note")
+    worker: Worker = app.state.worker
+    try:
+        outcome = worker.request_steer(job_id, note)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"unknown job '{job_id}'")
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    return JSONResponse(status_code=202, content={"job_id": job_id, "status": outcome})
+
+
 @app.get("/api/memory", dependencies=[Depends(require_auth)])
 async def memory_index():
     reader = MemoryReader(settings)

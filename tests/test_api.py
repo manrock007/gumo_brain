@@ -121,5 +121,8 @@ def test_dashboard_shell_is_balanced():
     assert h.count("<script>") == h.count("</script>") == 1
     for tok in ('class="topbar"', 'id="msg"', 'id="pending"', 'id="progress"',
                 'id="awaiting"', 'id="completed"', 'id="count-pending"',
-                'id="brain-body"', 'data-status="', 'STATUS_LABEL'):
+                'id="brain-body"', 'data-status="', 'STATUS_LABEL',
+                # live session view hooks
+                'id="sv"', 'id="sv-stream"', 'id="sv-timeline"', 'id="sv-note"',
+                'function routeHash', 'function steer', 'session/stream'):
         assert tok in h, tok
