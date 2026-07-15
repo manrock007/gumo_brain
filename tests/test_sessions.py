@@ -194,6 +194,22 @@ class TestRunClaudeStream:
         assert raw.status == "interrupted"
         assert raw.meta["session_id"] == "engine-uuid"
 
+    def test_pump_exception_reaps_and_errors(self, tmp_path):
+        """Seer PR#6 round 2: a pump-level exception (an over-long line makes
+        readline raise ValueError) must reap the child and return error, never
+        leak a zombie or a pending task."""
+        body = "python3 -c \"import sys; sys.stdout.write('x'*(2*1024*1024))\""
+        s = _settings(tmp_path, _fake_claude(tmp_path, body))
+
+        async def run():
+            raw = await run_claude_stream(s, str(tmp_path), "q", ["Read"], 30)
+            leftovers = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+            return raw, leftovers
+
+        raw, leftovers = asyncio.run(run())
+        assert raw.status == "error"
+        assert leftovers == []
+
     def test_exit0_no_envelope_with_text_is_ok(self, tmp_path):
         """Seer PR#6 round 1: contract parity with run_claude_raw — exit 0 with no
         result envelope but WITH assistant text returns ok+text (a stage that did

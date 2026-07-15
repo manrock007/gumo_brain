@@ -761,8 +761,14 @@ class Engine:
         )
 
     async def _comment(self, job, text, raw: bool = False):
+        # ClickUp is best-effort visibility and NEVER drives progress (ENGINE.md
+        # §7) — a comment failure must never propagate and corrupt control flow
+        # (e.g. flip a just-requeued steer to error, or overwrite closed telemetry).
         body = text if raw else f"{GATE_PREFIX} {text}"
-        await self.clickup.comment(job.get("clickup_task_id") or "", body)
+        try:
+            await self.clickup.comment(job.get("clickup_task_id") or "", body)
+        except Exception:
+            log.exception("clickup comment failed for %s (non-fatal)", job.get("issue_id"))
 
     # ---------- gate chat (artifact-primed, read-only — docs/CONVERSATIONS.md §2) ----------
 
