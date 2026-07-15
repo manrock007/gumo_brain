@@ -53,6 +53,28 @@ class TestChatEngineFallbacks:
         assert last["degraded"] == 1
         assert "moved on" in last["text"]
 
+    def test_running_job_passes_the_slow_lane_guard(self, worker, monkeypatch):
+        """Seer PR#8 round 5: the endpoint admits mid-run chat, so the slow lane's
+        under-lock re-validation must too — a running job at the SAME stage gets
+        past the status check (no 'moved on' tombstone)."""
+        import app.engine as engine_mod
+
+        worker.intake_feature("feat-c5", title="F", project="web", request="r")
+        worker.store.set_fields("feat-c5", stage=2, stage_attempts=1)
+        worker.store.set_status("feat-c5", "running")
+        job = dict(worker.store.get("feat-c5"))
+        worker.store.chat_add("feat-c5", 2, 1, "human", "how far along is the build?")
+
+        async def no_ws(*a, **k):  # past the guard, stop at the workspace step
+            raise RuntimeError("no workspace in tests")
+
+        monkeypatch.setattr(engine_mod, "prepare_feature_workspace", no_ws)
+        asyncio.run(worker.engine.chat(job, "how far along is the build?"))
+        last = worker.store.chat_last("feat-c5", 2)
+        assert last["role"] == "engine"
+        assert "moved on" not in last["text"]
+        assert "cannot check out" in last["text"]  # reached the step AFTER the guard
+
 
 class TestChatCancellation:
     def test_cancelled_chat_leaves_tombstone_engine_turn(self, worker, monkeypatch):
