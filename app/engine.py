@@ -32,6 +32,7 @@ from .feature_prompts import (
 )
 from .fixer import (
     BASE_ALLOWED_TOOLS,
+    PR_LINE_RE,
     BranchLostError,
     git,
     prepare_feature_workspace,
@@ -40,6 +41,7 @@ from .fixer import (
     run_claude_stream,
     session_transcript_exists,
 )
+from .github import GitHub
 from .memory import MemoryReader
 from .prompts import _test_block, build_v1_chat_prompt, build_v1_fastlane_system
 
@@ -80,11 +82,17 @@ class RepoLocks:
         lock = self._locks.get(repo)
         return bool(lock and lock.locked())
 
-PR_LINE_RE = re.compile(
-    r"^[\s`*>-]*PR_URL:\s*`?(https://github\.com/[\w./-]+/pull/\d+)`?[\s`]*$", re.MULTILINE
-)
+# PR_LINE_RE (the strict `PR_URL:` line matcher) lives in fixer.py — one
+# definition for both the feature pipeline and the v1 lifecycle capture.
 QUESTION_HEADING_RE = re.compile(r"^#{1,4}\s*(?:open\s+)?questions?\b.*$", re.IGNORECASE | re.MULTILINE)
 BUILD_GROUP_RE = re.compile(r"^#{1,4}\s*build\s+group\b", re.IGNORECASE | re.MULTILINE)
+
+
+def all_pr_urls(text: str) -> list[str]:
+    """Every PR_URL line in a run's output, de-duplicated in order — one work
+    packet can open several PRs (P5 + per-build-group in P6) and stages re-print
+    earlier URLs, so the prs table is fed from ALL of them, idempotently."""
+    return list(dict.fromkeys(PR_LINE_RE.findall(text or "")))
 
 
 def parse_stage_output(text: str) -> tuple[str, str, str | None]:
@@ -128,6 +136,7 @@ class Engine:
         self.locks = locks or RepoLocks()
         self.sync = ArtifactSync(store, clickup, settings.clickup_mirror_max_chars)
         self.memory = MemoryReader(settings, locks=self.locks)
+        self.github = GitHub(settings)
         # live session observation: a stage run streams its tool calls / text here,
         # keyed by job id. A SECOND broker instance (chat has its own) so a gate
         # chat turn and a live stage run never clobber each other's buffer.
@@ -156,6 +165,32 @@ class Engine:
         self.store.guidance_add(job_id, stage, "steer", note, "dashboard")
         log.info("job %s: steer queued to next checkpoint (P%s)", job_id, stage)
         return "queued"
+
+    async def record_prs(self, job_id: str, urls: list[str], kickoff: bool = True):
+        """Track every PR a run opened and, for NEW ones (pr_add is idempotent
+        by URL), run the lifecycle kickoff: flip the draft to ready-for-review
+        and post the first `@sentry review` (the bot ignores plain pushes).
+        kickoff=False records only (memory-bootstrap PRs are doc drafts — a code
+        review bot on them is noise). Best-effort throughout — a GitHub hiccup
+        never fails the run; the shepherd re-drives whatever this leaves."""
+        from .db import PR_URL_PARTS_RE
+
+        for url in urls or []:
+            try:
+                if not self.store.pr_add(job_id, url):
+                    continue  # already tracked — kickoff happened (or shepherd owns it)
+                m = PR_URL_PARTS_RE.search(url)
+                if not m or not kickoff or not self.settings.pr_auto_ready:
+                    continue
+                repo, number = m.group(1), int(m.group(2))
+                if await self.github.mark_ready(repo, number):
+                    self.store.pr_set(url, state="ready")
+                    log.info("job %s: PR %s#%s marked ready", job_id, repo, number)
+                if await self.github.comment(repo, number, "@sentry review"):
+                    self.store.pr_set(url, state="in_review", review_rounds=1)
+                    log.info("job %s: review requested on %s#%s", job_id, repo, number)
+            except Exception:
+                log.exception("PR lifecycle kickoff failed for %s (%s)", url, job_id)
 
     # ---------- the one entry point ----------
 
@@ -352,6 +387,8 @@ class Engine:
             return
 
         marker, payload, pr_url = parse_stage_output(raw.text)
+        # track EVERY PR this run mentioned (not just the last) + lifecycle kickoff
+        await self.record_prs(job_id, all_pr_urls(raw.text))
 
         if marker == "done" and stage_kind(stage) == "doc":
             # engine owns the artifact for document stages
@@ -1102,6 +1139,7 @@ class Engine:
         workspace = await prepare_feature_workspace(self.settings, target, branch, stage=0)
         is_canonical = project == self.settings.memory_canonical_project
         pr_url = None
+        pr_urls: list[str] = []  # every explicit PR_URL line across both runs
         for run in (1, 2):
             run_id = self.store.stage_run_open(job_id, stage=run, attempt=1)
             prompt = build_bootstrap_prompt(target=target, branch=branch, project=project,
@@ -1117,6 +1155,9 @@ class Engine:
             marker, payload, found_pr = parse_stage_output(raw.text)
             self.store.stage_run_close(run_id, marker, **self._meta(raw))
             pr_url = found_pr or pr_url
+            for u in all_pr_urls(raw.text):
+                if u not in pr_urls:
+                    pr_urls.append(u)
             if marker == "fail":
                 self.store.set_status(job_id, "no_fix", detail=payload[:2000])
                 return
@@ -1126,5 +1167,7 @@ class Engine:
                                              f"STAGE_FAIL: {payload[-1500:]}")
                 return
         await self.memory.refresh_cache(project, workspace, target.base)
+        if pr_urls:  # tracked, but no auto-ready/review — memory PRs are doc drafts
+            await self.record_prs(job_id, pr_urls, kickoff=False)
         self.store.set_status(job_id, "pr_opened" if pr_url else "no_fix",
                               pr_url=pr_url, detail="memory bootstrap complete")

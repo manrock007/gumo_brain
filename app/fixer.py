@@ -13,6 +13,12 @@ from .config import RepoTarget, Settings
 log = logging.getLogger("brain.fixer")
 
 PR_URL_RE = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+")
+# STRICT capture: only a standalone `PR_URL: <url>` line counts as "this run
+# OPENED that PR" — a URL mentioned in prose (context, a related PR) must never
+# trigger the lifecycle kickoff. Shared with the feature pipeline (engine.py).
+PR_LINE_RE = re.compile(
+    r"^[\s`*>-]*PR_URL:\s*`?(https://github\.com/[\w./-]+/pull/\d+)`?[\s`]*$", re.MULTILINE
+)
 
 BASE_ALLOWED_TOOLS = [
     "Read", "Grep", "Glob", "Edit", "Write",
@@ -26,6 +32,7 @@ class FixResult:
         # pr_opened | needs_input | no_fix | error | timeout
         self.status = status
         self.pr_url = pr_url
+        self.pr_urls: list[str] = [pr_url] if pr_url else []  # every PR the run mentioned
         self.detail = detail
         self.meta = meta or {}  # cost_usd / num_turns / duration_ms from the CLI envelope
 
@@ -508,7 +515,12 @@ async def run_claude(settings: Settings, target: RepoTarget, workspace: str, pro
     result_text = raw.text
     pr_match = PR_URL_RE.search(result_text)
     if pr_match:
-        return FixResult("pr_opened", pr_url=pr_match.group(0), detail=result_text[-3000:], meta=raw.meta)
+        res = FixResult("pr_opened", pr_url=pr_match.group(0), detail=result_text[-3000:], meta=raw.meta)
+        # lifecycle capture is STRICT: only explicit `PR_URL:` lines are PRs this
+        # run opened — a URL mentioned in prose must not get the kickoff. (The
+        # pr_opened STATUS keeps the broad match: long-standing v1 behavior.)
+        res.pr_urls = list(dict.fromkeys(PR_LINE_RE.findall(result_text)))
+        return res
     if "NEEDS_INPUT:" in result_text:
         return FixResult("needs_input", detail=result_text.split("NEEDS_INPUT:", 1)[1].strip()[:8000], meta=raw.meta)
     return FixResult("no_fix", detail=result_text[-3000:], meta=raw.meta)

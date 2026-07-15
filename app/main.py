@@ -463,6 +463,9 @@ async def session_snapshot(job_id: str):
         "runs": store.stage_runs_for(job_id) if feature else [],
         "guidance": store.guidance_for(job_id),
         "artifacts": artifacts,
+        # every PR this packet opened, with lifecycle state (draft -> ready ->
+        # in_review -> changes_requested -> approved -> merged/closed)
+        "prs": store.prs_for(job_id),
         # the full conversation across ALL stages (the inbox thread), plus the
         # current-stage pending/limit flags the composer needs
         "chat": store.chat_for(job_id),
