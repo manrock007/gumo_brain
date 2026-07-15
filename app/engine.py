@@ -178,7 +178,16 @@ class Engine:
         for url in urls or []:
             try:
                 if not self.store.pr_add(job_id, url):
-                    continue  # already tracked — kickoff happened (or shepherd owns it)
+                    # already tracked — kickoff happened (or shepherd owns it).
+                    # One case still needs action: the bot APPROVED this PR and
+                    # a later run (e.g. build group 2 on the same branch) just
+                    # pushed more commits. 'approved' is outside the shepherd's
+                    # scan states, so without a re-kick those commits would ship
+                    # unreviewed. Head-compare so a run that merely re-prints
+                    # the PR_URL line never burns a review round.
+                    if kickoff and self.settings.pr_auto_ready:
+                        await self._rekick_if_approved_head_moved(job_id, url)
+                    continue
                 m = PR_URL_PARTS_RE.search(url)
                 if not m or not kickoff or not self.settings.pr_auto_ready:
                     continue
@@ -191,6 +200,29 @@ class Engine:
                     log.info("job %s: review requested on %s#%s", job_id, repo, number)
             except Exception:
                 log.exception("PR lifecycle kickoff failed for %s (%s)", url, job_id)
+
+    async def _rekick_if_approved_head_moved(self, job_id: str, url: str):
+        from .db import PR_URL_PARTS_RE
+
+        row = self.store.pr_get(url)
+        if not row or row.get("state") != "approved":
+            return
+        m = PR_URL_PARTS_RE.search(url)
+        if not m:
+            return
+        repo, number = m.group(1), int(m.group(2))
+        info = await self.github.get_pr(repo, number)
+        if info is None:
+            return  # unknown — the next run mentioning this PR retries
+        head = ((info.get("head") or {}).get("sha") or "").strip()
+        if not head or head == (row.get("approved_head") or ""):
+            return  # nothing new since the clean pass
+        if await self.github.comment(repo, number, "@sentry review"):
+            rounds = int(row.get("review_rounds") or 0) + 1
+            self.store.pr_set(url, state="in_review", review_rounds=rounds,
+                              detail=f"round {rounds}: new commits after approval — "
+                                     "re-review requested")
+            log.info("job %s: %s#%s re-kicked after post-approval push", job_id, repo, number)
 
     # ---------- the one entry point ----------
 

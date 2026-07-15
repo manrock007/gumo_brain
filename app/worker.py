@@ -1007,7 +1007,12 @@ class Worker:
             if reactions is None:
                 return  # unknown ≠ no reactions — retry next pass, same as get_pr
             if any(r.get("content") == "hooray" for r in reactions):
-                self.store.pr_set(url, state="approved", detail="Sentry clean pass")
+                # stamp the approved head: a later run pushing MORE commits to
+                # this PR flips it back to in_review (engine.record_prs compares
+                # heads) so post-approval work never ships unreviewed
+                head = ((info.get("head") or {}).get("sha") or "").strip()
+                self.store.pr_set(url, state="approved", detail="Sentry clean pass",
+                                  approved_head=head)
                 await self._shepherd_notify(
                     pr, f"PR {repo}#{number} approved by Sentry — ready to merge. {url}")
                 return

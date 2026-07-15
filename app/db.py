@@ -110,6 +110,7 @@ CREATE TABLE IF NOT EXISTS prs (
     review_rounds INTEGER NOT NULL DEFAULT 0,  -- @sentry review passes requested (shepherd)
     last_checked REAL,               -- last shepherd poll
     detail TEXT DEFAULT '',          -- latest shepherd note (finding counts, errors)
+    approved_head TEXT NOT NULL DEFAULT '',  -- head sha the clean pass approved (re-kick detector)
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
@@ -170,6 +171,9 @@ MIGRATIONS = {  # table -> columns added after that table first shipped (in-plac
     },
     "artifact_state": {
         "content": "TEXT NOT NULL DEFAULT ''",
+    },
+    "prs": {
+        "approved_head": "TEXT NOT NULL DEFAULT ''",
     },
 }
 
@@ -575,6 +579,12 @@ class JobStore:
                 (job_id, url, repo, number, state, now, now),
             )
             return cur.rowcount == 1
+
+    def pr_get(self, url: str) -> dict | None:
+        with self._conn() as c:
+            row = c.execute("SELECT * FROM prs WHERE url = ?",
+                            ((url or "").strip().rstrip("/"),)).fetchone()
+            return dict(row) if row else None
 
     def prs_for(self, job_id: str) -> list[dict]:
         with self._conn() as c:

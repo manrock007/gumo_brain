@@ -109,6 +109,71 @@ class TestLifecycleKickoff:
         monkeypatch.setattr(w.engine.github, "mark_ready", boom)
         asyncio.run(w.engine.record_prs("feat-k2", ["https://github.com/o/r/pull/6"]))
 
+    def test_approved_pr_rekicked_when_head_moved(self, store, tmp_path, monkeypatch):
+        """Dogfood-found gap: build group 2 pushes MORE commits onto a PR the
+        bot already approved. 'approved' is outside the shepherd's scan states,
+        so record_prs must flip it back to in_review with a fresh trigger."""
+        w = self._worker(store, tmp_path)
+        url = "https://github.com/o/r/pull/59"
+        store.pr_add("feat-k6", url)
+        store.pr_set(url, state="approved", review_rounds=2, approved_head="aaa111")
+
+        calls = []
+
+        async def get_pr(repo, number):
+            return {"head": {"sha": "bbb222"}}  # moved past the approved head
+
+        async def ok_comment(repo, number, body):
+            calls.append(body)
+            return True
+
+        monkeypatch.setattr(w.engine.github, "get_pr", get_pr)
+        monkeypatch.setattr(w.engine.github, "comment", ok_comment)
+        asyncio.run(w.engine.record_prs("feat-k6", [url]))
+        assert calls == ["@sentry review"]
+        pr = store.pr_get(url)
+        assert pr["state"] == "in_review" and pr["review_rounds"] == 3
+        assert "new commits after approval" in pr["detail"]
+
+    def test_approved_pr_not_rekicked_on_same_head(self, store, tmp_path, monkeypatch):
+        """A run that merely re-prints the PR_URL line (no push) must not burn
+        a review round — the head compare keeps re-kicks to real pushes."""
+        w = self._worker(store, tmp_path)
+        url = "https://github.com/o/r/pull/60"
+        store.pr_add("feat-k7", url)
+        store.pr_set(url, state="approved", review_rounds=2, approved_head="aaa111")
+
+        async def get_pr(repo, number):
+            return {"head": {"sha": "aaa111"}}  # unchanged since the clean pass
+
+        async def boom_comment(*a, **k):
+            raise AssertionError("must not re-trigger on an unchanged head")
+
+        monkeypatch.setattr(w.engine.github, "get_pr", get_pr)
+        monkeypatch.setattr(w.engine.github, "comment", boom_comment)
+        asyncio.run(w.engine.record_prs("feat-k7", [url]))
+        pr = store.pr_get(url)
+        assert pr["state"] == "approved" and pr["review_rounds"] == 2
+
+    def test_approved_rekick_unknown_head_waits(self, store, tmp_path, monkeypatch):
+        """get_pr None = unknown — never re-kick blind; the next run mentioning
+        this PR retries the compare."""
+        w = self._worker(store, tmp_path)
+        url = "https://github.com/o/r/pull/61"
+        store.pr_add("feat-k8", url)
+        store.pr_set(url, state="approved", approved_head="aaa111")
+
+        async def get_pr(repo, number):
+            return None
+
+        async def boom_comment(*a, **k):
+            raise AssertionError("must not trigger while the head is unknown")
+
+        monkeypatch.setattr(w.engine.github, "get_pr", get_pr)
+        monkeypatch.setattr(w.engine.github, "comment", boom_comment)
+        asyncio.run(w.engine.record_prs("feat-k8", [url]))
+        assert store.pr_get(url)["state"] == "approved"
+
     def test_kickoff_disabled_records_only(self, store, tmp_path, monkeypatch):
         w = self._worker(store, tmp_path, auto=False)
 
