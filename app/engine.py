@@ -210,7 +210,7 @@ class Engine:
         # P6 auto-skips when the (post-pull) plan has a single build group
         if stage == 6 and not resuming and not self._plan_has_multiple_groups(workspace, job_id):
             self.store.stage_run_close(run_id, "skipped_single_group")
-            self.store.set_fields(job_id, stage=7, stage_attempts=0)
+            self.store.set_fields(job_id, stage=7, stage_attempts=0, ask_count=0)
             self.store.set_status(job_id, "queued")
             log.info("job %s: P6 auto-skipped (single build group)", job_id)
             await self._comment(job, "P6 auto-skipped — the plan has a single build group. Queued P7.")
@@ -237,15 +237,17 @@ class Engine:
                                   resume_attempt=None, resume_head="", resume_answer="",
                                   gate_kind="")
         if resuming:
-            self.store.set_fields(job_id, ask_count=int(job.get("ask_count") or 0) + 1)
             prompt = self._resume_message(job, stage, ask_answer, edited)
             log.info("job %s: resuming P%s session %s", job_id, stage, resume_sid[:8])
             raw = await self._invoke(workspace, prompt, tools, timeout, resume_session=resume_sid)
             if raw.status == "session_lost":
                 resuming, resume_reason = False, "the session could not be resumed"
             else:
-                # only now is this run truly a continuation of the parked session
+                # only now is this run truly a continuation of the parked session —
+                # and only now does it consume the ask budget (a lost session falls
+                # back to a fresh run and must not burn a resume that never happened)
                 self.store.stage_run_mark_resumed(run_id)
+                self.store.set_fields(job_id, ask_count=int(job.get("ask_count") or 0) + 1)
         if not resuming:
             if resume_reason and ask_answer:
                 # the human's answer must survive the downgrade to a fresh re-run
@@ -343,7 +345,8 @@ class Engine:
             await self._comment(
                 job, f"P{stage} ({stage_name(stage)}) complete — auto-advanced "
                      f"(light gate mode).\n\n{payload[:3000]}{evidence}")
-            self.store.set_fields(job_id, stage=stage + 1, stage_attempts=0, question="")
+            self.store.set_fields(job_id, stage=stage + 1, stage_attempts=0, question="",
+                                  ask_count=0)
             self.store.set_status(job_id, "queued")
             log.info("job %s: P%s auto-advanced (light mode)", job_id, stage)
             return "requeue"

@@ -187,6 +187,105 @@ class TestRequeuePropagation:
         assert result == "requeue"
 
 
+class TestAskBudget:
+    """Seer round 9: the ask budget counts resumes actually consumed by the
+    current stage attempt — a session_lost resume must not burn it, and every
+    stage advance (worker proceed, light-mode auto-advance, P6 auto-skip)
+    resets it."""
+
+    def _run_resume(self, worker, monkeypatch, tmp_path, invoke_status):
+        import app.engine as engine_mod
+
+        eng = worker.engine
+        worker.intake_feature("feat-ab1", title="F", project="web", request="r")
+        worker.store.set_fields(
+            "feat-ab1", stage=5, stage_attempts=1, gate_kind="ask",
+            resume_session_id="sess-1", resume_stage=5, resume_attempt=1,
+            resume_head="H", resume_answer="per-total", ask_count=1,
+        )
+        job = worker.store.get("feat-ab1")
+
+        async def fake_prepare(*a, **k):
+            return str(tmp_path)
+
+        async def fake_git(ws, *args):
+            return (0, "H") if args and args[0] == "rev-parse" else (0, "")
+
+        async def fake_pull(*a, **k):
+            return []
+
+        class Raw:
+            status = invoke_status
+            text = ""
+            meta = {}
+
+        async def fake_invoke(*a, **k):
+            return Raw()
+
+        async def fake_build(*a, **k):
+            return "fresh prompt"
+
+        async def anoop(*a, **k):
+            return None
+
+        monkeypatch.setattr(engine_mod, "prepare_feature_workspace", fake_prepare)
+        monkeypatch.setattr(engine_mod, "git", fake_git)
+        monkeypatch.setattr(engine_mod, "session_transcript_exists", lambda *a: True)
+        monkeypatch.setattr(eng.sync, "pull", fake_pull)
+        monkeypatch.setattr(eng, "_write_guidance_file", anoop)
+        monkeypatch.setattr(eng, "_invoke", fake_invoke)
+        monkeypatch.setattr(eng, "_build_prompt", fake_build)
+        monkeypatch.setattr(eng, "_after_run", anoop)
+        monkeypatch.setattr(eng, "_checkpoint", anoop)
+        monkeypatch.setattr(eng.memory, "refresh_cache", anoop)
+        monkeypatch.setattr(eng.clickup, "set_status", anoop)
+        asyncio.run(eng.run_stage(job))
+        return worker.store.get("feat-ab1")["ask_count"]
+
+    def test_successful_resume_consumes_budget(self, worker, monkeypatch, tmp_path):
+        assert self._run_resume(worker, monkeypatch, tmp_path, "ok") == 2
+
+    def test_lost_session_resume_keeps_budget(self, worker, monkeypatch, tmp_path):
+        assert self._run_resume(worker, monkeypatch, tmp_path, "session_lost") == 1
+
+    def test_auto_advance_resets_ask_budget(self, worker, monkeypatch, tmp_path):
+        eng = worker.engine
+        worker.intake_feature("feat-ab2", title="F", project="web", request="r",
+                              gate_mode="light")
+        worker.store.set_fields("feat-ab2", stage=7, stage_attempts=1, ask_count=2)
+        job = worker.store.get("feat-ab2")
+        run_id = worker.store.stage_run_open("feat-ab2", 7, 1, None)
+
+        class Raw:
+            status = "ok"
+            text = ("table\nSTAGE_DONE:\nresults\n## Questions\n"
+                    "1. Approve and continue to the next stage?")
+            meta = {}
+
+        async def truthy(*a, **k):
+            return True
+
+        async def empty(*a, **k):
+            return ""
+
+        async def empty_list(*a, **k):
+            return []
+
+        async def anoop(*a, **k):
+            return None
+
+        monkeypatch.setattr(eng, "_checkpoint", truthy)
+        monkeypatch.setattr(eng.sync, "push", empty_list)
+        monkeypatch.setattr(eng, "_evidence", empty)
+        monkeypatch.setattr(eng, "_comment", anoop)
+        result = asyncio.run(
+            eng._after_run(job, 7, run_id, None, "b", str(tmp_path), Raw(), "base"))
+        row = worker.store.get("feat-ab2")
+        assert result == "requeue"
+        assert row["stage"] == 8
+        assert row["ask_count"] == 0
+
+
 class TestChatDistillation:
     def test_proceed_records_last_engine_answer(self, worker):
         worker.intake_feature("feat-d1", title="F", project="web", request="r")
