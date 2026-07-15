@@ -258,12 +258,15 @@ async def run_claude_raw(settings: Settings, workspace: str, prompt: str,
         out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
         proc.kill()
+        await proc.wait()  # reap — kill alone leaves a zombie
         log.error("claude run timed out after %ss", timeout)
         return RawRunResult("timeout", f"timed out after {timeout}s",
                             {"session_id": session_id})
     except asyncio.CancelledError:
         # graceful shutdown must never orphan a live claude that later pushes
         proc.kill()
+        with contextlib.suppress(asyncio.CancelledError):
+            await proc.wait()
         raise
 
     stdout = out.decode(errors="replace")
@@ -377,6 +380,7 @@ async def run_claude_stream(settings: Settings, workspace: str, prompt: str,
         stderr_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await stderr_task  # reap the reader — a bare cancel leaves it pending
+        await proc.wait()      # reap the child — kill alone leaves a zombie
         log.error("claude stream run timed out after %ss", timeout)
         return RawRunResult("timeout", f"timed out after {timeout}s",
                             {"session_id": session_id})
@@ -386,6 +390,8 @@ async def run_claude_stream(settings: Settings, workspace: str, prompt: str,
         stderr_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await stderr_task
+        with contextlib.suppress(asyncio.CancelledError):
+            await proc.wait()
         raise
     try:
         stderr = (await asyncio.wait_for(stderr_task, timeout=10)).decode(errors="replace")
