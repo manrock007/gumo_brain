@@ -65,6 +65,7 @@ CREATE TABLE IF NOT EXISTS artifact_state (
     subtask_id TEXT DEFAULT '',
     synced_hash TEXT DEFAULT '',     -- semantic hash of the ClickUp READBACK (fixpoint)
     flags TEXT DEFAULT '',           -- '', 'truncated', 'superseded', 'mirror_lost'
+    content TEXT NOT NULL DEFAULT '',  -- last-known artifact body (fast-lane chat bundle)
     PRIMARY KEY (job_id, artifact)
 );
 
@@ -107,6 +108,7 @@ CREATE TABLE IF NOT EXISTS gate_chat (
     duration_ms REAL,
     session_id TEXT DEFAULT '',
     degraded INTEGER NOT NULL DEFAULT 0,  -- answered from documents only (no session)
+    lane TEXT NOT NULL DEFAULT '',   -- '' = tool run | 'fast' = bundle-primed API call
     at REAL NOT NULL
 );
 """
@@ -145,8 +147,16 @@ MIGRATIONS = {  # table -> columns added after that table first shipped (in-plac
         "duration_ms": "REAL",
         "session_id": "TEXT DEFAULT ''",
         "degraded": "INTEGER NOT NULL DEFAULT 0",
+        "lane": "TEXT NOT NULL DEFAULT ''",
+    },
+    "artifact_state": {
+        "content": "TEXT NOT NULL DEFAULT ''",
     },
 }
+
+# Artifact bodies cached for the fast-lane chat bundle are capped — they are
+# markdown documents, not blobs; anything longer is truncated with a banner.
+ARTIFACT_CONTENT_MAX = 60000
 
 
 class JobStore:
@@ -307,24 +317,48 @@ class JobStore:
 
     def artifact_set(self, job_id: str, artifact: str, **fields):
         current = self.artifact_get(job_id, artifact) or {
-            "subtask_id": "", "synced_hash": "", "flags": ""
+            "subtask_id": "", "synced_hash": "", "flags": "", "content": ""
         }
-        merged = {**{k: current[k] for k in ("subtask_id", "synced_hash", "flags")}, **fields}
+        keys = ("subtask_id", "synced_hash", "flags", "content")
+        merged = {**{k: current.get(k) or "" for k in keys}, **fields}
         with self._conn() as c:
             c.execute(
-                """INSERT INTO artifact_state (job_id, artifact, subtask_id, synced_hash, flags)
-                   VALUES (?, ?, ?, ?, ?)
+                """INSERT INTO artifact_state (job_id, artifact, subtask_id, synced_hash, flags, content)
+                   VALUES (?, ?, ?, ?, ?, ?)
                    ON CONFLICT(job_id, artifact) DO UPDATE SET
                      subtask_id = excluded.subtask_id,
                      synced_hash = excluded.synced_hash,
-                     flags = excluded.flags""",
-                (job_id, artifact, merged["subtask_id"], merged["synced_hash"], merged["flags"]),
+                     flags = excluded.flags,
+                     content = excluded.content""",
+                (job_id, artifact, merged["subtask_id"], merged["synced_hash"],
+                 merged["flags"], merged["content"]),
             )
 
-    def artifacts_for(self, job_id: str) -> list[dict]:
+    def artifact_content_set(self, job_id: str, artifact: str, content: str):
+        """Cache the artifact body for the fast-lane chat bundle (truncated)."""
+        content = content or ""
+        if len(content) > ARTIFACT_CONTENT_MAX:
+            content = content[:ARTIFACT_CONTENT_MAX] + "\n… (truncated cache)"
+        self.artifact_set(job_id, artifact, content=content)
+
+    def artifact_contents(self, job_id: str, names: list[str]) -> dict[str, str]:
+        """name -> cached body, for the requested artifacts that have one."""
+        marks = ",".join("?" for _ in names)
         with self._conn() as c:
             rows = c.execute(
-                "SELECT * FROM artifact_state WHERE job_id = ? ORDER BY artifact", (job_id,)
+                f"SELECT artifact, content FROM artifact_state "
+                f"WHERE job_id = ? AND artifact IN ({marks})",
+                (job_id, *names),
+            ).fetchall()
+            return {r["artifact"]: r["content"] for r in rows if (r["content"] or "").strip()}
+
+    def artifacts_for(self, job_id: str) -> list[dict]:
+        """Sync/telemetry view — excludes the cached body (it would bloat the
+        stats API; fetch bodies via artifact_contents)."""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT job_id, artifact, subtask_id, synced_hash, flags "
+                "FROM artifact_state WHERE job_id = ? ORDER BY artifact", (job_id,)
             ).fetchall()
             return [dict(r) for r in rows]
 
@@ -447,14 +481,14 @@ class JobStore:
     def chat_add(self, job_id: str, stage: int, attempt: int, role: str, text: str,
                  cost_usd: float | None = None, num_turns: int | None = None,
                  duration_ms: float | None = None, session_id: str = "",
-                 degraded: bool = False) -> int:
+                 degraded: bool = False, lane: str = "") -> int:
         with self._conn() as c:
             cur = c.execute(
                 """INSERT INTO gate_chat (job_id, stage, attempt, role, text,
-                     cost_usd, num_turns, duration_ms, session_id, degraded, at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                     cost_usd, num_turns, duration_ms, session_id, degraded, lane, at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (job_id, stage, attempt, role, text, cost_usd, num_turns,
-                 duration_ms, session_id, int(degraded), time.time()),
+                 duration_ms, session_id, int(degraded), lane, time.time()),
             )
             return cur.lastrowid
 

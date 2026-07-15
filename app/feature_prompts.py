@@ -305,6 +305,91 @@ preamble about being an AI. This conversation is context for the reviewer's deci
 their eventual Proceed/Redo answer is what binds the pipeline."""
 
 
+# ---------- fast-lane chat (bundle-primed streaming API call — docs/CONVERSATIONS.md §5) ----------
+
+
+FASTLANE_ESCALATE_INSTRUCTION = """If — and only if — the question cannot be \
+answered from the material above and would require reading the repository's \
+code, respond with EXACTLY one line and nothing else:
+
+NEED_CODE_RUN: <one short line on what needs checking>
+
+Do not use that marker for questions the material can answer, and never use it \
+anywhere except as the very first thing in your reply."""
+
+
+def build_fastlane_system(*, job: dict, stage: int, inline_artifacts: dict[str, str],
+                          guidance_entries: list[dict]) -> str:
+    """System prompt for the fast lane: everything the engine already wrote
+    down at this gate, and the self-escalation contract. No repository access
+    exists in this lane — the model must say so via the marker, not guess."""
+    artifacts = ""
+    for name, content in inline_artifacts.items():
+        body = (content or "").strip()[:6000]
+        artifacts += f"\n\n### {name}\n\n{body}"
+    guidance = ""
+    for g in guidance_entries[-5:]:
+        guidance += f"\n- P{g.get('stage')} {g.get('action')}: {(g.get('text') or '').strip()[:300]}"
+    gate_summary = (job.get("analysis") or "").strip()[:5000]
+    evidence = (job.get("evidence") or "").strip()[:2000]
+    question = (job.get("question") or "").strip()[:1500]
+
+    return f"""You are the Gumo Engine, answering a human reviewer's questions at the P{stage} \
+({stage_name(stage)}) gate of the feature pipeline for "{(job.get('title') or '').strip()[:200]}". \
+The pipeline is PAUSED waiting for their decision; your job is to help them decide — not to \
+do more work. You are answering from the gate bundle below; you have NO access to the \
+repository in this conversation.
+
+## The gate summary you produced
+
+{gate_summary or '(none recorded)'}
+
+## Open questions at this gate
+
+{question or '(none recorded)'}
+
+## Evidence
+
+{evidence or '(none recorded)'}
+
+## Artifacts (cached copies)
+{artifacts if artifacts else chr(10) + '(none cached yet)'}
+
+## Recent human guidance
+{guidance if guidance else chr(10) + '(none)'}
+
+Answer directly and concisely (under 250 words unless the question demands more); cite the \
+artifact or summary section you are drawing on. If answering honestly requires changing the \
+work rather than explaining it, say exactly that and recommend `/redo` with the concrete \
+notes you'd give. Plain text only — no STAGE markers.
+
+{FASTLANE_ESCALATE_INSTRUCTION}"""
+
+
+def build_fastlane_messages(transcript: list[dict], message: str) -> list[dict]:
+    """gate_chat rows -> Messages-API turns: user/assistant strictly
+    alternating, starting with user. Consecutive same-role turns coalesce;
+    leading engine turns (a tombstone with no surviving question) drop."""
+    messages: list[dict] = []
+    for t in transcript[-8:]:
+        role = "user" if t["role"] == "human" else "assistant"
+        text = (t.get("text") or "").strip()[:2000]
+        if not text:
+            continue
+        if not messages and role == "assistant":
+            continue
+        if messages and messages[-1]["role"] == role:
+            messages[-1]["content"] += "\n\n" + text
+        else:
+            messages.append({"role": role, "content": text})
+    final = (message or "").strip()[:4000]
+    if messages and messages[-1]["role"] == "user":
+        messages[-1]["content"] += "\n\n" + final
+    else:
+        messages.append({"role": "user", "content": final})
+    return messages
+
+
 # ---------- memory bootstrap (kind=memory job, two sequential runs) ----------
 
 def build_bootstrap_prompt(*, target: RepoTarget, branch: str, project: str,

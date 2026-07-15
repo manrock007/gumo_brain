@@ -17,10 +17,13 @@ from .artifacts import ArtifactSync, artifact_path, feature_dir, list_artifacts,
 from .clickup import ClickUp
 from .config import Settings
 from .db import JobStore
+from . import fastlane
 from .feature_prompts import (
     STAGES,
     build_bootstrap_prompt,
     build_chat_prompt,
+    build_fastlane_messages,
+    build_fastlane_system,
     build_stage_prompt,
     stage_artifact,
     stage_kind,
@@ -32,6 +35,7 @@ from .fixer import (
     git,
     prepare_feature_workspace,
     run_claude_raw,
+    run_claude_stream,
     session_transcript_exists,
 )
 from .memory import MemoryReader
@@ -645,19 +649,23 @@ class Engine:
 
     # ---------- gate chat (artifact-primed, read-only — docs/CONVERSATIONS.md §2) ----------
 
-    async def chat(self, job: dict, message: str):
+    async def chat(self, job: dict, message: str, publish=None):
         """Answer one gate-chat question. The human turn is already persisted (the
-        endpoint returns 202 immediately); this runs as a background task, waits
-        for the repo lock, and appends the engine turn — persist-then-poll, so the
-        dashboard's ordinary polling picks up the reply and nothing is lost if the
-        client disconnects."""
+        endpoint returns 202 immediately); this runs as a background task and
+        appends the engine turn — persist-then-poll, so the dashboard's ordinary
+        polling picks up the reply and nothing is lost if the client disconnects.
+        `publish(event, data)` (optional, sync) streams live progress to the SSE
+        broker: 'delta' text chunks and 'status' progress lines. Streaming is
+        pure UX — the persisted row is the contract."""
         job_id = job["issue_id"]
         stage = int(job.get("stage") or 0)
         attempt = max(1, int(job.get("stage_attempts") or 1))
         target = self.settings.repo_for_project(job.get("project") or "")
+        publish = publish or (lambda event, data: None)
 
         try:
-            reply, meta, degraded = await self._chat_inner(job, stage, message, target)
+            reply, meta, degraded = await self._chat_dispatch(job, stage, message,
+                                                              target, publish)
         except asyncio.CancelledError:
             # shutdown (or task cancellation): leave a tombstone engine turn so
             # the human turn isn't orphaned — an orphan blocks this gate's chat
@@ -680,7 +688,7 @@ class Engine:
             job_id, stage, attempt, "engine", reply,
             cost_usd=meta.get("cost_usd"), num_turns=meta.get("num_turns"),
             duration_ms=meta.get("duration_ms"), session_id=meta.get("session_id") or "",
-            degraded=degraded,
+            degraded=degraded, lane=meta.get("lane") or "",
         )
         # mirror the exchange to the ticket — ClickUp stays the record
         await self.clickup.comment(
@@ -690,11 +698,51 @@ class Engine:
             "_Replies here must start with /proceed, /redo, or /skip._",
         )
 
-    async def _chat_inner(self, job, stage, message, target) -> tuple[str, dict, bool]:
+    async def _chat_dispatch(self, job, stage, message, target, publish) -> tuple[str, dict, bool]:
+        """Two-lane routing (docs/CONVERSATIONS.md §5): try the fast lane —
+        a bundle-primed streaming API call — and fall through to the tool-run
+        slow lane when it escalates (NEED_CODE_RUN) or errors. The fast lane
+        never blocks on locks and never touches a workspace."""
+        if self.settings.chat_fast_enabled:
+            status, text, fmeta = await self._chat_fast(job, stage, message, publish)
+            if status == "ok":
+                return text.strip(), fmeta, False
+            if status == "escalate":
+                reason = text.split(":", 1)[1].strip()[:120] if ":" in text else ""
+                publish("status", "needs the repository — starting a code run"
+                        + (f" ({reason})" if reason else ""))
+                log.info("chat %s P%s: fast lane escalated: %s",
+                         job["issue_id"], stage, reason or text[:120])
+            else:
+                # error: the slow lane still answers; the fast lane stays UX-only
+                log.warning("chat %s P%s: fast lane error: %s",
+                            job["issue_id"], stage, text[:200])
+        return await self._chat_inner(job, stage, message, target, publish)
+
+    async def _chat_fast(self, job, stage, message, publish):
+        job_id = job["issue_id"]
+        names = list(dict.fromkeys([stage_artifact(stage), "P1-prd.md"]))
+        system = build_fastlane_system(
+            job=job, stage=stage,
+            inline_artifacts=self.store.artifact_contents(job_id, names),
+            guidance_entries=self.store.guidance_for(job_id),
+        )
+        messages = build_fastlane_messages(
+            self.store.chat_for(job_id, stage)[:-1],  # exclude the turn being answered
+            message,
+        )
+        return await fastlane.stream_answer(
+            self.settings, system, messages,
+            on_delta=lambda chunk: publish("delta", chunk),
+        )
+
+    async def _chat_inner(self, job, stage, message, target, publish=None) -> tuple[str, dict, bool]:
+        publish = publish or (lambda event, data: None)
         job_id = job["issue_id"]
         if target is None:
             return "(no repo is mapped for this project — cannot answer from code)", {}, True
         branch = f"brain/feat-{job_id}"
+        publish("status", "waiting for the repository workspace")
 
         async with self.locks.for_repo(target.repo):
             # re-validate under the lock: the gate may have been answered while queued
@@ -740,13 +788,15 @@ class Engine:
                     f"honest answer requires changing the work, say so and recommend /redo "
                     f"with concrete notes.{convo}\n\nThe reviewer asks:\n\n{message.strip()[:4000]}"
                 )
+                publish("status", "consulting the stage session")
                 async with self.locks.claude_global:  # shares the session store
-                    raw = await run_claude_raw(
+                    raw = await run_claude_stream(
                         self.settings, workspace, prompt,
                         allowed_tools=CHAT_TOOLS,
                         timeout=self.settings.chat_timeout_seconds,
                         disallowed_tools=CHAT_DENIED_TOOLS,
                         resume_session=resume_sid, fork_session=fork_new,
+                        on_event=publish,
                     )
                 if raw.status == "session_lost":
                     resume_sid = None  # fall through to artifact-primed below
@@ -763,13 +813,15 @@ class Engine:
                             if self.settings.session_persistence else None)
                 store_lock = (self.locks.chat_global if chat_dir
                               else self.locks.claude_global)
+                publish("status", "reading the branch artifacts and code")
                 async with store_lock:
-                    raw = await run_claude_raw(
+                    raw = await run_claude_stream(
                         self.settings, workspace, prompt,
                         allowed_tools=CHAT_TOOLS,
                         timeout=self.settings.chat_timeout_seconds,
                         disallowed_tools=CHAT_DENIED_TOOLS,
                         config_dir=chat_dir,
+                        on_event=publish,
                     )
             # hygiene: a chat run must never leave residue for _checkpoint to commit
             code, status = await git(workspace, "status", "--porcelain")

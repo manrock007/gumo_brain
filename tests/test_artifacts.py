@@ -157,6 +157,53 @@ class TestPushPull:
                              capture_output=True, text=True).stdout
         assert "human edit" in log
 
+
+class TestContentCache:
+    """docs/CONVERSATIONS.md §5: the fast-lane chat bundle reads artifact
+    bodies from the DB cache — refreshed on every write path, including when
+    ClickUp mirroring is off entirely."""
+
+    def test_push_caches_content_even_with_clickup_disabled(self, store, job, workspace):
+        clickup = FakeClickUp()
+        clickup.enabled = False
+        sync = ArtifactSync(store, clickup, mirror_max_chars=5000)
+        _write_artifact(workspace, "P3-design.md", "## Design\n\nuse model B\n")
+        asyncio.run(sync.push(workspace, job))
+        cached = store.artifact_contents(JOB, ["P3-design.md"])
+        assert "use model B" in cached["P3-design.md"]
+
+    def test_commit_file_caches_content(self, sync, job, workspace, store):
+        asyncio.run(sync.commit_file(workspace, JOB, "P1-prd.md",
+                                     "## PRD\n\nscope: exports\n", "P1: artifact"))
+        cached = store.artifact_contents(JOB, ["P1-prd.md"])
+        assert "scope: exports" in cached["P1-prd.md"]
+
+    def test_pulled_human_edit_refreshes_cache(self, sync, job, workspace, store):
+        sync.clickup.tasks["parent1"] = {"description": "parent"}
+        _write_artifact(workspace, "P1-prd.md", "## PRD\n\nscope: exports\n")
+        asyncio.run(sync.push(workspace, job))
+        st = store.artifact_get(JOB, "P1-prd.md")["subtask_id"]
+        sync.clickup.tasks[st]["description"] = "## PRD\n\nscope: exports AND imports\n"
+        asyncio.run(sync.pull(workspace, job))
+        cached = store.artifact_contents(JOB, ["P1-prd.md"])
+        assert "AND imports" in cached["P1-prd.md"]
+
+    def test_cache_truncates_and_stats_stay_lean(self, store, job, workspace):
+        from app.db import ARTIFACT_CONTENT_MAX
+
+        store.artifact_content_set(JOB, "P4-plan.md", "x" * (ARTIFACT_CONTENT_MAX + 500))
+        cached = store.artifact_contents(JOB, ["P4-plan.md"])["P4-plan.md"]
+        assert len(cached) <= ARTIFACT_CONTENT_MAX + 30
+        assert cached.endswith("(truncated cache)")
+        # the stats/sync view must NOT ship bodies over the API
+        rows = store.artifacts_for(JOB)
+        assert all("content" not in r for r in rows)
+
+    def test_content_survives_sync_hash_updates(self, store, job):
+        store.artifact_content_set(JOB, "P1-prd.md", "body text")
+        store.artifact_set(JOB, "P1-prd.md", synced_hash="h1")  # sync bookkeeping
+        assert store.artifact_contents(JOB, ["P1-prd.md"])["P1-prd.md"] == "body text"
+
     def test_pull_empty_description_never_wins(self, sync, job, workspace, store):
         sync.clickup.tasks["parent1"] = {"description": "parent"}
         _write_artifact(workspace, "P1-prd.md", "## PRD\n\ncontent\n")
