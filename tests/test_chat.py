@@ -105,6 +105,50 @@ class TestChatEngineFallbacks:
         assert "moved on" not in last["text"]
         assert "cannot check out" in last["text"]
 
+    def test_v1_followup_resumes_the_chat_session(self, store, tmp_path, monkeypatch):
+        """Seer PR#9 round 3: v1 chat transcripts live in the CHAT config store —
+        the resume lookup must search there, or every follow-up starts fresh."""
+        import os
+        from pathlib import Path
+
+        import app.engine as engine_mod
+        from app.config import Settings
+        from app.fixer import RawRunResult
+        from app.worker import Worker
+
+        s = Settings(data_dir=str(tmp_path), dashboard_password="test",
+                     session_persistence=True)
+        w = Worker(s, store)
+        # a prior engine turn with a session whose transcript lives in the CHAT store
+        d = Path(s.claude_chat_config_dir) / "projects" / "-ws"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "v1-sess-1.jsonl").write_text("{}")
+        w.intake_task("task-c9", title="T", project="web", request="r")
+        store.set_status("task-c9", "awaiting_input")
+        job = store.get("task-c9")
+        store.chat_add("task-c9", 0, 1, "human", "q1")
+        store.chat_add("task-c9", 0, 1, "engine", "a1", session_id="v1-sess-1")
+        store.chat_add("task-c9", 0, 1, "human", "follow-up?")
+
+        async def fake_ws(*a, **k):
+            return str(tmp_path)
+
+        captured = {}
+
+        async def fake_stream(settings, workspace, prompt, **k):
+            captured["resume"] = k.get("resume_session")
+            return RawRunResult("ok", "resumed answer", {"session_id": "v1-sess-1"})
+
+        async def fake_git(*a, **k):
+            return (0, "")
+
+        monkeypatch.setattr(engine_mod, "prepare_workspace", fake_ws)
+        monkeypatch.setattr(engine_mod, "run_claude_stream", fake_stream)
+        monkeypatch.setattr(engine_mod, "git", fake_git)
+        asyncio.run(w.engine.chat(job, "follow-up?"))
+        assert captured["resume"] == "v1-sess-1"  # continuity, not a fresh session
+        assert store.chat_last("task-c9", 0)["text"] == "resumed answer"
+
     def test_v1_slow_lane_does_not_wait_on_the_main_repo_lock(self, worker, monkeypatch):
         """Seer PR#9 round 1: a v1 item holds the MAIN repo lock for its whole
         run and lands terminal right after, so a chat waiting on that lock could

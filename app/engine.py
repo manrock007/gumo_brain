@@ -902,8 +902,13 @@ class Engine:
             resume_sid = None
             if self.settings.session_persistence:
                 for t in reversed(self.store.chat_for(job_id, stage)):
+                    # v1 chat runs live in the DEDICATED chat store (they invoke
+                    # with config_dir=claude_chat_config_dir) — check THAT store,
+                    # not the default stage store, or resume never fires
                     if (t["role"] == "engine" and t.get("session_id") and not t.get("degraded")
-                            and session_transcript_exists(self.settings, t["session_id"])):
+                            and session_transcript_exists(
+                                self.settings, t["session_id"],
+                                config_dir=self.settings.claude_chat_config_dir)):
                         resume_sid = t["session_id"]
                         break
             if resume_sid:

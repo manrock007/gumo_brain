@@ -64,14 +64,17 @@ def ensure_session_store(settings: Settings):
                           "persistence will degrade to fresh runs", target_dir)
 
 
-def session_transcript_exists(settings: Settings, session_id: str) -> bool:
+def session_transcript_exists(settings: Settings, session_id: str,
+                              config_dir: str | None = None) -> bool:
     """A resume of a missing session exits 0 with EMPTY stdout (verified on the
     installed CLI) — never trust exit signals. Transcripts live under
-    CLAUDE_CONFIG_DIR/projects/<cwd-slug>/<session>.jsonl; glob across project
-    slugs so slug-scheme drift can't fake a loss."""
+    <config dir>/projects/<cwd-slug>/<session>.jsonl; glob across project
+    slugs so slug-scheme drift can't fake a loss. config_dir picks WHICH store
+    to search — the default stage store, or the dedicated chat store for runs
+    that were invoked with config_dir=claude_chat_config_dir."""
     if not session_id or not settings.session_persistence:
         return False
-    root = Path(settings.claude_config_dir) / "projects"
+    root = Path(config_dir or settings.claude_config_dir) / "projects"
     if not root.is_dir():
         return False
     return any(root.glob(f"*/{session_id}.jsonl"))
