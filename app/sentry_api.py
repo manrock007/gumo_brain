@@ -24,6 +24,26 @@ class SentryClient:
         self._org = settings.sentry_org
         self._headers = {"Authorization": f"Bearer {settings.sentry_auth_token}"}
 
+    async def resolve_short_id(self, short_id: str) -> str | None:
+        """Numeric issue id for a short code like WEB-3Y — humans know issues
+        by short code, the API wants the group id. Returns the id, '' when the
+        code definitively does not exist (404), or None on a transient failure
+        (callers retry, never treat as not-found)."""
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.get(
+                    f"{self._base}/organizations/{self._org}/shortids/{short_id}/",
+                    headers=self._headers,
+                )
+                if r.status_code == 404:
+                    return ""
+                r.raise_for_status()
+                gid = (r.json() or {}).get("groupId")
+                return str(gid) if gid else ""
+        except Exception:
+            log.exception("short id resolution failed for %s", short_id)
+            return None
+
     async def issue(self, issue_id: str) -> dict:
         async with httpx.AsyncClient(timeout=30) as client:
             r = await client.get(

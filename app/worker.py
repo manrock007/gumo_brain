@@ -822,21 +822,28 @@ class Worker:
             return why
 
         if kind == "sentry":
-            if not arg.isdigit():
-                why = reject("a sentry adoption needs the numeric issue id: "
-                             "'[sentry 123456] title'")
+            issue_id = arg if arg.isdigit() else None
+            if issue_id is None and arg:
+                resolved = await self.sentry.resolve_short_id(arg.upper())
+                if resolved is None:
+                    return  # transient Sentry failure — retry next scan, no pin
+                issue_id = resolved or None
+            if not issue_id:
+                why = reject("a sentry adoption needs the issue id or short code: "
+                             f"'[sentry 123456] title' or '[sentry WEB-3Y] title'"
+                             + (f" — '{arg}' did not resolve" if arg else ""))
                 await self.clickup.comment(task_id, f"{GATE_PREFIX} could not adopt: {why}")
                 return
-            decision = self.intake(arg, source="clickup", forced=True, title=title)
+            decision = self.intake(issue_id, source="clickup", forced=True, title=title)
             if "queued" in decision:
                 # attach BEFORE any await so the run adopts this ticket instead
                 # of creating its own
-                self.store.set_fields(arg, clickup_task_id=task_id,
+                self.store.set_fields(issue_id, clickup_task_id=task_id,
                                       clickup_task_url=task_url)
             else:
                 reject(decision)  # pin the ticket, or the scan re-comments forever
             await self.clickup.comment(task_id, f"{GATE_PREFIX} 📥 {decision}")
-            log.info("clickup intake: sentry %s from ticket %s (%s)", arg, task_id, decision)
+            log.info("clickup intake: sentry %s from ticket %s (%s)", issue_id, task_id, decision)
             return
 
         pm = PROJECT_LINE_RE.search(desc)

@@ -88,6 +88,52 @@ class TestClickUpIntake:
         asyncio.run(worker._poll_intake())  # second scan: silent
         assert len(worker.clickup.comments_posted) == 1
 
+    def test_sentry_short_code_resolves(self, worker):
+        """Humans know issues as WEB-3Y, the API wants the group id — the scan
+        resolves short codes through the Sentry client."""
+        worker.clickup = FakeClickUp(tasks=[_cu_task("ts1", "[sentry WEB-3Y] null split")])
+
+        async def resolve(short_id):
+            assert short_id == "WEB-3Y"
+            return "6650001234"
+
+        worker.sentry.resolve_short_id = resolve
+        asyncio.run(worker._poll_intake())
+        job = worker.store.get("6650001234")
+        assert job is not None and job["kind"] == "sentry"
+        assert job["clickup_task_id"] == "ts1"
+
+    def test_sentry_unknown_short_code_rejects(self, worker):
+        worker.clickup = FakeClickUp(tasks=[_cu_task("ts2", "[sentry NOPE-1] ghost")])
+
+        async def resolve(short_id):
+            return ""  # definitively unknown (404)
+
+        worker.sentry.resolve_short_id = resolve
+        asyncio.run(worker._poll_intake())
+        assert worker.store.get("cu-ts2")["status"] == "skipped"
+        assert "did not resolve" in worker.store.get("cu-ts2")["detail"]
+
+    def test_sentry_resolution_outage_retries(self, worker):
+        """A transient Sentry failure must NOT pin the ticket — the next scan
+        retries the resolution."""
+        worker.clickup = FakeClickUp(tasks=[_cu_task("ts3", "[sentry WEB-3Y] flaky")])
+
+        async def resolve(short_id):
+            return None  # transient failure
+
+        worker.sentry.resolve_short_id = resolve
+        asyncio.run(worker._poll_intake())
+        assert worker.store.get("cu-ts3") is None       # not pinned
+        assert worker.clickup.comments_posted == []      # not commented
+
+        async def resolve_ok(short_id):
+            return "6650009999"
+
+        worker.sentry.resolve_short_id = resolve_ok
+        asyncio.run(worker._poll_intake())               # retry succeeds
+        assert worker.store.get("6650009999") is not None
+
     def test_unmapped_project_rejects_once_with_reason(self, worker):
         worker.clickup = FakeClickUp(
             tasks=[_cu_task("t5", "[fix] broken thing")],
