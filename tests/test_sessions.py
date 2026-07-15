@@ -140,6 +140,44 @@ class TestRunClaudeStream:
         assert raw.status == "timeout"
         assert leftovers == []
 
+    def test_interrupt_event_stops_the_run_resumable(self, tmp_path):
+        """A tripped interrupt event kills the CLI mid-run and returns 'interrupted'
+        with the engine-owned session id, so the caller can resume it. No task
+        (pump/stderr/steer) is left pending."""
+        s = _settings(tmp_path, _fake_claude(tmp_path, "sleep 30"))
+
+        async def run():
+            ev = asyncio.Event()
+
+            async def trip():
+                await asyncio.sleep(0.2)
+                ev.set()
+
+            raw, _ = await asyncio.gather(
+                run_claude_stream(s, str(tmp_path), "q", ["Read"], 30,
+                                  session_id="engine-uuid", interrupt_event=ev),
+                trip())
+            leftovers = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+            return raw, leftovers
+
+        raw, leftovers = asyncio.run(run())
+        assert raw.status == "interrupted"
+        assert raw.meta["session_id"] == "engine-uuid"
+        assert leftovers == []
+
+    def test_interrupt_event_untripped_completes_normally(self, tmp_path):
+        """An interrupt event that never fires must not change the result contract."""
+        s = _settings(tmp_path, _fake_claude(tmp_path, STREAM_SCRIPT))
+
+        async def run():
+            ev = asyncio.Event()
+            return await run_claude_stream(s, str(tmp_path), "q", ["Read"], 30,
+                                           interrupt_event=ev)
+
+        raw = asyncio.run(run())
+        assert raw.status == "ok"
+        assert raw.text == "the answer"
+
 
 class TestJanitorBothStores:
     def _mk_transcript(self, config_dir: str, sid: str, age_days: float):

@@ -14,9 +14,16 @@ live SSE streaming. Typed gate answers and chat drafts survive re-renders
 The visual system is a single set of CSS custom properties (surfaces, lines,
 semantic status colors, radii). Card status classes stay the raw job status
 (e.g. `awaiting_input`) so the CSS hooks match; only the human-facing label is
-prettified via STATUS_LABEL. A dedicated live-session page (drop into a
-running stage, watch it work, steer mid-run) is the next increment and slots
-onto the same card IA.
+prettified via STATUS_LABEL.
+
+Clicking a feature card opens the full-screen live session view (hash-routed
+`#/job/<id>`): a live activity stream of the running stage (SSE from
+`api/jobs/{id}/session/stream`), the P0-P9 stage timeline, gate decisions, the
+current branch artifact, and a steer console. The steer console posts to
+`api/jobs/{id}/session/steer` — with session persistence on it interrupts the
+running stage and resumes it with the note folded in; otherwise the note is
+queued to the next checkpoint. The durable frame comes from
+`api/jobs/{id}/session`; the stream is pure UX on top of it.
 
 NOTE: this module is one big Python string. It deliberately contains NO
 backslashes — JS regexes are built with `new RegExp` + `String.fromCharCode`,
@@ -202,6 +209,54 @@ DASHBOARD_HTML = """<!doctype html>
   .brain button:disabled { opacity:.5; }
   .empty { color:var(--muted); font-size:12.5px; padding:8px 4px; }
   .ok-t { color:var(--ok); } .err-t { color:var(--err); } .muted-t { color:var(--muted); }
+
+  /* ---------- live session view (full-screen, hash-routed #/job/<id>) ---------- */
+  a.t { color:var(--fg); text-decoration:none; }
+  a.t:hover { color:var(--accent); }
+  .sv { position:fixed; inset:0; z-index:40; background:var(--bg); display:flex; flex-direction:column; overflow:hidden; }
+  .sv[hidden] { display:none; }
+  .sv-top { display:flex; align-items:center; gap:14px; padding:12px 22px; border-bottom:1px solid var(--line); background:var(--bg); }
+  .sv-back { display:inline-flex; align-items:center; gap:6px; padding:6px 13px; border:1px solid var(--line-2); border-radius:var(--r-sm); background:var(--surface-2); color:var(--fg); cursor:pointer; font:inherit; font-size:13px; font-weight:600; }
+  .sv-back:hover { border-color:var(--accent); }
+  .sv-title { font-weight:650; font-size:15px; letter-spacing:-.01em; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0; }
+  .sv-top .badge { flex-shrink:0; }
+  .sv-strip { flex:0 0 200px; }
+  .sv-links { margin-left:auto; display:flex; gap:16px; font-size:13px; font-weight:550; flex-shrink:0; }
+  .sv-body { flex:1; display:grid; grid-template-columns:290px minmax(0,1fr) minmax(0,380px); overflow:hidden; }
+  .sv-col { overflow:auto; padding:16px 18px; }
+  .sv-col.left { border-right:1px solid var(--line); }
+  .sv-col.right { border-left:1px solid var(--line); }
+  .sv-col.center { display:flex; flex-direction:column; padding:0; overflow:hidden; }
+  .sv-h { font-size:11px; text-transform:uppercase; letter-spacing:.07em; color:var(--muted); font-weight:650; margin:0 0 12px; }
+  .sv-col.left .sv-h.mt { margin-top:24px; }
+  .tl { list-style:none; margin:0; padding:0; }
+  .tl li { display:flex; gap:10px; align-items:baseline; padding:7px 2px; border-bottom:1px solid var(--line); font-size:12.5px; }
+  .tl li:last-child { border-bottom:0; }
+  .tl .st { font-family:var(--mono); color:var(--fg-2); width:30px; flex-shrink:0; }
+  .tl .nm { flex:1; min-width:0; }
+  .tl .meta { color:var(--muted); font-size:11px; font-family:var(--mono); }
+  .tl li.cur { color:var(--accent); }
+  .tl li.cur .st { color:var(--accent); }
+  .gd { font-size:12.5px; padding:8px 0; border-bottom:1px solid var(--line); }
+  .gd .meta { display:block; color:var(--muted); font-size:11px; font-family:var(--mono); margin-bottom:3px; }
+  .sv-stream { flex:1; overflow:auto; padding:18px 22px; display:flex; flex-direction:column; gap:9px; }
+  .sv-stream .lead { color:var(--muted); font-size:12.5px; }
+  .ev { font-size:13px; line-height:1.55; }
+  .ev.status { font-family:var(--mono); font-size:11.5px; color:var(--muted); display:flex; gap:8px; align-items:baseline; }
+  .ev.status::before { content:"›"; color:var(--accent); font-weight:700; }
+  .ev.text { white-space:pre-wrap; overflow-wrap:anywhere; color:var(--fg); background:var(--surface); border:1px solid var(--line); border-radius:var(--r-sm); padding:10px 13px; }
+  .ev.human { align-self:flex-end; max-width:80%; background:linear-gradient(135deg,var(--accent),var(--accent-2)); color:#fff; border-radius:12px 12px 4px 12px; padding:9px 13px; }
+  .ev.done { color:var(--ok); font-size:12px; font-weight:650; }
+  .sv-steer { border-top:1px solid var(--line); padding:12px 20px; background:var(--bg); }
+  .sv-steer textarea { width:100%; padding:9px 12px; border:1px solid var(--line); border-radius:var(--r-sm); background:var(--surface-2); color:var(--fg); font:inherit; font-size:13px; resize:vertical; min-height:48px; }
+  .sv-steer textarea:focus { outline:0; border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-weak); }
+  .sv-steer .row { display:flex; gap:14px; align-items:center; margin-top:8px; }
+  .sv-steer button { padding:9px 22px; border:0; border-radius:var(--r-sm); background:linear-gradient(135deg,var(--accent),var(--accent-2)); color:#fff; cursor:pointer; font:inherit; font-size:13px; font-weight:650; }
+  .sv-steer button:disabled { opacity:.5; cursor:default; }
+  .sv-steer .note { font-size:12px; color:var(--muted); }
+  .sv-art select { width:100%; padding:8px 11px; border:1px solid var(--line); border-radius:var(--r-sm); background:var(--surface-2); color:var(--fg); font:inherit; font-size:13px; margin-bottom:10px; }
+  .sv-art pre { white-space:pre-wrap; overflow-wrap:anywhere; font:11.5px/1.6 var(--mono); background:var(--bg-2); border:1px solid var(--line); border-radius:var(--r-sm); padding:12px; color:var(--fg-2); margin:0; }
+  @media (max-width:960px) { .sv-body { grid-template-columns:1fr; } .sv-col.left,.sv-col.right { border:0; border-bottom:1px solid var(--line); } .sv-strip,.sv-links { display:none; } }
 </style>
 </head>
 <body>
@@ -272,6 +327,38 @@ DASHBOARD_HTML = """<!doctype html>
   <div class="col"><h2>Completed <span class="count" id="count-completed">0</span></h2><div id="completed"></div></div>
 </div>
 </main>
+
+<div id="sv" class="sv" hidden>
+  <div class="sv-top">
+    <button class="sv-back" onclick="closeSession()">&larr; Board</button>
+    <span class="sv-title" id="sv-title">&hellip;</span>
+    <span class="badge" id="sv-status"></span>
+    <span class="sv-links" id="sv-links"></span>
+  </div>
+  <div class="sv-body">
+    <div class="sv-col left">
+      <div class="sv-h">Stage timeline</div>
+      <ul class="tl" id="sv-timeline"><li class="lead">&hellip;</li></ul>
+      <div class="sv-h mt">Gate decisions</div>
+      <div id="sv-guidance"><div class="empty">none yet</div></div>
+    </div>
+    <div class="sv-col center">
+      <div class="sv-stream" id="sv-stream"><div class="lead">Live activity appears here while a stage runs. Drop a steer below to course-correct mid-run.</div></div>
+      <div class="sv-steer">
+        <textarea id="sv-note" placeholder="Steer the run — describe the course correction&hellip;"></textarea>
+        <div class="row">
+          <button id="sv-send" onclick="steer()">Steer</button>
+          <span class="note" id="sv-steer-note"></span>
+        </div>
+      </div>
+    </div>
+    <div class="sv-col right sv-art">
+      <div class="sv-h">Current artifact</div>
+      <select id="sv-art-sel" onchange="svShowArtifact()"></select>
+      <pre id="sv-art-body"></pre>
+    </div>
+  </div>
+</div>
 <script>
 const GROUPS = {
   pending: ['received', 'queued'],
@@ -379,9 +466,14 @@ function card(j) {
     stats = `<details class="stats" data-key="${id}:stats" data-job="${id}"><summary>stats</summary>
       <div class="stats-body" id="stats-${id}"><div class="empty">&hellip;</div></div></details>`;
   }
+  // feature cards deep-link into the full-screen session view (#/job/<id>);
+  // the hashchange listener opens it — a real link, so middle-click opens a tab
+  const title = j.kind === 'feature'
+    ? `<a class="t" href="#/job/${encodeURIComponent(j.issue_id)}" title="Open the live session">${esc(j.title || j.issue_id)}</a>`
+    : `<div class="t">${esc(j.title || j.issue_id)}</div>`;
   return `<div class="job" data-status="${esc(j.status)}" data-kind="${esc(j.kind)}">
     <div class="job-head">
-      <div class="t">${esc(j.title || j.issue_id)}</div>
+      ${title}
       <span class="badge ${esc(j.status)}">${esc(STATUS_LABEL[j.status] || j.status)}</span>
     </div>
     <div class="m">${kind}<span class="proj">${esc(j.project)}</span>${score}${phase}${owner}</div>
@@ -869,7 +961,199 @@ async function answer(id, action, btn) {
   btn.disabled = false;
 }
 
-loadProjects(); refresh(true); refreshMemory(true);
+// ---------- live session view (drop in, observe, steer mid-run) ----------
+// A full-screen, hash-routed overlay (#/job/<id>) over the single-page board:
+// live activity stream (SSE), stage timeline, current artifact, steer console.
+
+let svId = null;          // job id currently open, or null
+let svArtifacts = [];     // [{name, content, truncated}]
+let svArtName = '';       // remembered artifact selection across refreshes
+let svStream = null;      // EventSource for the live run
+let svPoll = null;        // snapshot poll handle
+let svLiveText = null;    // the currently-growing assistant-text bubble
+
+const JOB_HASH_RE = new RegExp('^#/job/(.+)$');
+function routeHash() {
+  const m = (location.hash || '').match(JOB_HASH_RE);
+  if (m) openSession(decodeURIComponent(m[1])); else closeSession();
+}
+
+function openSession(id) {
+  const sv = document.getElementById('sv');
+  if (svId !== id) {  // fresh job: reset the stream log
+    svId = id;
+    document.getElementById('sv-stream').innerHTML =
+      '<div class="lead">Live activity appears here while a stage runs. Drop a steer below to course-correct mid-run.</div>';
+    svLiveText = null; svArtName = '';
+  }
+  sv.hidden = false;
+  document.body.style.overflow = 'hidden';
+  loadSession(id);
+  startSessionStream(id);
+  if (svPoll) clearInterval(svPoll);
+  svPoll = setInterval(() => loadSession(id), 5000);
+}
+
+function closeSession() {
+  const sv = document.getElementById('sv');
+  if (sv) sv.hidden = true;
+  document.body.style.overflow = '';
+  stopSessionStream();
+  if (svPoll) { clearInterval(svPoll); svPoll = null; }
+  svId = null;
+  if ((location.hash || '').indexOf('#/job/') === 0)
+    history.replaceState(null, '', location.pathname + location.search);
+}
+
+async function loadSession(id) {
+  try {
+    const r = await fetch('api/jobs/' + encodeURIComponent(id) + '/session');
+    if (!r.ok) { if (r.status === 404 || r.status === 409) closeSession(); return; }
+    renderSession(await r.json());
+  } catch (e) { /* keep the last frame; the SSE stream carries liveness */ }
+}
+
+function renderSession(data) {
+  const j = data.job || {};
+  document.getElementById('sv-title').textContent = j.title || j.issue_id || '';
+  const st = document.getElementById('sv-status');
+  st.className = 'badge ' + esc(j.status);
+  st.textContent = STATUS_LABEL[j.status] || j.status;
+  let links = '';
+  if (j.clickup_task_url) links += `<a href="${esc(j.clickup_task_url)}" target="_blank">ClickUp</a>`;
+  if (j.pr_url) links += `<a href="${esc(j.pr_url)}" target="_blank">PR</a>`;
+  document.getElementById('sv-links').innerHTML = links;
+
+  renderTimeline(data.runs || [], j.stage);
+
+  const g = (data.guidance || []).slice().reverse();
+  document.getElementById('sv-guidance').innerHTML = g.length
+    ? g.map(e => `<div class="gd"><span class="meta">P${esc(String(e.stage))} &middot; ${esc(e.action)} &middot; ${esc(e.via)}</span>${esc((e.text || '').slice(0, 400))}</div>`).join('')
+    : '<div class="empty">none yet</div>';
+
+  svArtifacts = data.artifacts || [];
+  const sel = document.getElementById('sv-art-sel');
+  sel.innerHTML = svArtifacts.length
+    ? svArtifacts.map((a, i) => `<option value="${i}">${esc(a.name)}</option>`).join('')
+    : '<option value="-1">no artifacts yet</option>';
+  let idx = svArtifacts.findIndex(a => a.name === svArtName);
+  if (idx < 0) idx = svArtifacts.findIndex(a => a.name.indexOf('P' + j.stage + '-') === 0);
+  if (idx < 0) idx = 0;
+  sel.value = String(Math.max(0, idx));
+  svShowArtifact();
+
+  const running = j.status === 'running' || data.live;
+  document.getElementById('sv-steer-note').textContent = running
+    ? (data.steer_immediate
+        ? 'Interrupts the run and resumes the same session with your note.'
+        : 'Queued to the next checkpoint (session persistence is off).')
+    : 'Not running — your note is saved as guidance for the next stage.';
+}
+
+function renderTimeline(runs, curStage) {
+  const by = {};
+  for (const r of runs) {  // aggregate per stage; last status wins
+    const s = by[r.stage] || (by[r.stage] = { n: 0, dur: 0, cost: 0, status: '' });
+    s.n += 1; s.dur += r.duration_ms || 0; s.cost += r.cost_usd || 0;
+    if (r.result_status) s.status = r.result_status;
+  }
+  const el = document.getElementById('sv-timeline');
+  const stages = Object.keys(by).map(Number).sort((a, b) => a - b);
+  if (!stages.length) { el.innerHTML = '<li class="lead">no stage runs yet</li>'; return; }
+  el.innerHTML = stages.map(stg => {
+    const s = by[stg];
+    const cur = stg === Number(curStage) ? ' cur' : '';
+    const tries = s.n > 1 ? s.n + '&times; ' : '';
+    return `<li class="${cur}"><span class="st">P${stg}</span>
+      <span class="nm"><b>${esc(STAGE_NAMES[stg] || '')}</b> <span class="meta">${tries}${esc(s.status || '')}</span></span>
+      <span class="meta">${fmtMMSS(s.dur)} &middot; $${s.cost.toFixed(2)}</span></li>`;
+  }).join('');
+}
+
+function svShowArtifact() {
+  const sel = document.getElementById('sv-art-sel');
+  const body = document.getElementById('sv-art-body');
+  const a = svArtifacts[Number(sel.value)];
+  if (!a) { body.textContent = ''; return; }
+  svArtName = a.name;
+  body.textContent = (a.content || '(empty)') + (a.truncated ? '… (truncated)' : '');
+}
+
+function svLog() { return document.getElementById('sv-stream'); }
+function svClearLead() { const l = svLog().querySelector('.lead'); if (l) l.remove(); }
+
+function startSessionStream(id) {
+  stopSessionStream();
+  if (typeof EventSource === 'undefined') return;
+  const es = new EventSource('api/jobs/' + encodeURIComponent(id) + '/session/stream');
+  svStream = es;
+  es.addEventListener('status', (e) => svStatus(svData(e)));
+  es.addEventListener('delta', (e) => svDelta(svData(e)));
+  es.addEventListener('done', () => svDone());
+  es.onerror = () => { /* the 5s snapshot poll keeps the frame fresh */ };
+}
+function stopSessionStream() {
+  if (svStream) { try { svStream.close(); } catch (e) { /* closed */ } svStream = null; }
+}
+function svData(e) { try { return JSON.parse(e.data).t || ''; } catch (x) { return ''; } }
+
+function svStatus(t) {
+  if (!t) return;
+  svClearLead(); svLiveText = null;
+  const d = document.createElement('div'); d.className = 'ev status'; d.textContent = t;
+  const log = svLog(); log.appendChild(d); log.scrollTop = log.scrollHeight;
+}
+function svDelta(t) {
+  if (!t) return;
+  svClearLead();
+  const log = svLog();
+  if (!svLiveText) { svLiveText = document.createElement('div'); svLiveText.className = 'ev text'; log.appendChild(svLiveText); }
+  svLiveText.textContent += t; log.scrollTop = log.scrollHeight;
+}
+function svDone() {
+  svLiveText = null;
+  const d = document.createElement('div'); d.className = 'ev done'; d.textContent = 'run finished';
+  const log = svLog(); log.appendChild(d); log.scrollTop = log.scrollHeight;
+}
+
+async function steer() {
+  if (!svId) return;
+  const box = document.getElementById('sv-note');
+  const text = (box.value || '').trim();
+  const noteEl = document.getElementById('sv-steer-note');
+  if (!text) return;
+  const btn = document.getElementById('sv-send'); btn.disabled = true;
+  try {
+    const r = await fetch('api/jobs/' + encodeURIComponent(svId) + '/session/steer', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({note: text}),
+    });
+    let data = {}; try { data = await r.json(); } catch (e2) { /* non-JSON */ }
+    if (r.status === 202) {
+      svClearLead();
+      const d = document.createElement('div'); d.className = 'ev human'; d.textContent = text;
+      const log = svLog(); log.appendChild(d); log.scrollTop = log.scrollHeight;
+      box.value = '';
+      noteEl.textContent = data.status === 'interrupting'
+        ? 'Interrupting the run — it will resume with your steer.'
+        : 'Saved — it will be applied at the next checkpoint.';
+    } else {
+      noteEl.textContent = 'Steer: ' + (data.detail || r.status);
+    }
+  } catch (e) { noteEl.textContent = 'Steer error: ' + e; }
+  btn.disabled = false;
+}
+
+// Cmd/Ctrl+Enter sends a steer; Escape closes the view (unless mid-typing)
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && document.activeElement
+      && document.activeElement.id === 'sv-note') { e.preventDefault(); steer(); }
+  else if (e.key === 'Escape' && svId
+      && (!document.activeElement || document.activeElement.id !== 'sv-note')) closeSession();
+});
+window.addEventListener('hashchange', routeHash);
+
+loadProjects(); refresh(true); refreshMemory(true); routeHash();
 setInterval(() => refresh(false), 10000);
 setInterval(() => refreshMemory(false), 60000);
 </script>

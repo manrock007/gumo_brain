@@ -320,13 +320,20 @@ async def run_claude_stream(settings: Settings, workspace: str, prompt: str,
                             session_id: str | None = None,
                             fork_session: bool = False,
                             config_dir: str | None = None,
-                            on_event=None) -> RawRunResult:
+                            on_event=None,
+                            interrupt_event=None) -> RawRunResult:
     """run_claude_raw with live progress (docs/CONVERSATIONS.md §5): the CLI
     runs in stream-json mode and each event is surfaced through on_event as it
     happens — ("status", "Read app/x.py") per tool call, ("delta", text) per
     assistant text block. The RETURN contract is identical to run_claude_raw
     (same statuses, same meta, same session-id fallback rules); on_event is
-    best-effort UX and never affects the result."""
+    best-effort UX and never affects the result.
+
+    interrupt_event (optional asyncio.Event) enables mid-run human steering: when
+    it is set, the CLI is killed and the run returns status "interrupted" with the
+    (engine-owned, still resumable) session id — the caller resumes that session
+    with the steer note folded in. The partial work already streamed stays on the
+    branch; killing the CLI never orphans it (the session transcript persists)."""
     on_event = on_event or (lambda event, data: None)
     cmd, env = _claude_cmd_env(settings, prompt, allowed_tools, resume_session,
                                disallowed_tools, session_id, fork_session,
@@ -367,8 +374,33 @@ async def run_claude_stream(settings: Settings, workspace: str, prompt: str,
                 result_env = ev
 
     stderr_task = asyncio.create_task(proc.stderr.read())
+    pump_task = asyncio.create_task(_pump())
+    steer_task = asyncio.create_task(interrupt_event.wait()) if interrupt_event else None
+    waiters = {pump_task} | ({steer_task} if steer_task else set())
+
+    async def _reap():  # kill + drain both readers + the child; leaves no zombie
+        pump_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await pump_task
+        proc.kill()
+        stderr_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await stderr_task
+        with contextlib.suppress(asyncio.CancelledError):
+            await proc.wait()
+
     try:
-        await asyncio.wait_for(_pump(), timeout=timeout)
+        done, _ = await asyncio.wait(waiters, timeout=timeout,
+                                     return_when=asyncio.FIRST_COMPLETED)
+        if not done:
+            raise asyncio.TimeoutError  # nothing finished within the budget
+        if steer_task is not None and steer_task in done and pump_task not in done:
+            # human interrupted mid-run: stop the CLI, keep the session resumable
+            await _reap()
+            log.info("claude stream run interrupted by steer (session %s)", session_id)
+            return RawRunResult("interrupted", "interrupted by human steer",
+                                {"session_id": session_id or resume_session})
+        pump_task.result()  # pump finished — re-raise any pump exception
         try:
             # stdout is closed; a healthy CLI exits promptly — never wait forever
             await asyncio.wait_for(proc.wait(), timeout=30)
@@ -376,23 +408,19 @@ async def run_claude_stream(settings: Settings, workspace: str, prompt: str,
             proc.kill()
             await proc.wait()
     except asyncio.TimeoutError:
-        proc.kill()
-        stderr_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await stderr_task  # reap the reader — a bare cancel leaves it pending
-        await proc.wait()      # reap the child — kill alone leaves a zombie
+        await _reap()
         log.error("claude stream run timed out after %ss", timeout)
         return RawRunResult("timeout", f"timed out after {timeout}s",
                             {"session_id": session_id})
     except asyncio.CancelledError:
         # graceful shutdown must never orphan a live claude that later pushes
-        proc.kill()
-        stderr_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await stderr_task
-        with contextlib.suppress(asyncio.CancelledError):
-            await proc.wait()
+        await _reap()
         raise
+    finally:
+        if steer_task is not None and not steer_task.done():
+            steer_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await steer_task
     try:
         stderr = (await asyncio.wait_for(stderr_task, timeout=10)).decode(errors="replace")
     except (asyncio.TimeoutError, asyncio.CancelledError):

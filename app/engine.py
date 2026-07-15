@@ -14,6 +14,7 @@ import uuid
 from pathlib import Path
 
 from .artifacts import ArtifactSync, artifact_path, feature_dir, list_artifacts, normalize
+from .chatstream import ChatBroker
 from .clickup import ClickUp
 from .config import Settings
 from .db import JobStore
@@ -126,6 +127,34 @@ class Engine:
         self.locks = locks or RepoLocks()
         self.sync = ArtifactSync(store, clickup, settings.clickup_mirror_max_chars)
         self.memory = MemoryReader(settings, locks=self.locks)
+        # live session observation: a stage run streams its tool calls / text here,
+        # keyed by job id. A SECOND broker instance (chat has its own) so a gate
+        # chat turn and a live stage run never clobber each other's buffer.
+        self.stage_broker = ChatBroker()
+        # per-job mid-run steer handles: job_id -> {event, stage}. Populated while a
+        # stage runs; an HTTP steer request sets the event to interrupt in place.
+        self._steer: dict[str, dict] = {}
+
+    def request_steer(self, job_id: str, note: str) -> str:
+        """Human course-correction from the live session page. Returns the outcome:
+        'interrupting' — a stage is running and session persistence is on, so the
+        run is interrupted and will resume the same session with `note` folded in;
+        'queued' — otherwise (no persistence, or not running): the note is recorded
+        as guidance and applied at the next stage/gate (the safe fallback)."""
+        note = (note or "").strip()
+        if not note:
+            return "empty"
+        handle = self._steer.get(job_id)
+        if handle and self.settings.session_persistence and not handle["event"].is_set():
+            self.store.set_fields(job_id, steer_note=note)
+            handle["event"].set()
+            log.info("job %s: steer requested mid-P%s", job_id, handle["stage"])
+            return "interrupting"
+        # fallback: record as guidance so the next run/gate sees it
+        stage = handle["stage"] if handle else int(self.store.get(job_id).get("stage") or 0)
+        self.store.guidance_add(job_id, stage, "steer", note, "dashboard")
+        log.info("job %s: steer queued to next checkpoint (P%s)", job_id, stage)
+        return "queued"
 
     # ---------- the one entry point ----------
 
@@ -151,12 +180,23 @@ class Engine:
         # to a fresh run (head moved, budget spent, transcript pruned)
         self.store.set_fields(job_id, run_started_at=time.time(), stage_attempts=attempt)
         job["stage_attempts"] = attempt  # keep the local view consistent for _park
+
+        # register the live-session hooks: an interrupt event the session page can
+        # trip to steer mid-run, and a broker turn the page streams tool calls from.
+        steer_ev = asyncio.Event()
+        self._steer[job_id] = {"event": steer_ev, "stage": stage}
+        self.stage_broker.start(job_id)
+
+        def publish(event, data):
+            self.stage_broker.publish(job_id, event, data)
+
         self.store.set_status(job_id, "running")
         await self.clickup.set_status(job.get("clickup_task_id") or "", "running")
 
         try:
             return await self._run_stage_inner(job, stage, run_id, target, branch,
-                                               queued_at, resuming)
+                                               queued_at, resuming,
+                                               publish=publish, interrupt_event=steer_ev)
         except BranchLostError as e:
             self.store.stage_run_close(run_id, "branch_lost")
             self.store.set_status(job_id, "error", detail=str(e))
@@ -166,13 +206,18 @@ class Engine:
             # close the telemetry row before the worker's generic error handling
             self.store.stage_run_close(run_id, "exception")
             raise
+        finally:
+            self._steer.pop(job_id, None)
+            self.stage_broker.finish(job_id)
 
     async def _run_stage_inner(self, job: dict, stage: int, run_id: int, target,
                                branch: str, queued_at: float | None,
-                               resuming: bool = False):
+                               resuming: bool = False, publish=None, interrupt_event=None):
         job_id = job["issue_id"]
+        publish = publish or (lambda event, data: None)
         state = self.store.stage_state_get(job_id, stage) or {"attempts": 0, "base_sha": ""}
         attempt = int(job.get("stage_attempts") or int(state["attempts"]) + 1)
+        publish("status", "preparing the branch workspace")
         workspace = await prepare_feature_workspace(self.settings, target, branch, stage)
 
         # STAGE_ASK resume validation happens against the PRE-pull origin head so a
@@ -183,7 +228,9 @@ class Engine:
             code, oh = await git(workspace, "rev-parse", f"origin/{branch}")
             if code != 0 or oh.strip() != (job.get("resume_head") or ""):
                 resuming, resume_reason = False, "the branch moved while parked"
-            elif int(job.get("ask_count") or 0) >= self.settings.max_asks_per_stage:
+            elif (job.get("gate_kind") != "steer"
+                  and int(job.get("ask_count") or 0) >= self.settings.max_asks_per_stage):
+                # a human steer is not rate-limited by the STAGE_ASK budget
                 resuming, resume_reason = False, "the ask budget for this stage is spent"
             elif not session_transcript_exists(self.settings, job.get("resume_session_id") or ""):
                 resuming, resume_reason = False, "the session transcript is gone (restart/prune)"
@@ -235,23 +282,28 @@ class Engine:
 
         ask_answer = (job.get("resume_answer") or "").strip()
         resume_sid = (job.get("resume_session_id") or "").strip()
+        resume_kind = job.get("gate_kind")  # 'ask' | 'steer' — captured before the clear
         # consume the pending resume exactly once, whichever path runs
-        if resume_sid or job.get("gate_kind") == "ask":
+        if resume_sid or resume_kind in ("ask", "steer"):
             self.store.set_fields(job_id, resume_session_id="", resume_stage=None,
                                   resume_attempt=None, resume_head="", resume_answer="",
                                   gate_kind="")
         if resuming:
-            prompt = self._resume_message(job, stage, ask_answer, edited)
-            log.info("job %s: resuming P%s session %s", job_id, stage, resume_sid[:8])
-            raw = await self._invoke(workspace, prompt, tools, timeout, resume_session=resume_sid)
+            prompt = self._resume_message(job, stage, ask_answer, edited, resume_kind)
+            log.info("job %s: resuming P%s session %s (%s)", job_id, stage, resume_sid[:8],
+                     resume_kind or "ask")
+            publish("status", "resuming the session with your steer"
+                    if resume_kind == "steer" else "resuming the session with your answer")
+            raw = await self._invoke(workspace, prompt, tools, timeout, resume_session=resume_sid,
+                                     publish=publish, interrupt_event=interrupt_event)
             if raw.status == "session_lost":
                 resuming, resume_reason = False, "the session could not be resumed"
             else:
-                # only now is this run truly a continuation of the parked session —
-                # and only now does it consume the ask budget (a lost session falls
-                # back to a fresh run and must not burn a resume that never happened)
+                # only now is this run truly a continuation of the parked session.
+                # A STAGE_ASK resume consumes the ask budget; a human steer does not.
                 self.store.stage_run_mark_resumed(run_id)
-                self.store.set_fields(job_id, ask_count=int(job.get("ask_count") or 0) + 1)
+                if resume_kind != "steer":
+                    self.store.set_fields(job_id, ask_count=int(job.get("ask_count") or 0) + 1)
         if not resuming:
             if resume_reason and ask_answer:
                 # the human's answer must survive the downgrade to a fresh re-run
@@ -261,7 +313,16 @@ class Engine:
             prompt = await self._build_prompt(job, stage, target, branch, workspace,
                                               redo_notes, edited)
             log.info("job %s: running P%s (%s) attempt %s", job_id, stage, stage_name(stage), attempt)
-            raw = await self._invoke(workspace, prompt, tools, timeout)
+            publish("status", f"running P{stage} {stage_name(stage)} (attempt {attempt})")
+            raw = await self._invoke(workspace, prompt, tools, timeout,
+                                     publish=publish, interrupt_event=interrupt_event)
+
+        # a human tripped the steer event mid-run: the CLI was stopped with the
+        # session intact — checkpoint the work so far and re-enqueue to resume it
+        # with the steer note folded in (reuses the STAGE_ASK resume machinery).
+        if raw and raw.status == "interrupted":
+            return await self._steer_reenqueue(job, stage, run_id, attempt, workspace,
+                                               branch, raw, publish)
 
         try:
             # propagate the result: a light-mode auto-advance returns "requeue",
@@ -515,41 +576,97 @@ class Engine:
 
     async def _invoke(self, workspace, prompt, tools, timeout,
                       resume_session: str | None = None, fork_session: bool = False,
-                      config_dir: str | None = None):
+                      config_dir: str | None = None, publish=None, interrupt_event=None):
         """All stage/session claude invocations funnel here: the engine owns the
         session id on fresh runs (timeout/error runs still have a resumable id on
-        record), and invocations sharing the session store serialize globally."""
+        record), and invocations sharing the session store serialize globally.
+
+        When publish/interrupt_event are supplied (stage runs viewed on the live
+        session page) the run streams via run_claude_stream — same return contract
+        as run_claude_raw — so tool calls surface live and a human can steer it."""
         sid = None
         if resume_session is None and self.settings.session_persistence:
             sid = str(uuid.uuid4())
+        observed = publish is not None or interrupt_event is not None
+
+        async def _go(cdir):
+            if observed:
+                return await run_claude_stream(
+                    self.settings, workspace, prompt, tools, timeout,
+                    resume_session=resume_session, fork_session=fork_session,
+                    session_id=sid, config_dir=cdir,
+                    on_event=publish, interrupt_event=interrupt_event)
+            return await run_claude_raw(self.settings, workspace, prompt, tools, timeout,
+                                        resume_session=resume_session,
+                                        fork_session=fork_session, session_id=sid,
+                                        config_dir=cdir)
+
         if config_dir is None:
             # stage/bootstrap runs touch the stage/default store — ALWAYS serialize:
             # with persistence off that store is ~/.claude, shared with any
             # concurrent chat run (the worker itself is serial, so this only ever
             # waits on chats, never on other stages)
             async with self.locks.claude_global:
-                return await run_claude_raw(self.settings, workspace, prompt, tools, timeout,
-                                            resume_session=resume_session,
-                                            fork_session=fork_session, session_id=sid)
-        return await run_claude_raw(self.settings, workspace, prompt, tools, timeout,
-                                    resume_session=resume_session,
-                                    fork_session=fork_session, session_id=sid,
-                                    config_dir=config_dir)
+                return await _go(None)
+        return await _go(config_dir)
+
+    async def _steer_reenqueue(self, job, stage, run_id, attempt, workspace, branch, raw, publish):
+        """A human steered mid-run: the CLI was stopped with its session intact.
+        Checkpoint the work-in-progress to origin, then set up a resume of that same
+        session with the steer note folded in and re-enqueue. Continuity over a clean
+        slate — the model keeps its half-done work and adjusts course."""
+        job_id = job["issue_id"]
+        sid = (raw.meta or {}).get("session_id") or ""
+        note = (self.store.get(job_id) or {}).get("steer_note") or ""
+        publish("status", "steer received — checkpointing work so far")
+        pushed = await self._checkpoint(workspace, branch, job_id, stage)
+        code, head = await git(workspace, "rev-parse", f"origin/{branch}")
+        head = head.strip() if code == 0 else ""
+        self.store.stage_run_close(run_id, "interrupted", **self._meta(raw))
+        if not (pushed and sid and head):
+            # can't resume safely (push failed / no session / no head) — fall back to
+            # a fresh re-run carrying the note as guidance, so the steer is never lost
+            self.store.guidance_add(job_id, stage, "steer", note, "dashboard")
+            self.store.set_fields(job_id, steer_note="")
+            self.store.set_status(job_id, "queued")
+            await self._comment(job, f"Steer at P{stage}: could not resume in place; "
+                                     "re-running the stage with your note as guidance.")
+            return "requeue"
+        self.store.set_fields(job_id, resume_session_id=sid, resume_stage=stage,
+                              resume_attempt=attempt, resume_head=head, resume_answer=note,
+                              gate_kind="steer", steer_note="")
+        self.store.set_status(job_id, "queued")
+        publish("status", "resuming with your steer")
+        await self._comment(job, f"Steering P{stage} ({stage_name(stage)}) — interrupted mid-run "
+                                 "and resuming the same session with your note.")
+        log.info("job %s: steer-reenqueue P%s session %s", job_id, stage, sid[:8])
+        return "requeue"
 
     def _resume_intended(self, job: dict, stage: int) -> bool:
-        """A pending STAGE_ASK resume exists for exactly this gate (head/budget/
-        transcript validation happens later, in the workspace)."""
-        return bool(job.get("gate_kind") == "ask"
+        """A pending STAGE_ASK answer or mid-run steer exists for exactly this gate
+        (head/budget/transcript validation happens later, in the workspace)."""
+        return bool(job.get("gate_kind") in ("ask", "steer")
                     and (job.get("resume_session_id") or "").strip()
                     and job.get("resume_stage") == stage
                     and (job.get("resume_answer") or "").strip())
 
-    def _resume_message(self, job: dict, stage: int, answer: str, edited: list[str]) -> str:
-        parts = [
-            f"The human answered your STAGE_ASK question at the P{stage} gate:",
-            "",
-            answer,
-        ]
+    def _resume_message(self, job: dict, stage: int, answer: str, edited: list[str],
+                        kind: str = "ask") -> str:
+        if kind == "steer":
+            parts = [
+                f"The human interrupted you mid-run at P{stage} to steer your work:",
+                "",
+                answer,
+                "",
+                "Adjust course accordingly and continue from where you stopped — keep "
+                "the work already done that still applies; revise what the steer changes.",
+            ]
+        else:
+            parts = [
+                f"The human answered your STAGE_ASK question at the P{stage} gate:",
+                "",
+                answer,
+            ]
         chat = self.store.chat_for(job["issue_id"], stage)
         if chat:
             lines, total = [], 0

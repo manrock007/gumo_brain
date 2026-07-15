@@ -430,6 +430,18 @@ class Worker:
         )
         await self.clickup.set_status(task_id, "awaiting_input")
 
+    def request_steer(self, job_id: str, note: str) -> str:
+        """Live mid-run course-correction from the session page. Delegates to the
+        engine, which interrupts the running stage when it can (session persistence
+        on) or records the note as guidance for the next checkpoint otherwise.
+        Returns 'interrupting' | 'queued' | 'empty'."""
+        job = self.store.get(job_id)
+        if job is None:
+            raise KeyError(job_id)
+        if (job.get("kind") or "sentry") != "feature":
+            raise ValueError("steering is only valid for feature pipelines")
+        return self.engine.request_steer(job_id, note)
+
     async def answer_job(self, job_id: str, action: str, text: str, via: str) -> str:
         """Single resolution path for gate answers from BOTH channels.
         Returns the new status. Raises KeyError (unknown), ValueError (invalid
