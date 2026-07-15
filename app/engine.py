@@ -32,6 +32,7 @@ from .feature_prompts import (
 )
 from .fixer import (
     BASE_ALLOWED_TOOLS,
+    PR_LINE_RE,
     BranchLostError,
     git,
     prepare_feature_workspace,
@@ -81,9 +82,8 @@ class RepoLocks:
         lock = self._locks.get(repo)
         return bool(lock and lock.locked())
 
-PR_LINE_RE = re.compile(
-    r"^[\s`*>-]*PR_URL:\s*`?(https://github\.com/[\w./-]+/pull/\d+)`?[\s`]*$", re.MULTILINE
-)
+# PR_LINE_RE (the strict `PR_URL:` line matcher) lives in fixer.py — one
+# definition for both the feature pipeline and the v1 lifecycle capture.
 QUESTION_HEADING_RE = re.compile(r"^#{1,4}\s*(?:open\s+)?questions?\b.*$", re.IGNORECASE | re.MULTILINE)
 BUILD_GROUP_RE = re.compile(r"^#{1,4}\s*build\s+group\b", re.IGNORECASE | re.MULTILINE)
 

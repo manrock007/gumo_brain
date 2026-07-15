@@ -35,15 +35,17 @@ PR_URL: https://github.com/o/r/pull/21
         assert all_pr_urls(text) == [
             "https://github.com/o/r/pull/21", "https://github.com/o/r/pull/22"]
 
-    def test_fixresult_captures_every_pr(self, tmp_path):
+    def test_fixresult_captures_every_explicit_pr(self, tmp_path):
         from app.config import RepoTarget
         from app.fixer import run_claude
 
+        # printf '%s' passes the JSON through verbatim (dash echo mangles the
+        # embedded literal backslash-n escapes)
         script = tmp_path / "fake-claude"
         script.write_text(
             "#!/bin/sh\n"
-            "echo '{\"result\": \"opened https://github.com/o/r/pull/3 and "
-            "https://github.com/o/r/pull/4\"}'\n")
+            "printf '%s' '{\"result\": \"done\\nPR_URL: https://github.com/o/r/pull/3"
+            "\\nPR_URL: https://github.com/o/r/pull/4\"}'\n")
         script.chmod(0o755)
         s = Settings(data_dir=str(tmp_path), claude_binary=str(script))
         res = asyncio.run(run_claude(s, RepoTarget(repo="o/r", base="main"),
@@ -51,6 +53,24 @@ PR_URL: https://github.com/o/r/pull/21
         assert res.status == "pr_opened"
         assert res.pr_urls == ["https://github.com/o/r/pull/3",
                                "https://github.com/o/r/pull/4"]
+
+    def test_prose_mentioned_pr_is_not_captured(self, tmp_path):
+        """Seer PR#10 round 1: a PR merely MENTIONED in prose (context, a related
+        PR) must never enter the lifecycle capture — only explicit `PR_URL:`
+        lines count, or the kickoff would un-draft/review external PRs."""
+        from app.config import RepoTarget
+        from app.fixer import run_claude
+
+        script = tmp_path / "fake-claude"
+        script.write_text(
+            "#!/bin/sh\n"
+            "echo '{\"result\": \"similar to https://github.com/other/repo/pull/99, "
+            "no new PR needed\"}'\n")
+        script.chmod(0o755)
+        s = Settings(data_dir=str(tmp_path), claude_binary=str(script))
+        res = asyncio.run(run_claude(s, RepoTarget(repo="o/r", base="main"),
+                                     str(tmp_path), "fix"))
+        assert res.pr_urls == []  # nothing for record_prs to kick off
 
 
 class TestLifecycleKickoff:
