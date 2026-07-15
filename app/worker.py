@@ -987,9 +987,17 @@ class Worker:
             findings=[{"id": c["id"], "path": c.get("path"),
                        "line": c.get("line") or c.get("original_line"),
                        "body": c.get("body")} for c in findings])
-        async with self.locks.for_repo(target.repo):
+        # a DEDICATED clone + lock, NOT the main repo lock: a fix run can hold a
+        # lock for a full claude timeout, and taking the main one would starve
+        # pipeline stages / sentry jobs on that repo for the duration. The run
+        # mutates only its own clone and pushes to origin, so this is safe by
+        # construction (same pattern as the v1 chat clone); the shepherd lock
+        # just serializes shepherd runs per repo.
+        async with self.locks.for_repo(f"shepherd:{target.repo}"):
             try:
-                workspace = await prepare_feature_workspace(self.settings, target, branch, stage=1)
+                workspace = await prepare_feature_workspace(
+                    self.settings, target, branch, stage=1,
+                    workspace_root=f"{self.settings.workspaces_dir}/shepherd")
             except (BranchLostError, RuntimeError) as e:
                 self.store.pr_set(pr["url"], detail=f"cannot check out {branch}: {str(e)[:160]}")
                 return None

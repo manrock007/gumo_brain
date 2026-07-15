@@ -156,17 +156,21 @@ async def git(workspace: str, *args: str, timeout: int = 300) -> tuple[int, str]
 
 
 async def prepare_feature_workspace(settings: Settings, target: RepoTarget,
-                                    branch: str, stage: int) -> str:
+                                    branch: str, stage: int,
+                                    workspace_root: str | None = None) -> str:
     """Feature stages resume from origin/<branch> — never silently rebuild from base.
 
     Stage 0 creates the branch from origin/<base>. Stage > 0 requires
     origin/<branch> to exist (every stage end pushes it); if it is missing the
     prior artifacts are gone and continuing would build from nothing.
     Raises BranchLostError in that case.
+    workspace_root overrides the clone location — shepherd fix runs use their
+    own clone so they never contend with the job holding the main workspace.
     """
+    root = workspace_root or settings.workspaces_dir
     name = target.repo.split("/")[-1]
-    workspace = str(Path(settings.workspaces_dir) / name)
-    Path(settings.workspaces_dir).mkdir(parents=True, exist_ok=True)
+    workspace = str(Path(root) / name)
+    Path(root).mkdir(parents=True, exist_ok=True)
 
     if not Path(workspace, ".git").exists():
         code, out = await _run(

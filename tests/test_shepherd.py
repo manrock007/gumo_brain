@@ -272,6 +272,39 @@ class TestShepherdFixRun:
                                            {"id": 43, "body": "b", "path": "y"}]))
         assert out == {42: ("FIXED", "guarded None"), 43: ("REBUT", "stale commit")}
 
+    def test_fix_run_does_not_wait_on_the_main_repo_lock(self, store, tmp_path, monkeypatch):
+        """Seer PR#11 round 5: a fix run can hold a lock for a full claude
+        timeout — on the MAIN repo lock that starves pipeline stages for the
+        duration. The shepherd uses its own clone + lock; a fix must complete
+        while the main lock is held."""
+        import app.worker as worker_mod
+        from app.fixer import RawRunResult
+
+        w = _worker(store, tmp_path)
+        pr = _pr(store)
+        roots = {}
+
+        async def fake_ws(settings, target, branch, stage, workspace_root=None):
+            roots["root"] = workspace_root
+            return str(tmp_path)
+
+        async def fake_run(*a, **k):
+            return RawRunResult("ok", "FINDING 42: FIXED — done", {})
+
+        monkeypatch.setattr(worker_mod, "prepare_feature_workspace", fake_ws)
+        monkeypatch.setattr(worker_mod, "run_claude_raw", fake_run)
+        target = w.settings.target_for_repo("manrock007/gumoserver")
+
+        async def run():
+            async with w.locks.for_repo(target.repo):  # a busy pipeline job
+                return await asyncio.wait_for(
+                    w._shepherd_fix(pr, "brain/feat-s1", [{"id": 42, "body": "b"}]),
+                    timeout=5)
+
+        out = asyncio.run(run())
+        assert out == {42: ("FIXED", "done")}
+        assert roots["root"].endswith("/shepherd")  # its own clone, not the main one
+
     def test_unknown_repo_skips(self, store, tmp_path):
         w = _worker(store, tmp_path)
         store.insert("feat-u1", source="manual", kind="feature")
