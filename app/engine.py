@@ -1139,6 +1139,7 @@ class Engine:
         workspace = await prepare_feature_workspace(self.settings, target, branch, stage=0)
         is_canonical = project == self.settings.memory_canonical_project
         pr_url = None
+        pr_urls: list[str] = []  # every explicit PR_URL line across both runs
         for run in (1, 2):
             run_id = self.store.stage_run_open(job_id, stage=run, attempt=1)
             prompt = build_bootstrap_prompt(target=target, branch=branch, project=project,
@@ -1154,6 +1155,9 @@ class Engine:
             marker, payload, found_pr = parse_stage_output(raw.text)
             self.store.stage_run_close(run_id, marker, **self._meta(raw))
             pr_url = found_pr or pr_url
+            for u in all_pr_urls(raw.text):
+                if u not in pr_urls:
+                    pr_urls.append(u)
             if marker == "fail":
                 self.store.set_status(job_id, "no_fix", detail=payload[:2000])
                 return
@@ -1163,7 +1167,7 @@ class Engine:
                                              f"STAGE_FAIL: {payload[-1500:]}")
                 return
         await self.memory.refresh_cache(project, workspace, target.base)
-        if pr_url:  # tracked, but no auto-ready/review — memory PRs are doc drafts
-            await self.record_prs(job_id, [pr_url], kickoff=False)
+        if pr_urls:  # tracked, but no auto-ready/review — memory PRs are doc drafts
+            await self.record_prs(job_id, pr_urls, kickoff=False)
         self.store.set_status(job_id, "pr_opened" if pr_url else "no_fix",
                               pr_url=pr_url, detail="memory bootstrap complete")
