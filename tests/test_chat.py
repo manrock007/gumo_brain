@@ -54,6 +54,70 @@ class TestChatEngineFallbacks:
         assert "moved on" in last["text"]
 
 
+class TestChatConfigStoreLock:
+    """Seer round 7: an artifact-primed chat writes to a claude config store and
+    must hold the lock guarding THAT store while it runs — chat_global for the
+    dedicated chat store (persistence on), claude_global for the shared default
+    store (persistence off, where stage runs also live)."""
+
+    def _run_chat(self, worker, monkeypatch, tmp_path, job_id):
+        import app.engine as engine_mod
+
+        eng = worker.engine
+        worker.intake_feature(job_id, title="F", project="web", request="r")
+        worker.store.set_fields(job_id, stage=3, stage_attempts=1)
+        worker.store.set_status(job_id, "awaiting_input")
+        job = worker.store.get(job_id)
+        worker.store.chat_add(job_id, 3, 1, "human", "q?")
+
+        seen = {}
+
+        async def fake_prepare(*a, **k):
+            return str(tmp_path)
+
+        async def fake_git(*a, **k):
+            return (0, "")
+
+        async def fake_raw(settings, workspace, prompt, allowed_tools, timeout, **kw):
+            seen["claude_global"] = eng.locks.claude_global.locked()
+            seen["chat_global"] = eng.locks.chat_global.locked()
+            seen["config_dir"] = kw.get("config_dir")
+
+            class R:
+                status = "ok"
+                text = "answer"
+                meta = {}
+
+            return R()
+
+        monkeypatch.setattr(engine_mod, "prepare_feature_workspace", fake_prepare)
+        monkeypatch.setattr(engine_mod, "git", fake_git)
+        monkeypatch.setattr(engine_mod, "run_claude_raw", fake_raw)
+        asyncio.run(eng.chat(job, "q?"))
+        assert worker.store.chat_last(job_id, 3)["degraded"] == 0
+        return seen
+
+    def test_persistence_off_holds_shared_default_store_lock(
+            self, worker, monkeypatch, tmp_path):
+        seen = self._run_chat(worker, monkeypatch, tmp_path, "feat-lk1")
+        assert seen["config_dir"] is None
+        assert seen["claude_global"] is True   # shared with stage runs
+        assert seen["chat_global"] is False
+
+    def test_persistence_on_holds_chat_store_lock(self, tmp_path, monkeypatch):
+        from app.config import Settings
+        from app.db import JobStore
+        from app.worker import Worker
+
+        s = Settings(data_dir=str(tmp_path), dashboard_password="test",
+                     session_persistence=True)
+        w = Worker(s, JobStore(str(tmp_path / "brain.db")))
+        seen = self._run_chat(w, monkeypatch, tmp_path, "feat-lk2")
+        assert seen["config_dir"] == s.claude_chat_config_dir
+        assert seen["chat_global"] is True     # dedicated chat store
+        assert seen["claude_global"] is False  # stage runs stay unblocked
+
+
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
     monkeypatch.setenv("DATA_DIR", str(tmp_path))

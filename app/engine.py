@@ -56,10 +56,14 @@ class RepoLocks:
 
     def __init__(self):
         self._locks: dict[str, asyncio.Lock] = {}
-        # concurrent claude invocations sharing the session store's config dir
-        # must serialize — its state files are read-modify-written per invocation
-        # (docs/CONVERSATIONS.md §4). Only acquired when session_persistence is on.
+        # Concurrent claude invocations sharing a config dir must serialize — the
+        # CLI read-modify-writes its state files per invocation (docs/
+        # CONVERSATIONS.md §4). claude_global guards the stage/default store
+        # (which is ~/.claude when session_persistence is off — and chat is the
+        # first concurrent invoker this service ever had); chat_global guards the
+        # dedicated artifact-primed chat store used when persistence is on.
         self.claude_global = asyncio.Lock()
+        self.chat_global = asyncio.Lock()
 
     def for_repo(self, repo: str) -> asyncio.Lock:
         if repo not in self._locks:
@@ -511,7 +515,11 @@ class Engine:
         sid = None
         if resume_session is None and self.settings.session_persistence:
             sid = str(uuid.uuid4())
-        if self.settings.session_persistence and config_dir is None:
+        if config_dir is None:
+            # stage/bootstrap runs touch the stage/default store — ALWAYS serialize:
+            # with persistence off that store is ~/.claude, shared with any
+            # concurrent chat run (the worker itself is serial, so this only ever
+            # waits on chats, never on other stages)
             async with self.locks.claude_global:
                 return await run_claude_raw(self.settings, workspace, prompt, tools, timeout,
                                             resume_session=resume_session,
@@ -732,14 +740,21 @@ class Engine:
                     transcript=self.store.chat_for(job_id, stage)[:-1],  # exclude the turn being answered
                     inline_artifacts=inline,
                 )
-                raw = await run_claude_raw(
-                    self.settings, workspace, prompt,
-                    allowed_tools=CHAT_TOOLS,
-                    timeout=self.settings.chat_timeout_seconds,
-                    disallowed_tools=CHAT_DENIED_TOOLS,
-                    config_dir=(self.settings.claude_chat_config_dir
-                                if self.settings.session_persistence else None),
-                )
+                # serialize on whichever store this run touches: the dedicated
+                # chat store when persistence is on, else the shared default
+                # store (which stage runs also use — see _invoke)
+                chat_dir = (self.settings.claude_chat_config_dir
+                            if self.settings.session_persistence else None)
+                store_lock = (self.locks.chat_global if chat_dir
+                              else self.locks.claude_global)
+                async with store_lock:
+                    raw = await run_claude_raw(
+                        self.settings, workspace, prompt,
+                        allowed_tools=CHAT_TOOLS,
+                        timeout=self.settings.chat_timeout_seconds,
+                        disallowed_tools=CHAT_DENIED_TOOLS,
+                        config_dir=chat_dir,
+                    )
             # hygiene: a chat run must never leave residue for _checkpoint to commit
             code, status = await git(workspace, "status", "--porcelain")
             dirty = code == 0 and bool(status.strip())
