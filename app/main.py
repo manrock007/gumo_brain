@@ -61,6 +61,7 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(worker.sweep_forever()),
         asyncio.create_task(worker.reap_forever()),
         asyncio.create_task(worker.prune_sessions_forever()),
+        asyncio.create_task(worker.shepherd_forever()),
     ]
     app.state.store = store
     app.state.worker = worker

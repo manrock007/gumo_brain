@@ -75,6 +75,65 @@ class GitHub:
             log.exception("mark_ready %s#%s failed", repo, number)
             return False
 
+    async def list_comments(self, repo: str, number: int) -> list[dict] | None:
+        """Issue comments on the PR, oldest first (where '@sentry review'
+        triggers live). None on failure — never an empty list."""
+        if not self.enabled or not repo or not number:
+            return None
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.get(f"{API}/repos/{repo}/issues/{number}/comments",
+                                     headers=self._headers, params={"per_page": 100})
+                return r.json() if r.status_code == 200 else None
+        except Exception:
+            log.exception("list_comments %s#%s failed", repo, number)
+            return None
+
+    async def get_comment_reactions(self, repo: str, comment_id: int) -> list[dict] | None:
+        """Reactions on an issue comment — a 🎉 ('hooray') on the latest
+        '@sentry review' trigger is the bot's clean-pass signal."""
+        if not self.enabled or not repo or not comment_id:
+            return None
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.get(
+                    f"{API}/repos/{repo}/issues/comments/{comment_id}/reactions",
+                    headers=self._headers, params={"per_page": 100})
+                return r.json() if r.status_code == 200 else None
+        except Exception:
+            log.exception("get_comment_reactions %s/%s failed", repo, comment_id)
+            return None
+
+    async def get_review_comments(self, repo: str, number: int) -> list[dict] | None:
+        """Line-level review comments (where the bot's findings live), oldest
+        first. None on failure."""
+        if not self.enabled or not repo or not number:
+            return None
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.get(f"{API}/repos/{repo}/pulls/{number}/comments",
+                                     headers=self._headers, params={"per_page": 100})
+                return r.json() if r.status_code == 200 else None
+        except Exception:
+            log.exception("get_review_comments %s#%s failed", repo, number)
+            return None
+
+    async def reply_to_review_comment(self, repo: str, number: int,
+                                      comment_id: int, body: str) -> bool:
+        if not self.enabled or not repo or not number or not comment_id:
+            return False
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.post(
+                    f"{API}/repos/{repo}/pulls/{number}/comments/{comment_id}/replies",
+                    headers=self._headers, json={"body": body})
+                if r.status_code != 201:
+                    log.warning("reply %s#%s/%s -> %s", repo, number, comment_id, r.status_code)
+                return r.status_code == 201
+        except Exception:
+            log.exception("reply %s#%s/%s failed", repo, number, comment_id)
+            return False
+
     async def comment(self, repo: str, number: int, body: str) -> bool:
         """Post an issue comment on the PR (this is how '@sentry review' is
         triggered — review-thread replies alone do not re-engage the bot)."""

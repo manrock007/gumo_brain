@@ -55,6 +55,11 @@ class Settings(BaseSettings):
     # PR lifecycle: auto-flip captured draft PRs to ready-for-review and post
     # the first `@sentry review` trigger (the Seer bot ignores plain pushes)
     pr_auto_ready: bool = True
+    # The shepherd: autonomously drive tracked PRs through Sentry review —
+    # fix findings, reply, re-trigger — until approved (or the round cap).
+    shepherd_enabled: bool = True
+    shepherd_interval_seconds: int = 180
+    pr_max_review_rounds: int = 6
 
     # ClickUp — one task per issue being fixed; Claude posts progress comments
     clickup_token: str = ""
@@ -155,6 +160,15 @@ class Settings(BaseSettings):
     @property
     def clickup_enabled(self) -> bool:
         return bool(self.clickup_token and self.clickup_list_id)
+
+    def target_for_repo(self, repo: str) -> "RepoTarget | None":
+        """Reverse lookup for the shepherd: a prs row carries owner/name, not a
+        project slug."""
+        for slug in json.loads(self.repo_map):
+            t = self.repo_for_project(slug)
+            if t and t.repo == repo:
+                return t
+        return None
 
     def repo_for_project(self, project_slug: str) -> RepoTarget | None:
         mapping = json.loads(self.repo_map)
