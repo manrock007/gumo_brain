@@ -655,6 +655,19 @@ class Engine:
 
         try:
             reply, meta, degraded = await self._chat_inner(job, stage, message, target)
+        except asyncio.CancelledError:
+            # shutdown (or task cancellation): leave a tombstone engine turn so
+            # the human turn isn't orphaned — an orphan blocks this gate's chat
+            # for the stale-pending window after restart. The write is
+            # synchronous SQLite (safe in a cancelled task); skip the ClickUp
+            # mirror and propagate the cancellation.
+            self.store.chat_add(
+                job_id, stage, attempt, "engine",
+                "(the service shut down before this was answered — ask again, "
+                "or answer the gate with Proceed/Redo/Skip)",
+                degraded=True,
+            )
+            raise
         except Exception as e:
             log.exception("chat run failed for %s", job_id)
             reply, meta, degraded = (f"(chat failed: {str(e)[:300]} — the question is "

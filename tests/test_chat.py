@@ -54,6 +54,38 @@ class TestChatEngineFallbacks:
         assert "moved on" in last["text"]
 
 
+class TestChatCancellation:
+    def test_cancelled_chat_leaves_tombstone_engine_turn(self, worker, monkeypatch):
+        """Seer round 8: a chat task cancelled at shutdown must not orphan its
+        human turn — an orphan reads as an answer in flight and blocks the
+        gate's chat for the stale-pending window after restart."""
+        worker.intake_feature("feat-cx1", title="F", project="web", request="r")
+        worker.store.set_fields("feat-cx1", stage=3, stage_attempts=1)
+        worker.store.set_status("feat-cx1", "awaiting_input")
+        job = worker.store.get("feat-cx1")
+        worker.store.chat_add("feat-cx1", 3, 1, "human", "q?")
+
+        started = asyncio.Event()
+
+        async def hang(*a, **k):
+            started.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(worker.engine, "_chat_inner", hang)
+
+        async def run():
+            task = asyncio.create_task(worker.engine.chat(job, "q?"))
+            await started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(run())
+        last = worker.store.chat_last("feat-cx1", 3)
+        assert last["role"] == "engine"
+        assert last["degraded"] == 1
+
+
 class TestChatConfigStoreLock:
     """Seer round 7: an artifact-primed chat writes to a claude config store and
     must hold the lock guarding THAT store while it runs — chat_global for the
