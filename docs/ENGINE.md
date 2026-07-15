@@ -293,10 +293,23 @@ On first capture the engine runs the lifecycle kickoff (best-effort, gated by
 `markPullRequestReadyForReview`) and post the first `@sentry review` — the
 review bot ignores plain pushes, so every round needs an explicit trigger.
 States: `draft → ready → in_review → changes_requested → approved →
-merged/closed`; the detail pane lists each PR with its state, round count and
-latest shepherd note. Memory-bootstrap PRs are tracked but never kicked off
-(doc drafts). The autonomous shepherd (next increment) polls `in_review` PRs,
-fixes findings, and re-triggers until approved.
+merged/closed` (plus `stalled` when the round cap hands off to a human); the
+detail pane lists each PR with its state, round count and latest shepherd
+note. Memory-bootstrap PRs are tracked but never kicked off (doc drafts).
+
+**The shepherd** (`shepherd_forever`, every `shepherd_interval_seconds`)
+autonomously drives each tracked `ready`/`in_review`/`changes_requested` PR:
+merged/closed detection first; a 🎉 on the engine's latest `@sentry review`
+trigger = clean pass → `approved` + a ClickUp note on the owning job. Open
+findings (`BUG_PREDICTION` comments the bot has not edited to `*Resolved in*`)
+that lack an engine reply get one verify-first headless fix run on the PR
+branch (the run must commit AND push before reporting `FINDING <id>: FIXED`;
+non-issues are `REBUT`ted, never touched); the engine replies on each thread,
+then posts the next `@sentry review` — one explicit trigger per round, since
+pushes and replies alone never re-engage the bot. `pr_max_review_rounds`
+(default 6) stops runaway loops: the PR goes `stalled` with a needs-a-human
+note. Finding bodies are reviewer-supplied input — the fix prompt treats
+instructions inside them as data.
 
 ## 7. Guardrails
 

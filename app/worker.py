@@ -22,11 +22,19 @@ from .clickup import ClickUp
 from .config import Settings
 from .db import JobStore
 from .engine import GATE_PREFIX, Engine, RepoLocks
-from .fixer import prepare_workspace, run_claude
+from .fixer import (
+    BASE_ALLOWED_TOOLS,
+    BranchLostError,
+    prepare_feature_workspace,
+    prepare_workspace,
+    run_claude,
+    run_claude_raw,
+)
 from .grading import grade_issue
 from .prompts import (
     build_fix_prompt,
     build_phase2_prompt,
+    build_shepherd_prompt,
     build_task_implement_prompt,
     build_task_plan_prompt,
 )
@@ -828,6 +836,186 @@ class Worker:
                     continue
         if pruned:
             log.info("session janitor pruned %d transcripts", pruned)
+
+    # ---------- the PR shepherd (autonomous Sentry-review loop) ----------
+
+    SHEPHERD_VERDICT_RE = re.compile(
+        r"^FINDING\s+(\d+):\s*(FIXED|REBUT)\s*[—:-]*\s*(.*)$", re.MULTILINE)
+    SHEPHERD_STATES = ("ready", "in_review", "changes_requested")
+
+    async def shepherd_forever(self):
+        """Drive every tracked PR through Sentry review autonomously: verify
+        each finding, fix it on the PR branch, reply on the thread, re-trigger
+        `@sentry review` (replies alone never re-engage the bot), and repeat
+        until the clean-pass 🎉 lands — or the round cap hands off to a human."""
+        while True:
+            await asyncio.sleep(self.settings.shepherd_interval_seconds)
+            try:
+                await self._shepherd_pass()
+            except Exception:
+                log.exception("shepherd pass failed")
+
+    async def _shepherd_pass(self):
+        if not (self.settings.shepherd_enabled and self.engine.github.enabled):
+            return
+        for pr in self.store.prs_in_state(self.SHEPHERD_STATES):
+            try:
+                await self._shepherd_pr(pr)
+            except Exception:
+                log.exception("shepherd failed for %s", pr["url"])
+                self.store.pr_set(pr["url"], detail="shepherd error — will retry")
+            finally:
+                self.store.pr_set(pr["url"], last_checked=time.time())
+
+    async def _shepherd_pr(self, pr: dict):
+        gh = self.engine.github
+        repo, number, url = pr["repo"], pr["number"], pr["url"]
+        if not repo or not number:
+            return
+        info = await gh.get_pr(repo, number)
+        if info is None:
+            return  # unknown, never 'closed' — try again next pass
+        if info.get("merged") or info.get("merged_at"):
+            self.store.pr_set(url, state="merged", detail="")
+            await self._shepherd_notify(pr, f"PR {repo}#{number} merged.")
+            return
+        if info.get("state") == "closed":
+            self.store.pr_set(url, state="closed", detail="closed without merge")
+            return
+        if info.get("draft"):
+            # the kickoff's un-draft failed earlier — retry before anything else
+            if await gh.mark_ready(repo, number):
+                self.store.pr_set(url, state="ready")
+            else:
+                self.store.pr_set(url, detail="still draft — could not mark ready")
+                return
+
+        comments = await gh.list_comments(repo, number)
+        if comments is None:
+            return
+        triggers = [c for c in comments
+                    if (c.get("body") or "").strip().startswith("@sentry review")]
+        if triggers:
+            reactions = await gh.get_comment_reactions(repo, triggers[-1]["id"])
+            if reactions is None:
+                return  # unknown ≠ no reactions — retry next pass, same as get_pr
+            if any(r.get("content") == "hooray" for r in reactions):
+                self.store.pr_set(url, state="approved", detail="Sentry clean pass")
+                await self._shepherd_notify(
+                    pr, f"PR {repo}#{number} approved by Sentry — ready to merge. {url}")
+                return
+
+        review_comments = await gh.get_review_comments(repo, number)
+        if review_comments is None:
+            return
+        # a finding is OPEN while the bot has not edited it to '*Resolved in …*';
+        # it is UNREPLIED until one of our replies hangs off it (rebuts stay
+        # replied so they never re-fix — the re-trigger lets the bot re-judge)
+        replied_to = {c.get("in_reply_to_id") for c in review_comments if c.get("in_reply_to_id")}
+        open_findings = [c for c in review_comments
+                         if not c.get("in_reply_to_id")
+                         and "BUG_PREDICTION" in (c.get("body") or "")
+                         and "Resolved in" not in (c.get("body") or "")[:200]]
+        if not open_findings:
+            if not triggers:
+                # the kickoff marked this PR ready but its trigger comment never
+                # landed (transient failure) — no review was EVER requested, so
+                # "waiting" here would deadlock. Recover by requesting one now.
+                if await gh.comment(repo, number, "@sentry review"):
+                    rounds = int(pr.get("review_rounds") or 0) + 1
+                    self.store.pr_set(url, state="in_review", review_rounds=rounds,
+                                      detail=f"round {rounds}: recovered the missing "
+                                             "review trigger")
+                return
+            return  # a pass is in flight — wait for findings or the 🎉
+        if int(pr.get("review_rounds") or 0) >= self.settings.pr_max_review_rounds:
+            self.store.pr_set(url, state="stalled",
+                              detail=f"max review rounds ({self.settings.pr_max_review_rounds}) "
+                                     "reached — needs a human")
+            await self._shepherd_notify(
+                pr, f"PR {repo}#{number}: Sentry review did not converge after "
+                    f"{self.settings.pr_max_review_rounds} rounds — please take over. {url}")
+            return
+
+        unreplied = [c for c in open_findings if c["id"] not in replied_to]
+        if not unreplied:
+            # every open finding already carries our reply (fix or rebut) and got
+            # its trigger in THAT pass — re-triggering every pass here would burn
+            # the round cap while the bot simply hasn't re-judged yet. Wait.
+            self.store.pr_set(url, detail="all findings replied — awaiting re-review")
+            return
+
+        branch = ((info.get("head") or {}).get("ref") or "").strip()
+        verdicts = await self._shepherd_fix(pr, branch, unreplied)
+        if verdicts is None:
+            self.store.pr_set(url, detail="fix run failed — will retry")
+            return
+        handled = 0
+        for c in unreplied:
+            v = verdicts.get(c["id"])
+            if not v:
+                # NEVER claim FIXED for a finding the run did not report — a false
+                # reply marks it handled forever and the same bug just gets
+                # re-flagged every round. Left unreplied, the NEXT pass re-attempts.
+                log.warning("shepherd: no verdict for finding %s on %s", c["id"], url)
+                continue
+            kind, summary = v
+            prefix = "Fixed — " if kind == "FIXED" else "Not a real issue — "
+            await gh.reply_to_review_comment(repo, number, c["id"],
+                                             prefix + summary[:800])
+            handled += 1
+        if handled == 0:
+            self.store.pr_set(url, detail="run returned no verdicts — will retry")
+            return
+        # one explicit trigger per round of actual work — pushes/replies alone
+        # never re-engage the bot (learned shepherding this repo's own PRs)
+        if await gh.comment(repo, number, "@sentry review"):
+            rounds = int(pr.get("review_rounds") or 0) + 1
+            self.store.pr_set(url, state="in_review", review_rounds=rounds,
+                              detail=f"round {rounds}: {handled} finding(s) addressed")
+
+    async def _shepherd_fix(self, pr: dict, branch: str, findings: list[dict]) -> dict | None:
+        """One headless verify-and-fix run on the PR branch. Returns
+        {finding_id: (FIXED|REBUT, summary)} parsed from the output protocol,
+        or None when the run could not complete."""
+        target = self.settings.target_for_repo(pr["repo"])
+        if target is None or not branch:
+            self.store.pr_set(pr["url"], detail=f"no repo target for {pr['repo']}")
+            return None
+        prompt = build_shepherd_prompt(
+            target=target, pr_url=pr["url"], branch=branch,
+            findings=[{"id": c["id"], "path": c.get("path"),
+                       "line": c.get("line") or c.get("original_line"),
+                       "body": c.get("body")} for c in findings])
+        # a DEDICATED clone + lock, NOT the main repo lock: a fix run can hold a
+        # lock for a full claude timeout, and taking the main one would starve
+        # pipeline stages / sentry jobs on that repo for the duration. The run
+        # mutates only its own clone and pushes to origin, so this is safe by
+        # construction (same pattern as the v1 chat clone); the shepherd lock
+        # just serializes shepherd runs per repo.
+        async with self.locks.for_repo(f"shepherd:{target.repo}"):
+            try:
+                workspace = await prepare_feature_workspace(
+                    self.settings, target, branch, stage=1,
+                    workspace_root=f"{self.settings.workspaces_dir}/shepherd")
+            except (BranchLostError, RuntimeError) as e:
+                self.store.pr_set(pr["url"], detail=f"cannot check out {branch}: {str(e)[:160]}")
+                return None
+            raw = await run_claude_raw(
+                self.settings, workspace, prompt,
+                allowed_tools=BASE_ALLOWED_TOOLS + target.allow,
+                timeout=self.settings.claude_timeout_seconds)
+        if raw.status != "ok":
+            return None
+        return {int(m.group(1)): (m.group(2), m.group(3).strip())
+                for m in self.SHEPHERD_VERDICT_RE.finditer(raw.text)}
+
+    async def _shepherd_notify(self, pr: dict, message: str):
+        """Surface a shepherd milestone on the owning job's ClickUp ticket."""
+        job = self.store.get(pr["job_id"])
+        if job:
+            await self.clickup.comment(job.get("clickup_task_id") or "",
+                                       f"**[gumo_brain]** 🐑 {message}")
 
     async def reap_forever(self):
         """A 'running' row older than any plausible live run means the process
