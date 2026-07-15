@@ -246,6 +246,47 @@ class TestShepherdFixRun:
         assert "no repo target" in store.prs_for("feat-u1")[0]["detail"]
 
 
+class TestGitHubPagination:
+    """Seer PR#11 round 2: page 1 alone holds the OLDEST 100 items — the latest
+    '@sentry review' trigger (whose 🎉 signals the clean pass) and findings past
+    100 would be silently missed without Link-header pagination."""
+
+    def _gh(self, tmp_path, handler):
+        import httpx
+        from app.github import GitHub
+
+        s = Settings(data_dir=str(tmp_path), github_token="tok")
+        return GitHub(s, transport=httpx.MockTransport(handler))
+
+    def test_follows_link_next_across_pages(self, tmp_path):
+        import httpx
+
+        def handler(request):
+            if "page=2" in str(request.url):
+                return httpx.Response(200, json=[{"id": 2}])
+            return httpx.Response(
+                200, json=[{"id": 1}],
+                headers={"Link": f'<{str(request.url)}&page=2>; rel="next"'})
+
+        gh = self._gh(tmp_path, handler)
+        out = asyncio.run(gh.list_comments("o/r", 5))
+        assert [c["id"] for c in out] == [1, 2]
+
+    def test_mid_pagination_failure_returns_none(self, tmp_path):
+        import httpx
+
+        def handler(request):
+            if "page=2" in str(request.url):
+                return httpx.Response(502)
+            return httpx.Response(
+                200, json=[{"id": 1}],
+                headers={"Link": f'<{str(request.url)}&page=2>; rel="next"'})
+
+        gh = self._gh(tmp_path, handler)
+        # a partial list would silently hide the newest items — must be None
+        assert asyncio.run(gh.get_review_comments("o/r", 5)) is None
+
+
 class TestShepherdPass:
     def test_disabled_is_a_noop(self, store, tmp_path, monkeypatch):
         w = _worker(store, tmp_path, shepherd_enabled=False)
