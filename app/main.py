@@ -350,12 +350,11 @@ async def gate_chat_post(job_id: str, body: ChatBody):
         raise HTTPException(status_code=404, detail=f"unknown job '{job_id}'")
     if (job.get("kind") or "") not in ("feature", "sentry", "task"):
         raise HTTPException(status_code=409, detail="chat is not available for this item kind")
-    # chat is available while parked at a gate AND mid-run (the inbox conversation):
-    # the fast lane answers from the item's record without touching the repo; a
-    # code-reading escalation queues on the repo lock and lands via persist-then-poll.
-    if job["status"] not in ("awaiting_input", "running"):
-        raise HTTPException(status_code=409,
-                            detail=f"job is '{job['status']}' — chat needs a parked or running item")
+    # chat spans the item's whole life: parked at a gate, mid-run (the inbox
+    # conversation), AND after it lands — post-mortem questions ("why was this
+    # skipped?") answer from the record, whose detail column carries the
+    # grading/run outcome. The fast lane never touches the repo; a code-reading
+    # escalation queues on the chat clone's lock and lands via persist-then-poll.
     stage = int(job.get("stage") or 0)
     attempt = max(1, int(job.get("stage_attempts") or 1))
     # the turn budget is per GATE: count only this attempt's turns, so a redo

@@ -254,6 +254,7 @@ DASHBOARD_HTML = """<!doctype html>
   .composer .send.steer { background:linear-gradient(135deg,var(--warn),#c8860f); }
   .composer .send:disabled { opacity:.5; cursor:default; }
   .composer .chint { font-size:11.5px; color:var(--muted); }
+  .composer .cerr { font-size:11.5px; font-weight:600; color:var(--err); }
 
   /* ---------- welcome / intake (right pane, nothing selected) ---------- */
   .welcome { flex:1; overflow:auto; padding:20px 22px; }
@@ -379,6 +380,7 @@ DASHBOARD_HTML = """<!doctype html>
         <textarea id="c-in" data-draft="" placeholder=""></textarea>
         <div class="row2">
           <button class="send" id="c-send" onclick="sendComposer()">Send</button>
+          <span class="cerr" id="c-err"></span>
           <span class="chint" id="c-hint"></span>
         </div>
       </div>
@@ -871,8 +873,14 @@ function stageEv(kind, t) {
 
 // ---------- composer: Ask (chat) / Steer ----------
 
+function composerError(text) {
+  document.getElementById('c-err').textContent = text || '';
+  document.getElementById('c-hint').style.display = text ? 'none' : '';
+}
+
 function setMode(m) {
   composerMode = m;
+  composerError('');
   document.getElementById('tab-ask').classList.toggle('on', m === 'ask');
   document.getElementById('tab-steer').classList.toggle('on', m === 'steer');
   const box = document.getElementById('c-in');
@@ -893,7 +901,7 @@ function updateComposerHint(data) {
   } else if (data && data.chat_pending) {
     el.innerHTML = 'An answer is in flight&hellip;';
   } else {
-    el.innerHTML = 'Ask anytime (mid-run or at a gate). Switch to <b>Steer</b> to redirect the running stage.';
+    el.innerHTML = 'Ask anytime — mid-run, at a gate, or after the work lands. Switch to <b>Steer</b> to redirect a running stage.';
   }
 }
 
@@ -904,6 +912,7 @@ async function sendComposer() {
   if (!text) return;
   const btn = document.getElementById('c-send');
   btn.disabled = true;
+  composerError('');
   const msg = document.getElementById('msg');
   try {
     if (composerMode === 'steer') {
@@ -918,7 +927,7 @@ async function sendComposer() {
           ? 'Steering — the run is being interrupted and will resume with your note.'
           : 'Steer saved — it will be applied at the next checkpoint.';
         lastSnap = ''; loadDetail(sel);
-      } else msg.textContent = 'Steer: ' + (data.detail || r.status);
+      } else composerError(data.detail || ('steer failed (' + r.status + ')'));
     } else {
       const r = await fetch('api/jobs/' + encodeURIComponent(sel) + '/chat', {
         method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -930,11 +939,11 @@ async function sendComposer() {
         startChatStream(sel);
         lastSnap = ''; loadDetail(sel);
       } else {
-        msg.textContent = 'Chat: ' + (data.detail || r.status);
+        composerError(data.detail || ('send failed (' + r.status + ')'));
         if (r.status === 409) { lastSnap = ''; loadDetail(sel); }
       }
     }
-  } catch (e) { msg.textContent = 'Error: ' + e; }
+  } catch (e) { composerError('network error — not sent: ' + e); }
   btn.disabled = false;
 }
 

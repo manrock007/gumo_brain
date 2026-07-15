@@ -924,10 +924,13 @@ class Engine:
         # on it would make mid-run chat unreachable. Chat reads the BASE branch,
         # so its own clone is always safe; the chat lock only serializes chats.
         async with self.locks.for_repo(f"chat:{target.repo}"):
+            # no status re-check: v1 chat is valid for the item's whole life —
+            # a question queued mid-run stays answerable after the run lands
+            # (post-mortems read the BASE branch, never the run's residue)
             fresh = self.store.get(job_id)
-            if not fresh or fresh["status"] not in ("awaiting_input", "running"):
-                return ("This was answered before I got to it — the item has moved on. "
-                        "This question stays on the record."), {}, True
+            if not fresh:
+                return ("This item no longer exists — the question stays on "
+                        "the record."), {}, True
             try:
                 workspace = await prepare_workspace(
                     self.settings, target, f"brain/chat-{job_id}",
@@ -1008,13 +1011,12 @@ class Engine:
         publish("status", "waiting for the repository workspace")
 
         async with self.locks.for_repo(target.repo):
-            # re-validate under the lock: the gate may have been answered while queued.
-            # Both parked AND running are answerable (mid-run asks queue on the repo
-            # lock and land here once it frees) — matching the endpoint's guard; only
-            # a stage advance or a terminal status means the question's moment passed.
+            # re-validate under the lock: the gate may have been answered while
+            # queued. Parked, running AND terminal are all answerable (post-
+            # mortems included) — only a stage ADVANCE means the question's
+            # moment passed, because the answer would describe superseded work.
             fresh = self.store.get(job_id)
-            if (not fresh or fresh["status"] not in ("awaiting_input", "running")
-                    or int(fresh.get("stage") or 0) != stage):
+            if not fresh or int(fresh.get("stage") or 0) != stage:
                 return ("The gate was answered before I got to this — the pipeline has "
                         "moved on. This question stays on the record."), {}, True
             try:

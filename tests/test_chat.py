@@ -41,11 +41,15 @@ class TestChatEngineFallbacks:
         assert last["degraded"] == 1
 
     def test_gate_answered_before_reply(self, worker):
+        """A proceed ADVANCES the stage — a question queued against the old gate
+        would describe superseded work, so it tombstones. (Status alone no
+        longer tombstones: terminal items are post-mortem-answerable.)"""
         worker.intake_feature("feat-c4", title="F", project="web", request="r")
-        worker.store.set_fields("feat-c4", stage=2, stage_attempts=1)
-        worker.store.set_status("feat-c4", "queued")  # no longer parked
+        worker.store.set_fields("feat-c4", stage=3, stage_attempts=1)  # advanced
+        worker.store.set_status("feat-c4", "queued")
         job = dict(worker.store.get("feat-c4"))
         job["status"] = "awaiting_input"  # stale snapshot, as the endpoint saw it
+        job["stage"] = 2                  # the gate the question was asked at
         worker.store.chat_add("feat-c4", 2, 1, "human", "q?")
         asyncio.run(worker.engine.chat(job, "q?"))
         last = worker.store.chat_last("feat-c4", 2)
@@ -104,6 +108,59 @@ class TestChatEngineFallbacks:
         assert last["role"] == "engine"
         assert "moved on" not in last["text"]
         assert "cannot check out" in last["text"]
+
+    def test_v1_terminal_item_passes_the_slow_lane_guard(self, worker, monkeypatch):
+        """Post-mortem chat: a SKIPPED item's question must reach the workspace
+        step — v1 chat reads the BASE branch, so nothing about a terminal
+        status makes it unanswerable. Never the 'moved on' tombstone."""
+        import app.engine as engine_mod
+
+        worker.store.insert("sen-c7", source="webhook", kind="sentry", title="boom",
+                            project="web")
+        worker.store.set_status("sen-c7", "skipped", detail="skipped by grading")
+        job = worker.store.get("sen-c7")
+        worker.store.chat_add("sen-c7", 0, 1, "human", "why was this skipped")
+
+        async def no_ws(*a, **k):
+            raise RuntimeError("no workspace in tests")
+
+        monkeypatch.setattr(engine_mod, "prepare_workspace", no_ws)
+        asyncio.run(worker.engine.chat(job, "why was this skipped"))
+        last = worker.store.chat_last("sen-c7", 0)
+        assert last["role"] == "engine"
+        assert "moved on" not in last["text"]
+        assert "cannot check out" in last["text"]
+
+    def test_v1_fastlane_carries_the_outcome(self, worker, monkeypatch):
+        """'why was this skipped?' is answered from the record — so the
+        fast-lane system prompt must carry the status and the detail column,
+        where grading writes its verdict."""
+        from app import fastlane as fastlane_mod
+
+        worker.store.insert("sen-c8", source="webhook", kind="sentry", title="boom",
+                            project="web")
+        worker.store.set_fields("sen-c8", grade_reasons="score 4: too few users")
+        worker.store.set_status("sen-c8", "skipped",
+                                detail="skipped by grading: below threshold")
+        job = worker.store.get("sen-c8")
+        worker.store.chat_add("sen-c8", 0, 1, "human", "why was this skipped")
+
+        captured = {}
+
+        async def fake_fast(settings, system, messages, on_delta):
+            captured["system"] = system
+            return "ok", "grading scored it 4 — below the threshold", {"lane": "fast"}
+
+        monkeypatch.setattr(worker.engine.settings, "chat_fast_model", "m", raising=False)
+        monkeypatch.setattr(worker.engine.settings, "chat_api_key", "k", raising=False)
+        monkeypatch.setattr(fastlane_mod, "stream_answer", fake_fast)
+        import app.engine as engine_mod
+        monkeypatch.setattr(engine_mod.fastlane, "stream_answer", fake_fast)
+        asyncio.run(worker.engine.chat(job, "why was this skipped"))
+        assert "status: skipped" in captured["system"]
+        assert "below threshold" in captured["system"]        # detail column
+        assert "score 4: too few users" in captured["system"]  # grading verdict
+        assert not worker.store.chat_last("sen-c8", 0)["degraded"]
 
     def test_v1_followup_resumes_the_chat_session(self, store, tmp_path, monkeypatch):
         """Seer PR#9 round 3: v1 chat transcripts live in the CHAT config store —
@@ -527,10 +584,27 @@ class TestChatEndpoints:
         store.set_status("feat-api1", "running")
         r = c.post("/api/jobs/feat-api1/chat", headers=AUTH, json={"message": "hi"})
         assert r.status_code == 202
-        # but a finished job has no one to talk to
+        # finished items take post-mortem questions too ("why did it land like
+        # this?") — clear the in-flight turn first, then ask again
+        store.chat_add("feat-api1", 3, 1, "engine", "answered")
         store.set_status("feat-api1", "pr_opened")
-        r = c.post("/api/jobs/feat-api1/chat", headers=AUTH, json={"message": "hi"})
-        assert r.status_code == 409
+        r = c.post("/api/jobs/feat-api1/chat", headers=AUTH, json={"message": "why?"})
+        assert r.status_code == 202
+
+    def test_chat_on_finished_items(self, client):
+        """The dogfooding bug: 'why was this skipped?' on a skipped sentry item
+        must be askable — Send returned 409 and looked dead. Terminal statuses
+        are all chat-able now; the fast lane answers from the record."""
+        c, m = client
+        store = m.app.state.store
+        for status in ("skipped", "no_fix", "error", "timeout"):
+            job_id = f"sen-fin-{status}"
+            store.insert(job_id, source="webhook", kind="sentry", title="boom",
+                         project="web")
+            store.set_status(job_id, status, detail=f"landed as {status}")
+            r = c.post(f"/api/jobs/{job_id}/chat", headers=AUTH,
+                       json={"message": "why was this skipped"})
+            assert r.status_code == 202, status
 
     def test_chat_on_all_item_kinds(self, client):
         """Chat everywhere: sentry/task items are conversational too; only
