@@ -733,12 +733,13 @@ function renderFeatureDetail(data) {
     sd.addEventListener('toggle', () => { if (sd.open) loadHeaderStats(j.issue_id, sd); });
   }
 
-  // composer state
-  const running = j.status === 'running' || data.live;
+  // composer state — the backend's steer_available flag is the single source of
+  // truth: steering interrupts a RUNNING stage; at a gate the answer box (with
+  // Redo notes) is the correction channel, so the Steer tab disables there.
   const steerTab = document.getElementById('tab-steer');
   steerTab.style.display = '';
-  if (!running && composerMode === 'steer') setMode('ask');
-  steerTab.disabled = !running && j.status !== 'awaiting_input';
+  steerTab.disabled = !data.steer_available;
+  if (steerTab.disabled && composerMode === 'steer') setMode('ask');
   updateComposerHint(data);
   const send = document.getElementById('c-send');
   send.disabled = composerMode === 'ask' && (data.chat_limit || data.chat_pending);
