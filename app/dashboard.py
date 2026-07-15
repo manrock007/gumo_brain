@@ -1,16 +1,27 @@
-"""Single-file dashboard for gumo_brain v2 — the Gumo Engine (docs/ENGINE.md §6).
+"""Single-file dashboard for gumo_brain — the Gumo Engine (docs/ENGINE.md §6).
 
-Three intake panels (Sentry fix / request / feature pipeline P0-P9), a Product
-brain panel (per-repo memory freshness + bootstrap), and the four-column job
-queue. Feature cards carry a P0-P9 stage strip, a lazy per-stage stats table,
-and gates with Proceed / Redo / Skip, plus a per-gate chat with the engine
-(GET/POST api/jobs/{id}/chat, feature gates only). Typed gate answers and chat
-drafts survive re-renders (in-memory snapshot + localStorage drafts keyed
+A professional, theme-aware console (dark-first, light via
+prefers-color-scheme): a sticky top bar, three intake panels (Sentry fix /
+request / feature pipeline P0-P9), a Product brain panel (per-repo memory
+freshness + bootstrap), and the four-column job queue with live counts.
+Feature cards carry a status-accented rail, a P0-P9 stage strip, a lazy
+per-stage stats table, and gates with Proceed / Redo / Skip, plus a per-gate
+chat with the engine (GET/POST api/jobs/{id}/chat, feature gates only) with
+live SSE streaming. Typed gate answers and chat drafts survive re-renders
+(in-memory snapshot + localStorage drafts keyed
 `gb-draft-<job_id>` / `gb-chat-<job_id>`).
 
+The visual system is a single set of CSS custom properties (surfaces, lines,
+semantic status colors, radii). Card status classes stay the raw job status
+(e.g. `awaiting_input`) so the CSS hooks match; only the human-facing label is
+prettified via STATUS_LABEL. A dedicated live-session page (drop into a
+running stage, watch it work, steer mid-run) is the next increment and slots
+onto the same card IA.
+
 NOTE: this module is one big Python string. It deliberately contains NO
-backslashes — JS regexes are built with `new RegExp` + `String.fromCharCode`
-— so Python escape handling can never mangle the emitted HTML/JS.
+backslashes — JS regexes are built with `new RegExp` + `String.fromCharCode`,
+and CSS uses HTML entities / empty `content:""` rather than unicode escapes —
+so Python escape handling can never mangle the emitted HTML/JS.
 """
 
 DASHBOARD_HTML = """<!doctype html>
@@ -20,75 +31,194 @@ DASHBOARD_HTML = """<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>gumo_brain</title>
 <style>
-  :root { color-scheme: light dark; --bg:#fff; --fg:#1a1a2e; --muted:#667; --card:#f4f5f7; --accent:#5b5bd6; --ok:#1a7f37; --warn:#b35900; --err:#c0392b; --line:#d8dae0; }
-  @media (prefers-color-scheme: dark) { :root { --bg:#101014; --fg:#e8e8ee; --muted:#99a; --card:#1c1c24; --line:#33343e; } }
-  * { box-sizing: border-box; }
-  body { margin:0; font:15px/1.5 -apple-system,system-ui,sans-serif; background:var(--bg); color:var(--fg); padding:24px; }
-  h1 { font-size:20px; margin:0 0 4px; } h1 small { color:var(--muted); font-weight:400; }
-  #msg { margin:8px 0 16px; color:var(--muted); min-height:1.2em; }
-  .intake { display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:16px; margin:16px 0 24px; }
-  .panel { background:var(--card); border-radius:12px; padding:14px 16px; }
-  .panel h2 { font-size:13px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); margin:0 0 10px; }
-  .panel input, .panel textarea, .panel select { width:100%; padding:8px 12px; margin-bottom:8px; border:1px solid var(--line); border-radius:8px; background:var(--bg); color:var(--fg); font:inherit; }
-  .panel textarea { resize:vertical; min-height:64px; }
-  .panel button { padding:8px 16px; border:0; border-radius:8px; background:var(--accent); color:#fff; cursor:pointer; font:inherit; }
-  .panel button:disabled { opacity:.5; }
-  .hint { font-size:12px; color:var(--muted); margin:2px 0 8px; }
-  .cols { display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:16px; }
-  .col h2 { font-size:13px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); margin:0 0 8px; }
-  .job { background:var(--card); border-radius:10px; padding:10px 12px; margin-bottom:8px; }
-  .job .t { font-weight:600; font-size:14px; overflow:hidden; text-overflow:ellipsis; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; }
-  .job .m { font-size:12px; color:var(--muted); margin-top:4px; }
-  .job a { color:var(--accent); text-decoration:none; margin-right:10px; }
-  .badge { display:inline-block; font-size:11px; padding:1px 8px; border-radius:99px; background:var(--muted); color:var(--bg); margin-right:6px; }
-  .badge.pr_opened { background:var(--ok); } .badge.awaiting_input { background:var(--warn); }
-  .badge.error,.badge.timeout { background:var(--err); }
-  .badge.kind { background:transparent; color:var(--muted); border:1px solid var(--line); }
-  .chip { display:inline-block; font-size:11px; padding:0 8px; border-radius:99px; background:var(--warn); color:#fff; margin-left:8px; }
-  .empty { color:var(--muted); font-size:13px; }
-  .q { white-space:pre-wrap; font-size:13px; background:var(--bg); border:1px solid var(--line); border-radius:8px; padding:8px 10px; margin-top:8px; max-height:180px; overflow:auto; }
-  details { margin-top:6px; font-size:12px; }
-  details summary { cursor:pointer; color:var(--muted); }
-  details pre { white-space:pre-wrap; overflow-wrap:anywhere; font:12px/1.5 ui-monospace,monospace; background:var(--bg); border:1px solid var(--line); border-radius:8px; padding:8px 10px; max-height:320px; overflow:auto; }
-  .strip { display:flex; gap:2px; margin-top:8px; }
-  .seg { flex:1; text-align:center; font-size:9px; line-height:15px; border-radius:3px; border:1px solid var(--line); color:var(--muted); }
-  .seg.done { background:var(--accent); border-color:var(--accent); color:#fff; opacity:.55; }
-  .seg.cur { background:var(--accent); border-color:var(--accent); color:#fff; animation:pulse 1.4s ease-in-out infinite; }
+  :root {
+    color-scheme: dark light;
+    --bg:#0a0b0f; --bg-2:#0d0f15; --surface:#13151d; --surface-2:#191c26; --surface-3:#20242f;
+    --line:#242835; --line-2:#333a49;
+    --fg:#e7e9f0; --fg-2:#a9b0c0; --muted:#6f778a;
+    --accent:#8b7bff; --accent-2:#6d5efc; --accent-weak:rgba(124,108,255,.15);
+    --ok:#3fb950; --ok-weak:rgba(63,185,80,.15);
+    --warn:#e3a72c; --warn-weak:rgba(227,167,44,.15);
+    --err:#f56565; --err-weak:rgba(245,101,101,.15);
+    --info:#4d9fff; --info-weak:rgba(77,159,255,.15);
+    --r:10px; --r-sm:7px; --r-lg:14px;
+    --shadow:0 1px 2px rgba(0,0,0,.35), 0 10px 30px rgba(0,0,0,.22);
+    --font:-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --mono:ui-monospace,"SF Mono","JetBrains Mono",Menlo,Consolas,monospace;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg:#f5f6f8; --bg-2:#eceef2; --surface:#ffffff; --surface-2:#f5f6f9; --surface-3:#eceef3;
+      --line:#e4e7ec; --line-2:#d3d8e0;
+      --fg:#161922; --fg-2:#4a5163; --muted:#8b93a5;
+      --accent:#6d5efc; --accent-2:#5b4ce0; --accent-weak:rgba(109,94,252,.1);
+      --ok:#1a7f37; --ok-weak:rgba(26,127,55,.1);
+      --warn:#b26a00; --warn-weak:rgba(178,106,0,.12);
+      --err:#d33f3f; --err-weak:rgba(211,63,63,.1);
+      --info:#2563eb; --info-weak:rgba(37,99,235,.1);
+      --shadow:0 1px 2px rgba(20,25,40,.06), 0 10px 30px rgba(20,25,40,.08);
+    }
+  }
+  * { box-sizing:border-box; }
+  html { -webkit-text-size-adjust:100%; }
+  body { margin:0; font:14.5px/1.6 var(--font); background:var(--bg); color:var(--fg); -webkit-font-smoothing:antialiased; }
+  body::before { content:""; position:fixed; inset:0; z-index:-1; pointer-events:none;
+    background:radial-gradient(900px 480px at 80% -10%, var(--accent-weak), transparent 70%); }
+  a { color:var(--accent); text-decoration:none; }
+  a:hover { text-decoration:underline; }
+  ::selection { background:var(--accent-weak); }
+  ::-webkit-scrollbar { width:10px; height:10px; }
+  ::-webkit-scrollbar-thumb { background:var(--line-2); border-radius:99px; border:2px solid transparent; background-clip:content-box; }
+  ::-webkit-scrollbar-thumb:hover { background:var(--muted); background-clip:content-box; }
+
+  .topbar { position:sticky; top:0; z-index:20; display:flex; align-items:center; justify-content:space-between; gap:16px;
+    padding:11px 24px; background:var(--bg); background:color-mix(in srgb, var(--bg) 82%, transparent);
+    -webkit-backdrop-filter:saturate(150%) blur(12px); backdrop-filter:saturate(150%) blur(12px); border-bottom:1px solid var(--line); }
+  .brand { display:flex; align-items:center; gap:11px; min-width:0; }
+  .logo { display:grid; place-items:center; width:30px; height:30px; border-radius:9px; font:700 12px/1 var(--mono); letter-spacing:-.02em;
+    color:#fff; background:linear-gradient(135deg,var(--accent),var(--accent-2)); box-shadow:0 3px 12px var(--accent-weak); }
+  .brand-name { font-weight:650; font-size:15px; letter-spacing:-.01em; }
+  .brand-sub { color:var(--muted); font-size:13px; }
+  .topbar-meta { display:flex; align-items:center; gap:14px; color:var(--muted); font-size:12.5px; }
+  .live { display:inline-flex; align-items:center; gap:7px; }
+  .live-dot { width:7px; height:7px; border-radius:50%; background:var(--ok); animation:ping 2.4s ease-out infinite; }
+  @keyframes ping { 0%{ box-shadow:0 0 0 0 rgba(63,185,80,.5); } 70%{ box-shadow:0 0 0 6px rgba(63,185,80,0); } 100%{ box-shadow:0 0 0 0 rgba(63,185,80,0); } }
+  @media (max-width:600px) { .brand-sub { display:none; } }
+
+  .wrap { max-width:1560px; margin:0 auto; padding:22px 24px 64px; }
+  #msg { min-height:1.3em; margin:0 0 14px; color:var(--fg-2); font-size:13px; }
+  #msg:not(:empty) { padding:9px 13px; background:var(--surface); border:1px solid var(--line); border-radius:var(--r-sm); box-shadow:var(--shadow); }
+  .section-label { font-size:11.5px; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); font-weight:650; margin:0 0 13px; }
+
+  .intake { display:grid; grid-template-columns:repeat(auto-fit,minmax(330px,1fr)); gap:16px; margin:0 0 30px; }
+  .panel { background:var(--surface); border:1px solid var(--line); border-radius:var(--r-lg); padding:16px 18px; box-shadow:var(--shadow); }
+  .panel h2 { font-size:13px; font-weight:650; letter-spacing:-.01em; color:var(--fg); margin:0 0 13px; }
+  .panel input, .panel textarea, .panel select { width:100%; padding:9px 12px; margin-bottom:9px; border:1px solid var(--line);
+    border-radius:var(--r-sm); background:var(--surface-2); color:var(--fg); font:inherit; font-size:13.5px; transition:border-color .12s, box-shadow .12s; }
+  .panel input::placeholder, .panel textarea::placeholder { color:var(--muted); }
+  .panel input:focus, .panel textarea:focus, .panel select:focus { outline:0; border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-weak); }
+  .panel textarea { resize:vertical; min-height:70px; }
+  .panel button { padding:9px 18px; border:0; border-radius:var(--r-sm); background:linear-gradient(135deg,var(--accent),var(--accent-2));
+    color:#fff; cursor:pointer; font:inherit; font-size:13.5px; font-weight:600; box-shadow:0 2px 10px var(--accent-weak); transition:transform .1s, opacity .12s; }
+  .panel button:hover:not(:disabled) { transform:translateY(-1px); }
+  .panel button:disabled { opacity:.5; cursor:default; }
+  .hint { font-size:12px; color:var(--muted); margin:2px 0 9px; line-height:1.5; }
+
+  .cols { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:16px; align-items:start; }
+  .col { background:var(--bg-2); border:1px solid var(--line); border-radius:var(--r-lg); padding:12px; min-height:84px; }
+  .col h2 { display:flex; align-items:center; gap:8px; font-size:12px; text-transform:uppercase; letter-spacing:.06em; color:var(--fg-2); font-weight:650; margin:2px 4px 12px; }
+  .count { display:inline-grid; place-items:center; min-width:20px; height:20px; padding:0 6px; border-radius:99px; background:var(--surface-3); color:var(--muted); font:600 11px/1 var(--mono); }
+
+  .job { position:relative; background:var(--surface); border:1px solid var(--line); border-radius:var(--r); padding:12px 13px 12px 16px;
+    margin-bottom:10px; box-shadow:0 1px 2px rgba(0,0,0,.14); transition:border-color .12s; }
+  .job::before { content:""; position:absolute; left:0; top:11px; bottom:11px; width:3px; border-radius:99px; background:var(--line-2); }
+  .job[data-status="running"]::before { background:var(--accent); }
+  .job[data-status="awaiting_input"]::before { background:var(--warn); }
+  .job[data-status="pr_opened"]::before { background:var(--ok); }
+  .job[data-status="error"]::before, .job[data-status="timeout"]::before { background:var(--err); }
+  .job:hover { border-color:var(--line-2); }
+  .job-head { display:flex; align-items:flex-start; justify-content:space-between; gap:10px; }
+  .job .t { font-weight:600; font-size:13.5px; line-height:1.4; letter-spacing:-.01em; overflow:hidden; text-overflow:ellipsis;
+    display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; }
+  .job .m { font-size:12px; color:var(--muted); margin-top:6px; line-height:1.7; }
+  .job .m .badge, .job .m .proj { vertical-align:middle; }
+  .job .m.when { font-family:var(--mono); font-size:11px; opacity:.85; }
+  .job .m.links a { margin-right:13px; font-weight:550; }
+  .proj { font-family:var(--mono); font-size:11.5px; color:var(--fg-2); }
+
+  .badge { display:inline-flex; align-items:center; gap:6px; white-space:nowrap; font-size:11px; font-weight:600; padding:2px 9px; border-radius:99px;
+    background:var(--surface-3); color:var(--fg-2); margin-right:2px; }
+  .job-head .badge { flex-shrink:0; }
+  .badge::before { content:""; width:6px; height:6px; border-radius:50%; background:currentColor; }
+  .badge.running { color:var(--accent); background:var(--accent-weak); }
+  .badge.running::before { animation:pulse 1.4s ease-in-out infinite; }
+  .badge.awaiting_input { color:var(--warn); background:var(--warn-weak); }
+  .badge.pr_opened { color:var(--ok); background:var(--ok-weak); }
+  .badge.error, .badge.timeout { color:var(--err); background:var(--err-weak); }
+  .badge.queued, .badge.received { color:var(--info); background:var(--info-weak); }
+  .badge.no_fix, .badge.skipped { color:var(--muted); background:var(--surface-3); }
+  .badge.kind { background:transparent; color:var(--muted); border:1px solid var(--line-2); text-transform:lowercase; font-weight:550; }
+  .badge.kind::before { display:none; }
+  .chip { display:inline-flex; align-items:center; font-size:10.5px; font-weight:600; padding:1px 8px; border-radius:99px; background:var(--warn-weak); color:var(--warn); margin-left:8px; }
+
+  .q { white-space:pre-wrap; font-size:12.5px; line-height:1.55; background:var(--bg-2); border:1px solid var(--line); border-radius:var(--r-sm);
+    padding:9px 11px; margin-top:9px; max-height:190px; overflow:auto; }
+  details { margin-top:8px; font-size:12px; }
+  details summary { cursor:pointer; color:var(--fg-2); font-weight:550; user-select:none; list-style:none; display:inline-flex; align-items:center; gap:6px; }
+  details summary::-webkit-details-marker { display:none; }
+  details summary::before { content:"+"; font:700 12px/1 var(--mono); color:var(--muted); }
+  details[open] > summary::before { content:"-"; }
+  details summary:hover { color:var(--fg); }
+  details pre { white-space:pre-wrap; overflow-wrap:anywhere; font:11.5px/1.55 var(--mono); background:var(--bg-2); border:1px solid var(--line);
+    border-radius:var(--r-sm); padding:10px 11px; max-height:340px; overflow:auto; margin:8px 0 0; color:var(--fg-2); }
+
+  .strip { display:flex; gap:3px; margin-top:11px; }
+  .seg { flex:1; height:7px; border-radius:99px; background:var(--surface-3); font-size:0; overflow:hidden; transition:background .2s; }
+  .seg.done { background:var(--accent); opacity:.85; }
+  .seg.cur { background:var(--accent); box-shadow:0 0 0 2px var(--accent-weak); animation:pulse 1.5s ease-in-out infinite; }
   .seg.cur.still { animation:none; }
-  @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:.4; } }
-  .stagetext { font-size:12px; color:var(--muted); margin-top:2px; }
-  .answer textarea { width:100%; margin-top:8px; padding:6px 10px; border:1px solid var(--line); border-radius:8px; background:var(--bg); color:var(--fg); font:inherit; font-size:13px; resize:vertical; min-height:44px; }
-  .answer .btns { display:flex; gap:8px; margin-top:6px; }
-  .answer button { flex:1; padding:6px 0; border:0; border-radius:8px; cursor:pointer; font:inherit; font-size:13px; color:#fff; }
-  .answer button.go { background:var(--ok); } .answer button.no { background:var(--err); }
-  .answer button.redo { background:var(--warn); }
-  .answer button:disabled { opacity:.5; }
-  .answer .hint { margin:4px 0 0; }
-  .answer button.ask { background:var(--accent); }
-  .chat-log { display:flex; flex-direction:column; gap:6px; margin-top:6px; max-height:260px; overflow:auto; font-size:13px; }
-  .chat-log .turn { max-width:92%; align-self:flex-start; }
+  @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:.35; } }
+  .stagetext { font-size:11.5px; color:var(--fg-2); margin-top:8px; font-weight:550; }
+
+  .answer { margin-top:12px; padding-top:12px; border-top:1px solid var(--line); }
+  .answer textarea { width:100%; padding:8px 11px; border:1px solid var(--line); border-radius:var(--r-sm); background:var(--surface-2); color:var(--fg);
+    font:inherit; font-size:13px; resize:vertical; min-height:46px; transition:border-color .12s, box-shadow .12s; }
+  .answer textarea:focus { outline:0; border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-weak); }
+  .answer .btns { display:flex; gap:8px; margin-top:8px; }
+  .answer button { flex:1; padding:8px 0; border:0; border-radius:var(--r-sm); cursor:pointer; font:inherit; font-size:12.5px; font-weight:600; color:#fff; transition:transform .1s, opacity .12s; }
+  .answer button:hover:not(:disabled) { transform:translateY(-1px); }
+  .answer button.go { background:linear-gradient(135deg,#3fb950,#2ea043); }
+  .answer button.no { background:var(--surface-3); color:var(--fg-2); }
+  .answer button.redo { background:linear-gradient(135deg,var(--warn),#c8860f); }
+  .answer button.ask { background:linear-gradient(135deg,var(--accent),var(--accent-2)); }
+  .answer button:disabled { opacity:.5; cursor:default; }
+  .answer .hint { margin:6px 0 0; }
+
+  .chat { margin-top:10px; }
+  .chat-log { display:flex; flex-direction:column; gap:8px; margin-top:10px; max-height:300px; overflow:auto; font-size:13px; padding:2px; }
+  .chat-log .turn { max-width:88%; align-self:flex-start; }
   .chat-log .turn.human { align-self:flex-end; }
-  .chat-log .turn .b { white-space:pre-wrap; overflow-wrap:anywhere; border:1px solid var(--line); border-radius:8px; padding:6px 10px; background:var(--bg); }
-  .chat-log .turn.human .b { background:var(--accent); border-color:var(--accent); color:#fff; }
-  .chat-log .turn .c { font-size:11px; color:var(--muted); margin-top:1px; }
+  .chat-log .turn .b { white-space:pre-wrap; overflow-wrap:anywhere; border:1px solid var(--line); border-radius:12px 12px 12px 4px; padding:8px 11px; background:var(--surface-2); line-height:1.5; }
+  .chat-log .turn.human .b { background:linear-gradient(135deg,var(--accent),var(--accent-2)); border-color:transparent; color:#fff; border-radius:12px 12px 4px 12px; }
+  .chat-log .turn .c { font-size:10.5px; color:var(--muted); margin-top:3px; padding:0 4px; }
   .chat-log .turn.human .c { text-align:right; }
-  .chat-log .turn.wait { color:var(--muted); font-size:12px; }
-  .spin { display:inline-block; width:10px; height:10px; border:2px solid var(--muted); border-top-color:transparent; border-radius:50%; margin-right:6px; vertical-align:-1px; animation:rot .9s linear infinite; }
+  .chat-log .turn.wait { color:var(--muted); font-size:12px; align-self:flex-start; }
+  .spin { display:inline-block; width:11px; height:11px; border:2px solid var(--muted); border-top-color:transparent; border-radius:50%; margin-right:6px; vertical-align:-1px; animation:rot .8s linear infinite; }
   @keyframes rot { to { transform:rotate(360deg); } }
-  .brain { margin:0 0 24px; }
-  .brain > summary { cursor:pointer; font-size:13px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); }
-  .brain table, .stats-body table { border-collapse:collapse; font-size:12px; margin-top:8px; }
-  .brain th, .brain td, .stats-body th, .stats-body td { border:1px solid var(--line); padding:3px 8px; text-align:left; }
-  .brain th, .stats-body th { color:var(--muted); font-weight:600; }
-  .brain button { padding:3px 10px; border:0; border-radius:6px; background:var(--accent); color:#fff; cursor:pointer; font:inherit; font-size:12px; }
+
+  .brain { margin:0 0 30px; background:var(--surface); border:1px solid var(--line); border-radius:var(--r-lg); padding:15px 18px; box-shadow:var(--shadow); }
+  .brain > summary { font-size:13px; font-weight:650; color:var(--fg); letter-spacing:-.01em; }
+  .brain > summary .hint { display:inline; }
+  .brain table, .stats-body table { border-collapse:collapse; font-size:12px; margin-top:12px; width:100%; }
+  .brain th, .brain td, .stats-body th, .stats-body td { border-bottom:1px solid var(--line); padding:7px 10px; text-align:left; }
+  .brain tr:last-child td, .stats-body tr:last-child td { border-bottom:0; }
+  .brain th, .stats-body th { color:var(--muted); font-weight:600; font-size:10.5px; text-transform:uppercase; letter-spacing:.05em; }
+  .stats-body { overflow-x:auto; }
+  .stats-body td:nth-child(n+2), .stats-body th:nth-child(n+2) { font-family:var(--mono); }
+  .stats-body th { white-space:nowrap; }
+  .brain button { padding:5px 12px; border:1px solid var(--line-2); border-radius:var(--r-sm); background:var(--surface-3); color:var(--fg);
+    cursor:pointer; font:inherit; font-size:12px; font-weight:600; transition:border-color .12s; }
+  .brain button:hover:not(:disabled) { border-color:var(--accent); }
   .brain button:disabled { opacity:.5; }
+  .empty { color:var(--muted); font-size:12.5px; padding:8px 4px; }
   .ok-t { color:var(--ok); } .err-t { color:var(--err); } .muted-t { color:var(--muted); }
 </style>
 </head>
 <body>
-<h1>gumo_brain <small>the Gumo Engine &mdash; Sentry fixes, requests &amp; feature pipelines</small></h1>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">gb</span>
+    <span class="brand-name">gumo_brain</span>
+    <span class="brand-sub">the Gumo Engine</span>
+  </div>
+  <div class="topbar-meta">
+    <span class="live"><span class="live-dot"></span>live</span>
+  </div>
+</header>
+<main class="wrap">
 <div id="msg"></div>
 
+<div class="section-label">New work</div>
 <div class="intake">
   <div class="panel">
     <h2>Fix a Sentry issue</h2>
@@ -134,12 +264,14 @@ DASHBOARD_HTML = """<!doctype html>
   <div id="brain-body"><div class="empty">loading&hellip;</div></div>
 </details>
 
+<div class="section-label">Pipeline queue</div>
 <div class="cols">
-  <div class="col"><h2>Pending</h2><div id="pending"></div></div>
-  <div class="col"><h2>In progress</h2><div id="progress"></div></div>
-  <div class="col"><h2>Awaiting input</h2><div id="awaiting"></div></div>
-  <div class="col"><h2>Completed</h2><div id="completed"></div></div>
+  <div class="col"><h2>Pending <span class="count" id="count-pending">0</span></h2><div id="pending"></div></div>
+  <div class="col"><h2>In progress <span class="count" id="count-progress">0</span></h2><div id="progress"></div></div>
+  <div class="col"><h2>Awaiting input <span class="count" id="count-awaiting">0</span></h2><div id="awaiting"></div></div>
+  <div class="col"><h2>Completed <span class="count" id="count-completed">0</span></h2><div id="completed"></div></div>
 </div>
+</main>
 <script>
 const GROUPS = {
   pending: ['received', 'queued'],
@@ -149,6 +281,9 @@ const GROUPS = {
 };
 const STAGE_NAMES = ['Intake', 'PRD', 'Recon', 'Design', 'Plan', 'Build 1', 'Build 2+', 'Test', 'Review', 'Ship'];
 const KIND_LABEL = { sentry: 'sentry', task: 'request', feature: 'feature', memory: 'memory' };
+const STATUS_LABEL = { received: 'Received', queued: 'Queued', running: 'Running',
+  awaiting_input: 'Awaiting input', pr_opened: 'PR opened', no_fix: 'No fix',
+  skipped: 'Skipped', error: 'Error', timeout: 'Timeout' };
 const LIVE = ['received', 'queued', 'running', 'awaiting_input'];
 
 function esc(s) { const d = document.createElement('span'); d.textContent = s == null ? '' : String(s); return d.innerHTML; }
@@ -244,9 +379,13 @@ function card(j) {
     stats = `<details class="stats" data-key="${id}:stats" data-job="${id}"><summary>stats</summary>
       <div class="stats-body" id="stats-${id}"><div class="empty">&hellip;</div></div></details>`;
   }
-  return `<div class="job"><div class="t">${esc(j.title || j.issue_id)}</div>
-    <div class="m"><span class="badge ${esc(j.status)}">${esc(j.status)}</span>${kind}${esc(j.project)}${score}${phase}${owner}</div>
-    ${strip}<div class="m">${links}</div><div class="m">${when}</div>${ask}${rekick}${stats}</div>`;
+  return `<div class="job" data-status="${esc(j.status)}" data-kind="${esc(j.kind)}">
+    <div class="job-head">
+      <div class="t">${esc(j.title || j.issue_id)}</div>
+      <span class="badge ${esc(j.status)}">${esc(STATUS_LABEL[j.status] || j.status)}</span>
+    </div>
+    <div class="m">${kind}<span class="proj">${esc(j.project)}</span>${score}${phase}${owner}</div>
+    ${strip}${links ? `<div class="m links">${links}</div>` : ''}<div class="m when">${when}</div>${ask}${rekick}${stats}</div>`;
 }
 
 // ---------- render, with draft + <details> state preservation (§6: typed
@@ -288,6 +427,8 @@ function renderJobs(jobs) {
     const items = jobs.filter(j => statuses.includes(j.status));
     document.getElementById(div).innerHTML =
       items.length ? items.map(card).join('') : '<div class="empty">none</div>';
+    const cnt = document.getElementById('count-' + div);
+    if (cnt) cnt.textContent = items.length;
   }
 
   // re-open evidence/analysis/stats/chat panels; stats + chat bodies refill
