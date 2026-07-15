@@ -113,16 +113,16 @@ def test_dashboard_has_no_backslashes():
 
 
 def test_dashboard_shell_is_balanced():
-    """The redesign wraps content in a sticky topbar + <main>; the ids and hooks
-    the front-end JS drives must all be present and the shell balanced."""
+    """The inbox split-view: the ids and hooks the front-end JS drives must all
+    be present and the shell balanced."""
     from app.dashboard import DASHBOARD_HTML as h
 
-    assert h.count("<main") == h.count("</main>") == 1
     assert h.count("<script>") == h.count("</script>") == 1
-    for tok in ('class="topbar"', 'id="msg"', 'id="pending"', 'id="progress"',
-                'id="awaiting"', 'id="completed"', 'id="count-pending"',
+    for tok in ('class="topbar"', 'id="msg"', 'id="inbox-list"', 'id="welcome"',
+                'id="dpane"', 'id="d-thread"', 'id="d-title"', 'id="c-in"',
                 'id="brain-body"', 'data-status="', 'STATUS_LABEL',
-                # live session view hooks
-                'id="sv"', 'id="sv-stream"', 'id="sv-timeline"', 'id="sv-note"',
-                'function routeHash', 'function steer', 'session/stream'):
+                'function routeHash', 'function sendComposer', 'function answer',
+                'function setFilter', 'session/stream', 'chat/stream',
+                # intake forms keep their ids — the submit handlers depend on them
+                'id="task-project"', 'id="feat-project"', 'id="ref"'):
         assert tok in h, tok

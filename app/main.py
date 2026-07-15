@@ -345,9 +345,13 @@ async def gate_chat_post(job_id: str, body: ChatBody):
     if job is None:
         raise HTTPException(status_code=404, detail=f"unknown job '{job_id}'")
     if (job.get("kind") or "") != "feature":
-        raise HTTPException(status_code=409, detail="chat is available on feature gates only")
-    if job["status"] != "awaiting_input":
-        raise HTTPException(status_code=409, detail=f"job is '{job['status']}', not parked at a gate")
+        raise HTTPException(status_code=409, detail="chat is available on feature pipelines only")
+    # chat is available while parked at a gate AND mid-run (the inbox conversation):
+    # the fast lane answers from persisted artifacts without touching the repo; a
+    # code-reading escalation queues on the repo lock and lands via persist-then-poll.
+    if job["status"] not in ("awaiting_input", "running"):
+        raise HTTPException(status_code=409,
+                            detail=f"job is '{job['status']}' — chat needs a parked or running stage")
     stage = int(job.get("stage") or 0)
     if store.chat_count(job_id, stage) >= settings.chat_max_turns_per_gate:
         raise HTTPException(status_code=409,
@@ -442,11 +446,17 @@ async def session_snapshot(job_id: str):
             "gate_mode": job.get("gate_mode") or "full", "owner": job.get("owner") or "",
             "pr_url": job.get("pr_url") or "", "clickup_task_url": job.get("clickup_task_url") or "",
             "question": job.get("question") or "", "gate_kind": job.get("gate_kind") or "",
+            "evidence": job.get("evidence") or "", "analysis": job.get("analysis") or "",
             "updated_at": job.get("updated_at"),
         },
         "runs": store.stage_runs_for(job_id),
         "guidance": store.guidance_for(job_id),
         "artifacts": artifacts,
+        # the full conversation across ALL stages (the inbox thread), plus the
+        # current-stage pending/limit flags the composer needs
+        "chat": store.chat_for(job_id),
+        "chat_pending": _chat_pending(store, job_id, stage, settings.chat_timeout_seconds),
+        "chat_limit": store.chat_count(job_id, stage) >= settings.chat_max_turns_per_gate,
         "live": live,
         # steering interrupts in place only with session persistence; otherwise the
         # note is queued to the next checkpoint (still useful, just not immediate)

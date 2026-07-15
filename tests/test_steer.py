@@ -188,7 +188,9 @@ class TestSessionRoutes:
         return store, worker
 
     def test_snapshot_shape(self, client):
-        self._feature(client, "feat-a1")
+        store, _ = self._feature(client, "feat-a1")
+        store.chat_add("feat-a1", 5, 1, "human", "how is it going?")
+        store.chat_add("feat-a1", 5, 1, "engine", "building the Money object")
         r = client.get("/api/jobs/feat-a1/session", headers=AUTH)
         assert r.status_code == 200
         data = r.json()
@@ -196,7 +198,10 @@ class TestSessionRoutes:
         assert data["job"]["stage_name"]
         assert data["live"] is True
         assert data["steer_available"] is True
-        assert {"runs", "guidance", "artifacts"} <= data.keys()
+        assert {"runs", "guidance", "artifacts", "chat", "chat_pending", "chat_limit"} <= data.keys()
+        # the snapshot carries the FULL conversation (the inbox thread)
+        assert [t["role"] for t in data["chat"]] == ["human", "engine"]
+        assert data["chat_pending"] is False
 
     def test_snapshot_404_and_409(self, client):
         assert client.get("/api/jobs/nope/session", headers=AUTH).status_code == 404

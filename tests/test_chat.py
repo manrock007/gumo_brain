@@ -375,7 +375,12 @@ class TestChatEndpoints:
         store = self._park_feature(m)
         r = c.post("/api/jobs/feat-api1/chat", headers=AUTH, json={"message": "  "})
         assert r.status_code == 400
+        # mid-run chat is allowed (the inbox conversation) — 202, not 409
         store.set_status("feat-api1", "running")
+        r = c.post("/api/jobs/feat-api1/chat", headers=AUTH, json={"message": "hi"})
+        assert r.status_code == 202
+        # but a finished job has no one to talk to
+        store.set_status("feat-api1", "pr_opened")
         r = c.post("/api/jobs/feat-api1/chat", headers=AUTH, json={"message": "hi"})
         assert r.status_code == 409
 
