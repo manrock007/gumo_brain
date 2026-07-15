@@ -307,6 +307,12 @@ class Worker:
         broker = self.engine.stage_broker
         broker.start(issue_id)
         try:
+            # publish BEFORE the lock wait: the pane is already live (status is
+            # running), and silence while another run holds the repo reads as a
+            # hang. Moving start() inside the lock would be worse — a subscriber
+            # with no turn gets an immediate 'done' and reads "run finished".
+            broker.publish(issue_id, "status",
+                           "waiting for the repository workspace (another run may be using it)")
             async with self.locks.for_repo(target.repo):  # workspace toucher
                 broker.publish(issue_id, "status", "preparing the repository workspace")
                 if phase == 2:
