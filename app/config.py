@@ -52,6 +52,9 @@ class Settings(BaseSettings):
 
     # GitHub token used for git push + `gh pr create` (fine-grained PAT)
     github_token: str = ""
+    # PR lifecycle: auto-flip captured draft PRs to ready-for-review and post
+    # the first `@sentry review` trigger (the Seer bot ignores plain pushes)
+    pr_auto_ready: bool = True
 
     # ClickUp — one task per issue being fixed; Claude posts progress comments
     clickup_token: str = ""

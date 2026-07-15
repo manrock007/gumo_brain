@@ -1,6 +1,10 @@
+import re
 import sqlite3
 import time
 from contextlib import contextmanager
+
+# owner/name + number out of a GitHub PR url (kept escape-simple on purpose)
+PR_URL_PARTS_RE = re.compile(r"github\.com/([\w.-]+/[\w.-]+)/pull/(\d+)")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -94,6 +98,20 @@ CREATE TABLE IF NOT EXISTS stage_runs (
     result_status TEXT DEFAULT '',
     session_id TEXT DEFAULT '',      -- the run's CLI session (resumable)
     resumed INTEGER NOT NULL DEFAULT 0  -- 1 = this run continued a STAGE_ASK session
+);
+
+CREATE TABLE IF NOT EXISTS prs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL,
+    url TEXT NOT NULL UNIQUE,        -- one row per PR, however many a packet opens
+    repo TEXT NOT NULL DEFAULT '',   -- owner/name parsed from the url
+    number INTEGER,
+    state TEXT NOT NULL DEFAULT 'draft',  -- draft | ready | in_review | changes_requested | approved | merged | closed
+    review_rounds INTEGER NOT NULL DEFAULT 0,  -- @sentry review passes requested (shepherd)
+    last_checked REAL,               -- last shepherd poll
+    detail TEXT DEFAULT '',          -- latest shepherd note (finding counts, errors)
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS gate_chat (
@@ -525,6 +543,53 @@ class JobStore:
                     "SELECT * FROM gate_chat WHERE job_id = ? AND stage = ? ORDER BY id",
                     (job_id, stage),
                 ).fetchall()
+            return [dict(r) for r in rows]
+
+    # ---------- pull requests (one work packet can open several) ----------
+
+    def pr_add(self, job_id: str, url: str, state: str = "draft") -> bool:
+        """Record a PR a run opened. Idempotent by URL (runs re-print PR_URL
+        lines across stages); returns True only when the row is NEW — callers
+        key one-time actions (mark-ready, first review trigger) off that."""
+        url = (url or "").strip().rstrip("/")
+        if not url:
+            return False
+        m = PR_URL_PARTS_RE.search(url)
+        repo, number = (m.group(1), int(m.group(2))) if m else ("", None)
+        now = time.time()
+        with self._conn() as c:
+            cur = c.execute(
+                """INSERT INTO prs (job_id, url, repo, number, state, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(url) DO NOTHING""",
+                (job_id, url, repo, number, state, now, now),
+            )
+            return cur.rowcount == 1
+
+    def prs_for(self, job_id: str) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM prs WHERE job_id = ? ORDER BY id", (job_id,)
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def pr_set(self, url: str, **fields):
+        if not fields:
+            return
+        cols = ", ".join(f"{k} = ?" for k in fields)
+        with self._conn() as c:
+            c.execute(
+                f"UPDATE prs SET {cols}, updated_at = ? WHERE url = ?",
+                (*fields.values(), time.time(), url),
+            )
+
+    def prs_in_state(self, states: tuple[str, ...] | list[str]) -> list[dict]:
+        """Shepherd work-list: every tracked PR in one of the given states."""
+        marks = ",".join("?" for _ in states)
+        with self._conn() as c:
+            rows = c.execute(
+                f"SELECT * FROM prs WHERE state IN ({marks}) ORDER BY id", tuple(states)
+            ).fetchall()
             return [dict(r) for r in rows]
 
     def chat_count(self, job_id: str, stage: int, attempt: int | None = None) -> int:

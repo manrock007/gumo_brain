@@ -26,6 +26,7 @@ class FixResult:
         # pr_opened | needs_input | no_fix | error | timeout
         self.status = status
         self.pr_url = pr_url
+        self.pr_urls: list[str] = [pr_url] if pr_url else []  # every PR the run mentioned
         self.detail = detail
         self.meta = meta or {}  # cost_usd / num_turns / duration_ms from the CLI envelope
 
@@ -508,7 +509,10 @@ async def run_claude(settings: Settings, target: RepoTarget, workspace: str, pro
     result_text = raw.text
     pr_match = PR_URL_RE.search(result_text)
     if pr_match:
-        return FixResult("pr_opened", pr_url=pr_match.group(0), detail=result_text[-3000:], meta=raw.meta)
+        res = FixResult("pr_opened", pr_url=pr_match.group(0), detail=result_text[-3000:], meta=raw.meta)
+        # a packet can mention several PRs — capture them ALL for the prs table
+        res.pr_urls = list(dict.fromkeys(PR_URL_RE.findall(result_text)))
+        return res
     if "NEEDS_INPUT:" in result_text:
         return FixResult("needs_input", detail=result_text.split("NEEDS_INPUT:", 1)[1].strip()[:8000], meta=raw.meta)
     return FixResult("no_fix", detail=result_text[-3000:], meta=raw.meta)

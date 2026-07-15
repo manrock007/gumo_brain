@@ -337,6 +337,7 @@ class Worker:
         finally:
             broker.finish(issue_id)
         log.info("issue %s -> %s %s", issue_id, result.status, result.pr_url or "")
+        await self.engine.record_prs(issue_id, result.pr_urls)
 
         if result.status == "needs_input":
             await self._park_awaiting(issue_id, task_id or "", result.detail)
@@ -419,6 +420,7 @@ class Worker:
         finally:
             broker.finish(job_id)
         log.info("request %s -> %s %s", job_id, result.status, result.pr_url or "")
+        await self.engine.record_prs(job_id, result.pr_urls)
 
         if result.status == "needs_input":
             await self._park_awaiting(job_id, task_id, result.detail)

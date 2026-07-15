@@ -208,6 +208,12 @@ DASHBOARD_HTML = """<!doctype html>
     border-radius:50%; margin-right:6px; vertical-align:-1px; animation:rot .8s linear infinite; }
   @keyframes rot { to { transform:rotate(360deg); } }
 
+  .prlist { list-style:none; margin:0; padding:0; }
+  .prlist li { display:flex; align-items:center; gap:10px; padding:8px 4px; border-bottom:1px solid var(--line); font-size:12.5px; }
+  .prlist li:last-child { border-bottom:0; }
+  .prlist li a { font-family:var(--mono); font-size:12px; font-weight:600; }
+  .prlist .meta { color:var(--muted); font-size:11.5px; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+
   .gate { border:1px solid var(--warn); border-radius:var(--r); background:var(--surface); padding:12px 14px; }
   .gate .g-h { font-size:11.5px; font-weight:650; color:var(--warn); text-transform:uppercase; letter-spacing:.06em; margin-bottom:8px; }
   .q { white-space:pre-wrap; font-size:12.5px; line-height:1.55; background:var(--bg-2); border:1px solid var(--line);
@@ -629,6 +635,24 @@ function stageCards(data) {
   return h || '<div class="lead">no stage runs yet</div>';
 }
 
+const PR_STATE_LABEL = { draft: 'Draft', ready: 'Ready', in_review: 'In review',
+  changes_requested: 'Changes requested', approved: 'Approved', merged: 'Merged', closed: 'Closed' };
+const PR_STATE_CLASS = { draft: 'queued', ready: 'received', in_review: 'running',
+  changes_requested: 'awaiting_input', approved: 'pr_opened', merged: 'pr_opened', closed: 'no_fix' };
+
+function prSection(data) {
+  const prs = data.prs || [];
+  if (!prs.length) return '';
+  const rows = prs.map(p => {
+    const name = p.repo && p.number ? esc(p.repo) + '#' + esc(String(p.number)) : esc(p.url);
+    const rounds = p.review_rounds > 1 ? ` &middot; round ${esc(String(p.review_rounds))}` : '';
+    const note = p.detail ? ` &middot; ${esc(String(p.detail).slice(0, 120))}` : '';
+    return `<li><span class="badge ${esc(PR_STATE_CLASS[p.state] || 'queued')}">${esc(PR_STATE_LABEL[p.state] || p.state)}</span>
+      <a href="${esc(p.url)}" target="_blank">${name}</a><span class="meta">${rounds}${note}</span></li>`;
+  }).join('');
+  return `<div class="daydiv">&mdash; pull requests &mdash;</div><ul class="prlist">${rows}</ul>`;
+}
+
 function convoThread(data) {
   // one chronological timeline: chat turns AND steers (from the guidance log)
   // merged and sorted by their `at` timestamps — never chat-then-steers.
@@ -723,7 +747,7 @@ function renderDetail(data) {
     ? '<div class="daydiv">&mdash; conversation &mdash;</div>'
       + (convoThread(data) || '<div class="lead">no messages yet &mdash; ask the engine anything about this work</div>')
     : '';
-  document.getElementById('d-thread').innerHTML = pipeline + activity + convo + gatePacket(data);
+  document.getElementById('d-thread').innerHTML = pipeline + activity + prSection(data) + convo + gatePacket(data);
   restoreThread(st);
 
   // re-seat the persistent live log + streaming chat bubble after the rebuild

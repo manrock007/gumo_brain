@@ -284,9 +284,24 @@ running, the note is recorded as guidance for the next checkpoint (the safe
 fallback). Fail-closed: if the checkpoint push or session id is missing, the
 steer degrades to a fresh re-run carrying the note as guidance — never lost.
 
+### PR lifecycle
+
+Every PR a run mentions (`PR_URL:` lines — a packet can open several: P5 +
+per-build-group in P6) is tracked in the `prs` table, idempotently by URL.
+On first capture the engine runs the lifecycle kickoff (best-effort, gated by
+`pr_auto_ready`): flip the draft to ready-for-review (GraphQL
+`markPullRequestReadyForReview`) and post the first `@sentry review` — the
+review bot ignores plain pushes, so every round needs an explicit trigger.
+States: `draft → ready → in_review → changes_requested → approved →
+merged/closed`; the detail pane lists each PR with its state, round count and
+latest shepherd note. Memory-bootstrap PRs are tracked but never kicked off
+(doc drafts). The autonomous shepherd (next increment) polls `in_review` PRs,
+fixes findings, and re-triggers until approved.
+
 ## 7. Guardrails
 
-- One branch per feature; serial worker; PRs always drafts; fail-closed gates.
+- One branch per feature; serial worker; PRs open as drafts (the lifecycle
+  kickoff may mark them ready — never merges); fail-closed gates.
 - Features are human-initiated → exempt from grading/daily cap; every stage
   run is recorded in `stage_runs` so cost is visible instead.
 - Artifact content pulled from ClickUp is delimited as human-authored INPUT;

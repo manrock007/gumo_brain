@@ -218,6 +218,15 @@ class TestSessionRoutes:
         assert data["chat_available"] is True
         assert data["steer_available"] is False  # steering stays feature-only
 
+    def test_snapshot_lists_the_packets_prs(self, client):
+        store, _ = self._feature(client, "feat-a9")
+        store.pr_add("feat-a9", "https://github.com/o/r/pull/11")
+        store.pr_add("feat-a9", "https://github.com/o/r/pull/12")
+        store.pr_set("https://github.com/o/r/pull/11", state="approved")
+        r = client.get("/api/jobs/feat-a9/session", headers=AUTH)
+        prs = r.json()["prs"]
+        assert [(p["number"], p["state"]) for p in prs] == [(11, "approved"), (12, "draft")]
+
     def test_steer_endpoint_queues(self, client):
         # not running -> queued (guidance), 202
         self._feature(client, "feat-a2", status="awaiting_input", stage=3)
