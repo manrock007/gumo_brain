@@ -126,7 +126,11 @@ async def prepare_workspace(settings: Settings, target: RepoTarget, branch: str,
             raise RuntimeError(f"git clone failed: {out[-2000:]}")
 
     start_point = f"origin/{target.base}"
-    cmds = [["git", "fetch", "origin", target.base]]
+    # discard leftovers FIRST: a run killed mid-write (deploy restart) leaves
+    # dirty TRACKED files that make every later `git checkout` refuse — origin
+    # is always the record, local edits from a dead run are worthless
+    cmds = [["git", "reset", "--hard"],
+            ["git", "fetch", "origin", target.base]]
     if keep_branch:
         # reuse the branch if present locally, else recreate from base
         code, _ = await _run(["git", "rev-parse", "--verify", branch], cwd=workspace, timeout=60)
@@ -180,6 +184,11 @@ async def prepare_feature_workspace(settings: Settings, target: RepoTarget,
         if code != 0:
             raise RuntimeError(f"git clone failed: {out[-2000:]}")
 
+    # discard leftovers FIRST (see prepare_workspace): a stage run killed
+    # mid-write leaves dirty tracked files that abort the checkout below
+    code, out = await git(workspace, "reset", "--hard")
+    if code != 0:
+        raise RuntimeError(f"git reset --hard failed: {out[-2000:]}")
     code, _ = await git(workspace, "fetch", "origin", target.base)
     if code != 0:
         raise RuntimeError(f"git fetch {target.base} failed")
