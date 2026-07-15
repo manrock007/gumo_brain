@@ -926,23 +926,41 @@ class Worker:
             return
 
         unreplied = [c for c in open_findings if c["id"] not in replied_to]
-        if unreplied:
-            branch = ((info.get("head") or {}).get("ref") or "").strip()
-            verdicts = await self._shepherd_fix(pr, branch, unreplied)
-            if verdicts is None:
-                self.store.pr_set(url, detail="fix run failed — will retry")
-                return
-            for c in unreplied:
-                kind, summary = verdicts.get(c["id"], ("FIXED", "addressed in the latest push"))
-                prefix = "Fixed — " if kind == "FIXED" else "Not a real issue — "
-                await gh.reply_to_review_comment(repo, number, c["id"],
-                                                 prefix + summary[:800])
-        # every round needs its own explicit trigger — pushes/replies alone
+        if not unreplied:
+            # every open finding already carries our reply (fix or rebut) and got
+            # its trigger in THAT pass — re-triggering every pass here would burn
+            # the round cap while the bot simply hasn't re-judged yet. Wait.
+            self.store.pr_set(url, detail="all findings replied — awaiting re-review")
+            return
+
+        branch = ((info.get("head") or {}).get("ref") or "").strip()
+        verdicts = await self._shepherd_fix(pr, branch, unreplied)
+        if verdicts is None:
+            self.store.pr_set(url, detail="fix run failed — will retry")
+            return
+        handled = 0
+        for c in unreplied:
+            v = verdicts.get(c["id"])
+            if not v:
+                # NEVER claim FIXED for a finding the run did not report — a false
+                # reply marks it handled forever and the same bug just gets
+                # re-flagged every round. Left unreplied, the NEXT pass re-attempts.
+                log.warning("shepherd: no verdict for finding %s on %s", c["id"], url)
+                continue
+            kind, summary = v
+            prefix = "Fixed — " if kind == "FIXED" else "Not a real issue — "
+            await gh.reply_to_review_comment(repo, number, c["id"],
+                                             prefix + summary[:800])
+            handled += 1
+        if handled == 0:
+            self.store.pr_set(url, detail="run returned no verdicts — will retry")
+            return
+        # one explicit trigger per round of actual work — pushes/replies alone
         # never re-engage the bot (learned shepherding this repo's own PRs)
         if await gh.comment(repo, number, "@sentry review"):
             rounds = int(pr.get("review_rounds") or 0) + 1
             self.store.pr_set(url, state="in_review", review_rounds=rounds,
-                              detail=f"round {rounds}: {len(unreplied)} finding(s) addressed")
+                              detail=f"round {rounds}: {handled} finding(s) addressed")
 
     async def _shepherd_fix(self, pr: dict, branch: str, findings: list[dict]) -> dict | None:
         """One headless verify-and-fix run on the PR branch. Returns

@@ -125,9 +125,10 @@ class TestShepherdFindings:
         row = store.prs_for("feat-s1")[0]
         assert row["state"] == "in_review" and row["review_rounds"] == 3
 
-    def test_rebutted_finding_not_refixed_but_retriggered(self, store, tmp_path, monkeypatch):
-        """A finding we already replied to must not be fixed again — but the
-        bot only re-judges on an explicit trigger, so one is posted."""
+    def test_replied_findings_wait_without_burning_rounds(self, store, tmp_path, monkeypatch):
+        """Seer PR#11 round 1: findings we already replied to (fix or rebut) got
+        their trigger in that pass — later passes must WAIT for the bot's
+        re-judgment, not re-trigger every 3 minutes until the round cap."""
         w = _worker(store, tmp_path)
         pr = _pr(store, rounds=2)
         gh = GH(pr=OPEN_PR, comments=[], reviews=[
@@ -140,8 +141,44 @@ class TestShepherdFindings:
 
         monkeypatch.setattr(w, "_shepherd_fix", boom)
         asyncio.run(w._shepherd_pr(pr))
-        assert gh.replies == []
+        assert gh.replies == [] and gh.posted == []
+        row = store.prs_for("feat-s1")[0]
+        assert row["review_rounds"] == 2 and "awaiting" in row["detail"]
+
+    def test_missing_verdict_never_claims_fixed(self, store, tmp_path, monkeypatch):
+        """Seer PR#11 round 1: a finding the run did not report must NOT get a
+        false 'Fixed' reply — left unreplied, the next pass re-attempts it.
+        A round with zero verdicts posts no trigger and burns no round."""
+        w = _worker(store, tmp_path)
+        pr = _pr(store, rounds=1)
+        gh = GH(pr=OPEN_PR, comments=[],
+                reviews=[{"id": 42, "body": FINDING_BODY}])
+        w.engine.github = gh
+
+        async def no_verdicts(*a, **k):
+            return {}
+
+        monkeypatch.setattr(w, "_shepherd_fix", no_verdicts)
+        asyncio.run(w._shepherd_pr(pr))
+        assert gh.replies == [] and gh.posted == []
+        row = store.prs_for("feat-s1")[0]
+        assert row["review_rounds"] == 1 and "no verdicts" in row["detail"]
+
+    def test_partial_verdicts_reply_only_whats_reported(self, store, tmp_path, monkeypatch):
+        w = _worker(store, tmp_path)
+        pr = _pr(store, rounds=1)
+        gh = GH(pr=OPEN_PR, comments=[], reviews=[
+            {"id": 42, "body": FINDING_BODY}, {"id": 44, "body": FINDING_BODY}])
+        w.engine.github = gh
+
+        async def one_verdict(*a, **k):
+            return {42: ("FIXED", "guarded")}
+
+        monkeypatch.setattr(w, "_shepherd_fix", one_verdict)
+        asyncio.run(w._shepherd_pr(pr))
+        assert gh.replies == [(42, "Fixed — guarded")]  # 44 stays unreplied for next pass
         assert gh.posted == ["@sentry review"]
+        assert store.prs_for("feat-s1")[0]["review_rounds"] == 2
 
     def test_max_rounds_stalls_for_a_human(self, store, tmp_path, monkeypatch):
         w = _worker(store, tmp_path, pr_max_review_rounds=2)
