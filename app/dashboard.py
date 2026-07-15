@@ -639,10 +639,22 @@ function stageCards(data) {
   return h || '<div class="lead">no stage runs yet</div>';
 }
 
-function convoTurns(data) {
-  const turns = data.chat || [];
+function convoThread(data) {
+  // one chronological timeline: chat turns AND steers (from the guidance log)
+  // merged and sorted by their `at` timestamps — never chat-then-steers.
+  const items = [];
+  for (const t of data.chat || []) items.push({ at: t.at || 0, kind: 'chat', t });
+  for (const g of data.guidance || [])
+    if (g.action === 'steer') items.push({ at: g.at || 0, kind: 'steer', g });
+  items.sort((a, b) => a.at - b.at);
   let h = '';
-  for (const t of turns) {
+  for (const it of items) {
+    if (it.kind === 'steer') {
+      const g = it.g;
+      h += `<div class="turn human steer"><div class="b">&#8618; Steer: ${esc(g.text)}</div><div class="c">steer &middot; P${esc(String(g.stage))}</div></div>`;
+      continue;
+    }
+    const t = it.t;
     const human = t.role === 'human';
     let meta = human ? 'you' : 'engine';
     meta += ' · P' + t.stage;
@@ -652,16 +664,6 @@ function convoTurns(data) {
     h += `<div class="turn ${human ? 'human' : 'engine'}"><div class="b">${esc(t.text)}</div><div class="c">${esc(meta)}</div></div>`;
   }
   if (data.chat_pending) h += '<div class="turn wait" id="convo-wait"><span class="spin"></span>answering&hellip;</div>';
-  return h;
-}
-
-function steerTurns(data) {
-  // steers live in the guidance log — show them in the conversation flow
-  let h = '';
-  for (const g of data.guidance || []) {
-    if (g.action !== 'steer') continue;
-    h += `<div class="turn human steer"><div class="b">&#8618; Steer: ${esc(g.text)}</div><div class="c">steer &middot; P${esc(String(g.stage))}</div></div>`;
-  }
   return h;
 }
 
@@ -703,7 +705,7 @@ function renderFeatureDetail(data) {
     '<div class="daydiv">&mdash; pipeline &mdash;</div>'
     + stageCards(data)
     + '<div class="daydiv">&mdash; conversation &mdash;</div>'
-    + (convoTurns(data) + steerTurns(data) || '<div class="lead">no messages yet &mdash; ask the engine anything about this work</div>')
+    + (convoThread(data) || '<div class="lead">no messages yet &mdash; ask the engine anything about this work</div>')
     + gatePacket(data);
   restoreThread(st);
 
