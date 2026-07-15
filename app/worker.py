@@ -917,7 +917,17 @@ class Worker:
                          and "BUG_PREDICTION" in (c.get("body") or "")
                          and "Resolved in" not in (c.get("body") or "")[:200]]
         if not open_findings:
-            return  # no findings and no 🎉 yet: a pass is in flight — wait
+            if not triggers:
+                # the kickoff marked this PR ready but its trigger comment never
+                # landed (transient failure) — no review was EVER requested, so
+                # "waiting" here would deadlock. Recover by requesting one now.
+                if await gh.comment(repo, number, "@sentry review"):
+                    rounds = int(pr.get("review_rounds") or 0) + 1
+                    self.store.pr_set(url, state="in_review", review_rounds=rounds,
+                                      detail=f"round {rounds}: recovered the missing "
+                                             "review trigger")
+                return
+            return  # a pass is in flight — wait for findings or the 🎉
         if int(pr.get("review_rounds") or 0) >= self.settings.pr_max_review_rounds:
             self.store.pr_set(url, state="stalled",
                               detail=f"max review rounds ({self.settings.pr_max_review_rounds}) "

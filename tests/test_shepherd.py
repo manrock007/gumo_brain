@@ -114,6 +114,19 @@ class TestShepherdStates:
         assert gh.posted == []
         assert store.prs_for("feat-s1")[0]["review_rounds"] == 1
 
+    def test_missing_kickoff_trigger_is_recovered(self, store, tmp_path):
+        """Seer PR#11 round 4: ready + no trigger comment + no findings means a
+        review was NEVER requested (the kickoff's comment failed) — waiting
+        would deadlock; the shepherd must post the trigger itself."""
+        w = _worker(store, tmp_path)
+        pr = _pr(store, state="ready", rounds=0)
+        gh = GH(pr=OPEN_PR, comments=[], reviews=[])
+        w.engine.github = gh
+        asyncio.run(w._shepherd_pr(pr))
+        assert gh.posted == ["@sentry review"]
+        row = store.prs_for("feat-s1")[0]
+        assert row["state"] == "in_review" and row["review_rounds"] == 1
+
     def test_review_in_flight_waits(self, store, tmp_path):
         """No findings, no 🎉 (👀 pending): the shepherd must not re-trigger."""
         w = _worker(store, tmp_path)
