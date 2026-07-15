@@ -208,6 +208,7 @@ class Worker:
         for job in self.store.requeueable():
             self._enqueue(job["issue_id"], self._priority_for(job))
             log.info("startup requeue: %s (%s)", job["issue_id"], job["status"])
+        await self._recover_interrupted()
         log.info("worker started")
         while True:
             _, _, job_id, queued_at = await self.queue.get()
@@ -226,6 +227,24 @@ class Worker:
                 )
             finally:
                 self.queue.task_done()
+
+    async def _recover_interrupted(self):
+        """Boot-time crash recovery: at startup NO run can legitimately be
+        'running' — the CLI subprocess dies with the process (deploys restart
+        the container mid-run). Requeue those corpses immediately instead of
+        letting the stale-run reaper surface them as errors an hour later;
+        the stage/phase machinery re-runs them cleanly (attempts bump, fresh
+        checkout). The reaper stays for mid-life zombies in a live process."""
+        for job in self.store.by_status(["running"]):
+            self.store.set_status(
+                job["issue_id"], "queued",
+                detail="recovered: a restart interrupted the previous run — re-running")
+            self._enqueue(job["issue_id"], self._priority_for(job))
+            log.info("startup recovery: requeued interrupted run %s", job["issue_id"])
+            await self.clickup.comment(
+                job.get("clickup_task_id") or "",
+                f"{GATE_PREFIX} ♻️ a service restart interrupted the run in progress — "
+                "it has been requeued and will re-run automatically.")
 
     async def _process(self, job: dict, queued_at: float | None = None):
         """Every workspace toucher runs under its repo's lock (chat runs and the
