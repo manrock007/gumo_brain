@@ -101,3 +101,25 @@ def test_dashboard_serves(client):
     r = client.get("/", headers=AUTH)
     assert r.status_code == 200
     assert "Submit a request" in r.text
+
+
+def test_dashboard_has_no_backslashes():
+    """Load-bearing invariant: dashboard.py is one Python string that must never
+    contain a backslash (JS regexes are built via new RegExp + fromCharCode), so
+    Python escape handling can never mangle the emitted HTML/JS."""
+    from app.dashboard import DASHBOARD_HTML
+
+    assert "\\" not in DASHBOARD_HTML
+
+
+def test_dashboard_shell_is_balanced():
+    """The redesign wraps content in a sticky topbar + <main>; the ids and hooks
+    the front-end JS drives must all be present and the shell balanced."""
+    from app.dashboard import DASHBOARD_HTML as h
+
+    assert h.count("<main") == h.count("</main>") == 1
+    assert h.count("<script>") == h.count("</script>") == 1
+    for tok in ('class="topbar"', 'id="msg"', 'id="pending"', 'id="progress"',
+                'id="awaiting"', 'id="completed"', 'id="count-pending"',
+                'id="brain-body"', 'data-status="', 'STATUS_LABEL'):
+        assert tok in h, tok
