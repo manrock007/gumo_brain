@@ -3,7 +3,8 @@
 Two scopes:
 - Repo scope   — `.gumo/memory/` in each repo (architecture, map, conventions,
   decisions/ + changelog/ as per-entry directories).
-- Product scope — `.gumo/product/` in the CANONICAL repo (gumoserver): what the
+- Product scope — `.gumo/product/` in the CANONICAL repo (settings.
+  memory_canonical_project, part of the editable project context): what the
   product is, cross-repo contract. Client-repo runs read it base-pinned from
   the canonical workspace; client repos carry no product.md.
 

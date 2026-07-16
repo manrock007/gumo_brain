@@ -285,6 +285,17 @@ DASHBOARD_HTML = """<!doctype html>
     color:var(--fg); cursor:pointer; font:inherit; font-size:12px; font-weight:600; }
   .brain button:disabled { opacity:.5; }
   .ok-t { color:var(--ok); } .err-t { color:var(--err); } .muted-t { color:var(--muted); }
+  /* ---------- project context editor ---------- */
+  .ctx input, .ctx textarea { padding:7px 10px; border:1px solid var(--line); border-radius:var(--r-sm);
+    background:var(--surface-2); color:var(--fg); font:inherit; font-size:12.5px; }
+  .ctx input:focus, .ctx textarea:focus { outline:0; border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-weak); }
+  .ctx textarea { width:100%; resize:vertical; min-height:120px; font-family:var(--mono); font-size:12px; }
+  .ctx .ctx-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin:12px 0; }
+  .ctx .ctx-grid input { width:100%; }
+  .ctx .ctx-row { display:grid; grid-template-columns:.8fr 1.3fr .6fr 1.1fr 1.1fr 1.3fr 30px; gap:6px; margin-bottom:6px; }
+  .ctx label { display:block; font-size:10.5px; text-transform:uppercase; letter-spacing:.05em;
+    color:var(--muted); font-weight:600; margin:10px 0 5px; }
+  .ctx button.save { background:linear-gradient(135deg,var(--accent),var(--accent-2)); border:0; color:#fff; }
 </style>
 </head>
 <body>
@@ -359,6 +370,10 @@ DASHBOARD_HTML = """<!doctype html>
       <details class="brain">
         <summary>Product brain <span class="hint" style="display:inline">&mdash; per-repo memory freshness</span></summary>
         <div id="brain-body"><div class="empty">loading&hellip;</div></div>
+      </details>
+      <details class="brain ctx" style="margin-top:14px">
+        <summary>Project context <span class="hint" style="display:inline">&mdash; the repos + business context the engine works on</span></summary>
+        <div id="ctx-body"><div class="empty">loading&hellip;</div></div>
       </details>
     </div>
 
@@ -1061,6 +1076,114 @@ async function bootstrap(project, btn) {
   if (lastMemData) renderMemory(lastMemData); else btn.disabled = false;
 }
 
+// ---------- project context (api/context) ----------
+
+let ctxData = null;
+
+// esc() leaves quotes alone (it round-trips through textContent), so values
+// interpolated into value="…" attributes need the quote entity too
+function attr(s) { return esc(s).replace(new RegExp(String.fromCharCode(34), 'g'), '&quot;'); }
+
+async function loadContext() {
+  try {
+    const r = await fetch('api/context');
+    if (!r.ok) return;
+    ctxData = await r.json();
+    renderContext();
+  } catch (e) { /* keep the previous form */ }
+}
+
+function ctxRepoRow(slug, e) {
+  e = e || {};
+  return `<div class="ctx-row">
+    <input class="cr-slug" placeholder="project slug" value="${attr(slug || '')}">
+    <input class="cr-repo" placeholder="owner/name" value="${attr(e.repo || '')}">
+    <input class="cr-base" placeholder="base branch" value="${attr(e.base || '')}">
+    <input class="cr-setup" placeholder="setup cmd (optional)" value="${attr(e.setup_cmd || '')}">
+    <input class="cr-test" placeholder="test cmd (optional)" value="${attr(e.test_cmd || '')}">
+    <input class="cr-allow" placeholder="extra allowed tools, comma-sep" value="${attr((e.allow || []).join(', '))}">
+    <button type="button" onclick="this.parentNode.remove()" title="Remove this repo">&#10007;</button>
+  </div>`;
+}
+
+function renderContext() {
+  const c = ctxData.context;
+  const over = ctxData.overridden || [];
+  const rows = Object.entries(c.repo_map).map(([s, e]) => ctxRepoRow(s, e)).join('');
+  const note = over.length
+    ? 'Customized (' + esc(over.join(', ')) + ') &mdash; saved in the engine DB, survives restarts.'
+    : 'Running on the built-in defaults.';
+  document.getElementById('ctx-body').innerHTML = `
+    <div class="hint" style="margin-top:10px">${note} Every run is briefed from this: the repos the engine may work on (project slug &rarr; GitHub repo), which repo hosts product-scope memory, and the business context injected into every prompt.</div>
+    <div class="ctx-grid">
+      <div><label>Product name</label><input id="ctx-name" value="${attr(c.product_name)}"></div>
+      <div><label>Canonical project &mdash; hosts .gumo/product/</label><input id="ctx-canon" value="${attr(c.canonical_project)}"></div>
+    </div>
+    <label>Repositories (project slug &rarr; repo)</label>
+    <div id="ctx-repos">${rows}</div>
+    <button type="button" onclick="ctxAddRow()">+ Add repo</button>
+    <label>Business context (injected into every run's prompt)</label>
+    <textarea id="ctx-biz">${esc(c.business_context)}</textarea>
+    <div style="display:flex; gap:8px; margin-top:12px">
+      <button type="button" class="save" onclick="saveContext(this)">Save context</button>
+      <button type="button" onclick="resetContext(this)">Reset to defaults</button>
+    </div>`;
+}
+
+function ctxAddRow() {
+  document.getElementById('ctx-repos').insertAdjacentHTML('beforeend', ctxRepoRow('', {}));
+}
+
+async function saveContext(btn) {
+  const msg = document.getElementById('msg');
+  const repo_map = {};
+  for (const row of document.querySelectorAll('#ctx-repos .ctx-row')) {
+    const v = (cls) => row.querySelector('.' + cls).value.trim();
+    const slug = v('cr-slug');
+    if (!slug) continue;
+    repo_map[slug] = {
+      repo: v('cr-repo'), base: v('cr-base') || 'main',
+      setup_cmd: v('cr-setup') || null, test_cmd: v('cr-test') || null,
+      allow: v('cr-allow') ? v('cr-allow').split(',').map(s => s.trim()).filter(Boolean) : [],
+    };
+  }
+  const body = {
+    product_name: document.getElementById('ctx-name').value.trim(),
+    canonical_project: document.getElementById('ctx-canon').value.trim(),
+    business_context: document.getElementById('ctx-biz').value,
+    repo_map,
+  };
+  btn.disabled = true; msg.textContent = 'Saving project context…';
+  try {
+    const r = await fetch('api/context', {
+      method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
+    });
+    const data = await r.json();
+    if (r.ok) {
+      ctxData = data; renderContext();
+      msg.textContent = 'Project context saved — new runs use it immediately.';
+      loadProjects(); refreshMemory(true);
+    } else msg.textContent = 'Error: ' + (data.detail || r.status);
+  } catch (e) { msg.textContent = 'Error: ' + e; }
+  btn.disabled = false;
+}
+
+async function resetContext(btn) {
+  if (!confirm('Reset the project context to the built-in defaults? Saved customizations are removed.')) return;
+  const msg = document.getElementById('msg');
+  btn.disabled = true;
+  try {
+    const r = await fetch('api/context', { method: 'DELETE' });
+    const data = await r.json();
+    if (r.ok) {
+      ctxData = data; renderContext();
+      msg.textContent = 'Project context reset to defaults.';
+      loadProjects(); refreshMemory(true);
+    } else msg.textContent = 'Error: ' + (data.detail || r.status);
+  } catch (e) { msg.textContent = 'Error: ' + e; }
+  btn.disabled = false;
+}
+
 // ---------- intake forms ----------
 
 async function loadProjects() {
@@ -1166,7 +1289,7 @@ document.addEventListener('keydown', (e) => {
 });
 window.addEventListener('hashchange', routeHash);
 
-loadProjects(); refresh(true); refreshMemory(true); routeHash();
+loadProjects(); refresh(true); refreshMemory(true); loadContext(); routeHash();
 setInterval(() => refresh(false), 10000);
 setInterval(() => refreshMemory(false), 60000);
 </script>

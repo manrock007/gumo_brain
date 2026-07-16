@@ -1,3 +1,4 @@
+import json
 import re
 import sqlite3
 import time
@@ -112,6 +113,12 @@ CREATE TABLE IF NOT EXISTS prs (
     detail TEXT DEFAULT '',          -- latest shepherd note (finding counts, errors)
     approved_head TEXT NOT NULL DEFAULT '',  -- head sha the clean pass approved (re-kick detector)
     created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS app_config (
+    key TEXT PRIMARY KEY,            -- project-context override key (config.RUNTIME_CONTEXT_KEYS)
+    value TEXT NOT NULL,             -- JSON-encoded value
     updated_at REAL NOT NULL
 );
 
@@ -321,6 +328,38 @@ class JobStore:
                 (cutoff,),
             ).fetchall()
             return [dict(r) for r in rows]
+
+    # ---------- app config (project-context overrides, key-value) ----------
+
+    def config_all(self) -> dict:
+        """Every persisted override, JSON-decoded: {key: value}."""
+        with self._conn() as c:
+            rows = c.execute("SELECT key, value FROM app_config").fetchall()
+        out = {}
+        for r in rows:
+            try:
+                out[r["key"]] = json.loads(r["value"])
+            except (ValueError, TypeError):
+                continue  # a corrupt row must not take the app down
+        return out
+
+    def config_set(self, key: str, value):
+        with self._conn() as c:
+            c.execute(
+                """INSERT INTO app_config (key, value, updated_at) VALUES (?, ?, ?)
+                   ON CONFLICT(key) DO UPDATE SET
+                     value = excluded.value, updated_at = excluded.updated_at""",
+                (key, json.dumps(value), time.time()),
+            )
+
+    def config_clear(self, keys: list[str] | None = None):
+        """Remove overrides (all of them when keys is None) — revert to defaults."""
+        with self._conn() as c:
+            if keys is None:
+                c.execute("DELETE FROM app_config")
+            else:
+                marks = ",".join("?" for _ in keys)
+                c.execute(f"DELETE FROM app_config WHERE key IN ({marks})", keys)
 
     # ---------- guidance log (INSERT-only) ----------
 

@@ -92,6 +92,59 @@ def test_memory_endpoints(client):
     assert r.status_code == 404
 
 
+def test_context_roundtrip(client):
+    r = client.get("/api/context", headers=AUTH)
+    assert r.status_code == 200
+    data = r.json()
+    assert data["context"]["product_name"] == "Gumo"
+    assert "gumo" in data["context"]["repo_map"]
+    assert data["overridden"] == []
+    assert data["defaults"]["canonical_project"] == "gumo"
+
+    # invalid payloads change nothing (atomic, fail-closed)
+    r = client.put("/api/context", headers=AUTH,
+                   json={"repo_map": {"x": {"repo": "not-owner-name"}}})
+    assert r.status_code == 400
+    r = client.put("/api/context", headers=AUTH,
+                   json={"repo_map": {"x": {"repo": "o/r"}}})  # canonical 'gumo' missing
+    assert r.status_code == 400
+    assert client.get("/api/context", headers=AUTH).json()["overridden"] == []
+
+    body = {
+        "product_name": "Acme",
+        "business_context": "Acme builds rockets.",
+        "repo_map": {"api": {"repo": "acme/api", "base": "dev", "test_cmd": "pytest"},
+                     "app": {"repo": "acme/app"}},
+        "canonical_project": "api",
+    }
+    r = client.put("/api/context", headers=AUTH, json=body)
+    assert r.status_code == 200
+    data = r.json()
+    assert data["context"]["product_name"] == "Acme"
+    assert data["context"]["canonical_project"] == "api"
+    assert data["context"]["repo_map"]["app"]["base"] == "main"  # normalized default
+    assert set(data["overridden"]) == {"product_name", "business_context",
+                                       "repo_map", "memory_canonical_project"}
+    # the rest of the app follows the new map immediately
+    slugs = {p["slug"] for p in client.get("/api/projects", headers=AUTH).json()}
+    assert slugs == {"api", "app"}
+    assert client.post("/api/tasks", headers=AUTH,
+                       json={"project": "gumo", "title": "x"}).status_code == 400
+
+    r = client.delete("/api/context", headers=AUTH)
+    assert r.status_code == 200
+    assert r.json()["context"]["product_name"] == "Gumo"
+    assert r.json()["overridden"] == []
+    slugs = {p["slug"] for p in client.get("/api/projects", headers=AUTH).json()}
+    assert "gumo" in slugs
+
+
+def test_context_requires_auth(client):
+    assert client.get("/api/context").status_code == 401
+    assert client.put("/api/context", json={}).status_code == 401
+    assert client.delete("/api/context").status_code == 401
+
+
 def test_feature_stats_404(client):
     r = client.get("/api/features/none/stats", headers=AUTH)
     assert r.status_code == 404
@@ -124,5 +177,8 @@ def test_dashboard_shell_is_balanced():
                 'function routeHash', 'function sendComposer', 'function answer',
                 'function setFilter', 'session/stream', 'chat/stream',
                 # intake forms keep their ids — the submit handlers depend on them
-                'id="task-project"', 'id="feat-project"', 'id="ref"'):
+                'id="task-project"', 'id="feat-project"', 'id="ref"',
+                # the project-context editor (docs/ENGINE.md §10)
+                'id="ctx-body"', 'function saveContext', 'function resetContext',
+                'function loadContext'):
         assert tok in h, tok

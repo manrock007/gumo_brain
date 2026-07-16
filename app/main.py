@@ -1,4 +1,5 @@
 import asyncio
+import html
 import json
 import logging
 import re
@@ -14,7 +15,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 
 from .chatstream import ChatBroker
-from .config import get_settings
+from .config import RUNTIME_CONTEXT_KEYS, Settings, get_settings
 from .dashboard import DASHBOARD_HTML
 from .db import JobStore
 from .feature_prompts import stage_name
@@ -54,6 +55,10 @@ async def lifespan(app: FastAPI):
     if settings.session_persistence:
         ensure_session_store(settings)
     store = JobStore(settings.db_path)
+    try:  # operator-saved project context (repos, business context) wins over env/defaults
+        settings.apply_runtime_overrides(store.config_all())
+    except ValueError as e:
+        log.error("stored project-context overrides are invalid, running on defaults: %s", e)
     worker = Worker(settings, store)
     tasks = [
         asyncio.create_task(worker.run_forever()),
@@ -80,7 +85,10 @@ async def health():
 
 @app.get("/", response_class=HTMLResponse, dependencies=[Depends(require_auth)])
 async def dashboard():
-    return DASHBOARD_HTML
+    # brand subtitle follows the configured product name (docs/ENGINE.md §10)
+    return DASHBOARD_HTML.replace(
+        "the Gumo Engine", f"the {html.escape(settings.product_name)} Engine", 1
+    )
 
 
 @app.get("/api/jobs", dependencies=[Depends(require_auth)])
@@ -149,6 +157,67 @@ async def projects():
     """Configured Sentry-project -> repo mappings, for the dashboard's project picker."""
     mapping = json.loads(settings.repo_map)
     return [{"slug": slug, "repo": entry.get("repo", "")} for slug, entry in sorted(mapping.items())]
+
+
+# ---------- project context (docs/ENGINE.md §10) ----------
+# What the engine works ON — repos, canonical project, product name, business
+# context. Env/code defaults (the Gumo repos) apply until an operator saves
+# overrides here; overrides persist in the DB and survive restarts.
+
+
+class ContextBody(BaseModel):
+    product_name: str | None = None
+    business_context: str | None = None
+    repo_map: dict | None = None        # {slug: {repo, base, setup_cmd?, test_cmd?, allow?}}
+    canonical_project: str | None = None  # must be a slug in the (resulting) repo map
+
+
+def _context_payload() -> dict:
+    defaults = Settings()  # env/code defaults, no runtime overrides
+    return {
+        "context": settings.project_context(),
+        "defaults": defaults.project_context(),
+        "overridden": sorted(app.state.store.config_all().keys()),
+    }
+
+
+@app.get("/api/context", dependencies=[Depends(require_auth)])
+async def get_context():
+    return _context_payload()
+
+
+@app.put("/api/context", dependencies=[Depends(require_auth)])
+async def put_context(body: ContextBody):
+    """Update the project context. Only supplied fields change; values are
+    validated atomically (a bad payload changes nothing), applied to the live
+    engine immediately, and persisted for future restarts. Runs already parked
+    or queued keep their recorded project slug — the new map applies from the
+    next run that resolves it."""
+    overrides = {
+        "product_name": body.product_name,
+        "business_context": body.business_context,
+        "repo_map": body.repo_map,
+        "memory_canonical_project": body.canonical_project,
+    }
+    try:
+        applied = settings.apply_runtime_overrides(overrides)
+    except (ValueError, TypeError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    store: JobStore = app.state.store
+    for key, value in applied.items():
+        # repo_map is persisted decoded so the stored JSON stays one-layer
+        store.config_set(key, json.loads(value) if key == "repo_map" else value)
+    return _context_payload()
+
+
+@app.delete("/api/context", dependencies=[Depends(require_auth)])
+async def reset_context():
+    """Drop every stored override — revert to the env/code defaults."""
+    app.state.store.config_clear()
+    defaults = Settings()
+    for key in RUNTIME_CONTEXT_KEYS:
+        setattr(settings, key, getattr(defaults, key))
+    return _context_payload()
 
 
 class SubmitBody(BaseModel):

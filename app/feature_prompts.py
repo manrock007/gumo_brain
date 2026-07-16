@@ -6,7 +6,8 @@ Output protocol every stage must follow (parsed end-anchored, fail-closed):
   PR_URL: <url>   (standalone line, honored at P5/P9 in addition to STAGE_DONE)
 """
 
-from .config import RepoTarget
+from .config import DEFAULT_PRODUCT_NAME, RepoTarget
+from .prompts import business_block
 
 STAGES = [
     # (stage, name, artifact, kind)  kind: doc = read-only run, engine writes artifact
@@ -125,15 +126,16 @@ def _artifacts_block(artifact_names: list[str], job_id: str,
 REQUEST_CAP = 8000  # a large adopted ClickUp description must not crowd out artifacts/memory
 
 
-def _header(target: RepoTarget, branch: str, job: dict, stage: int) -> str:
+def _header(target: RepoTarget, branch: str, job: dict, stage: int,
+            product_name: str, business_context: str) -> str:
     request = (job.get("request") or "").strip()
     if len(request) > REQUEST_CAP:
         request = request[:REQUEST_CAP] + "\n…[request truncated; full text on the tracking ticket]"
-    return f"""You are the Gumo Engine's build agent, executing stage P{stage} ({stage_name(stage)}) \
+    return f"""You are the {product_name} Engine's build agent, executing stage P{stage} ({stage_name(stage)}) \
 of a human-gated feature pipeline (P0 Intake → P9 Ship). A human reviews and approves \
 every stage's output before the next stage runs — write for that reviewer.
 
-You are inside a clone of `{target.repo}` on branch `{branch}` (base: `{target.base}`).
+You are inside a clone of `{target.repo}` on branch `{branch}` (base: `{target.base}`).{business_block(business_context)}
 
 ## Feature request
 
@@ -214,7 +216,9 @@ def build_stage_prompt(*, target: RepoTarget, branch: str, job: dict, stage: int
                        redo_notes: str = "",
                        evidence_note: str = "",
                        test_block: str = "",
-                       canonical_project: str = "gumo") -> str:
+                       canonical_project: str = "gumo",
+                       product_name: str = DEFAULT_PRODUCT_NAME,
+                       business_context: str = "") -> str:
     job_id = job["issue_id"]
     kind = stage_kind(stage)
     if kind == "doc":
@@ -249,7 +253,7 @@ binding:
 
 {redo_notes}{evidence_note}"""
 
-    return f"""{_header(target, branch, job, stage)}{_memory_block(memory_context)}\
+    return f"""{_header(target, branch, job, stage, product_name, business_context)}{_memory_block(memory_context)}\
 {_artifacts_block(artifact_names, job_id, inline_artifacts)}{_guidance_block(guidance_entries, stage)}{redo_block}{test_block}
 
 {task_header}
@@ -265,7 +269,8 @@ binding:
 
 def build_chat_prompt(*, target: RepoTarget, branch: str, job: dict, stage: int,
                       message: str, transcript: list[dict],
-                      inline_artifacts: dict[str, str]) -> str:
+                      inline_artifacts: dict[str, str],
+                      product_name: str = DEFAULT_PRODUCT_NAME) -> str:
     convo = ""
     for t in transcript[-8:]:
         who = "Reviewer" if t["role"] == "human" else "You"
@@ -275,7 +280,7 @@ def build_chat_prompt(*, target: RepoTarget, branch: str, job: dict, stage: int,
         artifacts += f"\n\n### {name}\n\n{content}"
     gate_summary = (job.get("analysis") or "").strip()[:5000]
 
-    return f"""You are the Gumo Engine, answering a human reviewer's question at the P{stage} \
+    return f"""You are the {product_name} Engine, answering a human reviewer's question at the P{stage} \
 ({stage_name(stage)}) gate of a feature pipeline. The pipeline is PAUSED waiting for their \
 decision; your job is to help them decide — not to do more work.
 
@@ -319,7 +324,8 @@ anywhere except as the very first thing in your reply."""
 
 
 def build_fastlane_system(*, job: dict, stage: int, inline_artifacts: dict[str, str],
-                          guidance_entries: list[dict]) -> str:
+                          guidance_entries: list[dict],
+                          product_name: str = DEFAULT_PRODUCT_NAME) -> str:
     """System prompt for the fast lane: everything the engine already wrote
     down at this gate, and the self-escalation contract. No repository access
     exists in this lane — the model must say so via the marker, not guess."""
@@ -334,7 +340,7 @@ def build_fastlane_system(*, job: dict, stage: int, inline_artifacts: dict[str, 
     evidence = (job.get("evidence") or "").strip()[:2000]
     question = (job.get("question") or "").strip()[:1500]
 
-    return f"""You are the Gumo Engine, answering a human reviewer's questions at the P{stage} \
+    return f"""You are the {product_name} Engine, answering a human reviewer's questions at the P{stage} \
 ({stage_name(stage)}) gate of the feature pipeline for "{(job.get('title') or '').strip()[:200]}". \
 The pipeline is PAUSED waiting for their decision; your job is to help them decide — not to \
 do more work. You are answering from the gate bundle below; you have NO access to the \
@@ -393,7 +399,9 @@ def build_fastlane_messages(transcript: list[dict], message: str) -> list[dict]:
 # ---------- memory bootstrap (kind=memory job, two sequential runs) ----------
 
 def build_bootstrap_prompt(*, target: RepoTarget, branch: str, project: str,
-                           is_canonical: bool, run: int) -> str:
+                           is_canonical: bool, run: int,
+                           product_name: str = DEFAULT_PRODUCT_NAME,
+                           business_context: str = "") -> str:
     if run == 1:
         files = """1. `.gumo/memory/map.md` — the codebase map: important directories/files and
    what lives where. Flat, factual, ≤200 lines.
@@ -414,9 +422,9 @@ def build_bootstrap_prompt(*, target: RepoTarget, branch: str, project: str,
 {product}
 Read `.gumo/memory/map.md` and `architecture.md` (written by the previous run)
 before you start."""
-    return f"""You are bootstrapping the Gumo Engine's product memory for `{target.repo}`
+    return f"""You are bootstrapping the {product_name} Engine's product memory for `{target.repo}`
 (project `{project}`). This memory warms every future automated run — accuracy
-beats completeness. You are on branch `{branch}`.
+beats completeness. You are on branch `{branch}`.{business_block(business_context)}
 
 Explore the repository and write (run {run} of 2):
 
