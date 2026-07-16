@@ -33,6 +33,7 @@ from .feature_prompts import (
 from .fixer import (
     BASE_ALLOWED_TOOLS,
     PR_LINE_RE,
+    TRANSIENT_ERROR_RE,
     BranchLostError,
     git,
     prepare_feature_workspace,
@@ -412,6 +413,21 @@ class Engine:
         job_id = job["issue_id"]
         if raw.status in ("timeout", "error"):
             self.store.stage_run_close(run_id, raw.status, **self._meta(raw))
+            # ONE automatic retry for upstream hiccups (API 5xx, overloaded…):
+            # the work is fine, the transport failed. Errors the run produced
+            # itself — and every timeout — still park for a human /redo. The
+            # budget is 1 until a gate parks or a human redo resets it, so a
+            # genuinely broken stage can never retry-loop.
+            if (raw.status == "error" and TRANSIENT_ERROR_RE.search(raw.text or "")
+                    and int(job.get("auto_retries") or 0) < 1):
+                self.store.set_fields(job_id, auto_retries=1)
+                self.store.set_status(job_id, "queued",
+                                      detail=f"transient upstream error — retrying "
+                                             f"automatically: {raw.text[:300]}")
+                await self._comment(
+                    job, f"P{stage} ({stage_name(stage)}) hit a transient upstream error — "
+                         "retrying automatically (1/1). ♻️")
+                return "requeue"
             self.store.set_status(job_id, raw.status, detail=raw.text[:2000])
             await self._comment(
                 job, f"P{stage} ({stage_name(stage)}) ended with `{raw.status}`: "
@@ -527,6 +543,9 @@ class Engine:
         ask_session marks a STAGE_ASK gate: the answer resumes that session in place."""
         job_id = job["issue_id"]
         is_ask = bool(ask_session)
+        # a stage reached a gate: restore the transient-retry budget (it is
+        # per-stage-attempt-chain, not per-pipeline)
+        self.store.set_fields(job_id, auto_retries=0)
         evidence = await self._evidence(workspace, target, base_sha, stage, pr_url)
         warnings = ""
         if flag:

@@ -20,6 +20,14 @@ PR_LINE_RE = re.compile(
     r"^[\s`*>-]*PR_URL:\s*`?(https://github\.com/[\w./-]+/pull/\d+)`?[\s`]*$", re.MULTILINE
 )
 
+# Upstream hiccups that deserve ONE automatic retry before parking as an error
+# needing a human /redo. Deliberately narrow: assertion failures, tool errors
+# and anything the run itself concluded must stay manual.
+TRANSIENT_ERROR_RE = re.compile(
+    r"(?i)(api error|server error|internal server|bad gateway|service unavailable|"
+    r"gateway timeout|rate.?limit|overloaded|connection (?:reset|refused|error|closed)|"
+    r"temporarily unavailable|socket hang.?up)")
+
 BASE_ALLOWED_TOOLS = [
     "Read", "Grep", "Glob", "Edit", "Write",
     "Bash(git:*)", "Bash(gh:*)", "Bash(brain-ticket:*)",

@@ -24,6 +24,7 @@ from .db import JobStore
 from .engine import GATE_PREFIX, Engine, RepoLocks
 from .fixer import (
     BASE_ALLOWED_TOOLS,
+    TRANSIENT_ERROR_RE,
     BranchLostError,
     prepare_feature_workspace,
     prepare_workspace,
@@ -53,8 +54,9 @@ PRIO_SWEEP = 2
 QUESTION_HEADING_RE = re.compile(r"^#{1,4}\s*(?:open\s+)?questions?\b.*$", re.IGNORECASE | re.MULTILINE)
 REDO_TARGET_RE = re.compile(r"^\s*[Pp](\d)\b\s*")
 
-# ClickUp intake: '[fix] title', '[feature] title', '[sentry 123456] title'
-INTAKE_RE = re.compile(r"^\s*\[\s*(fix|task|bug|feature|sentry)(?:\s+([A-Za-z0-9_-]+))?\s*\]\s*(.+)$",
+# ClickUp intake: '[fix] title', '[feature] title', '[sentry 123456] title',
+# '[memory <project>] title'
+INTAKE_RE = re.compile(r"^\s*\[\s*(fix|task|bug|feature|sentry|memory)(?:\s+([A-Za-z0-9_-]+))?\s*\]\s*(.+)$",
                        re.IGNORECASE)
 PROJECT_LINE_RE = re.compile(r"^\s*\**project\**\s*[:=]\s*\**\s*([A-Za-z0-9_-]+)\**\s*$",
                              re.IGNORECASE | re.MULTILINE)
@@ -375,6 +377,8 @@ class Worker:
         if result.status == "needs_input":
             await self._park_awaiting(issue_id, task_id or "", result.detail)
             return
+        if await self._maybe_auto_retry_v1(row, result.status, result.detail, task_id or ""):
+            return
 
         self.store.set_status(issue_id, result.status, pr_url=result.pr_url, detail=result.detail)
         await self.clickup.set_status(task_id or "", result.status)
@@ -458,6 +462,8 @@ class Worker:
         if result.status == "needs_input":
             await self._park_awaiting(job_id, task_id, result.detail)
             return
+        if await self._maybe_auto_retry_v1(row, result.status, result.detail, task_id):
+            return
 
         self.store.set_status(job_id, result.status, pr_url=result.pr_url, detail=result.detail)
         await self.clickup.set_status(task_id, result.status)
@@ -472,6 +478,29 @@ class Worker:
                 task_id, f"Run ended with status `{result.status}`: {result.detail[:500]}"
             )
 
+    async def _maybe_auto_retry_v1(self, row: dict, result_status: str,
+                                   detail: str, task_id: str) -> bool:
+        """ONE automatic requeue for a v1 run that died on an upstream hiccup
+        (API 5xx, overloaded…) — mirrors the feature-stage policy in
+        engine._after_run. Timeouts and run-produced errors stay manual.
+        Returns True when the retry was armed (caller stops terminal handling)."""
+        if result_status != "error" or not TRANSIENT_ERROR_RE.search(detail or ""):
+            return False
+        if int(row.get("auto_retries") or 0) >= 1:
+            return False
+        job_id = row["issue_id"]
+        self.store.set_fields(job_id, auto_retries=1)
+        self.store.set_status(job_id, "queued",
+                              detail=f"transient upstream error — retrying automatically: "
+                                     f"{(detail or '')[:300]}")
+        self._enqueue(job_id, self._priority_for(row))
+        await self.clickup.comment(
+            task_id or "",
+            f"{GATE_PREFIX} ♻️ the run hit a transient upstream error — retrying "
+            "automatically (1/1).")
+        log.info("auto-retry armed for %s after transient error", job_id)
+        return True
+
     # ---------- HITL: parking and answering ----------
 
     async def _park_awaiting(self, job_id: str, task_id: str, analysis: str):
@@ -479,7 +508,8 @@ class Worker:
         pre-comment marker) commits BEFORE the ClickUp comment is posted."""
         comments = await self.clickup.comments(task_id)
         marker = comments[-1]["id"] if comments else ""
-        self.store.set_fields(job_id, analysis=analysis,
+        # parking is a successful phase end: restore the transient-retry budget
+        self.store.set_fields(job_id, analysis=analysis, auto_retries=0,
                               question=extract_questions(analysis), comment_marker=marker)
         self.store.set_status(job_id, "awaiting_input", detail=analysis[:2000])
         await self.clickup.comment(
@@ -578,7 +608,8 @@ class Worker:
                                          pending_redo_stage=target_stage,
                                          gate_kind="", resume_session_id="",
                                          resume_stage=None, resume_attempt=None,
-                                         resume_head="", resume_answer="", ask_count=0):
+                                         resume_head="", resume_answer="", ask_count=0,
+                                         auto_retries=0):
                 raise GateConflict("already answered")
             self.store.guidance_add(job_id, target_stage, "redo", text, via,
                                     job.get("parked_head") or "")
@@ -863,6 +894,23 @@ class Worker:
                 reject(decision)  # pin the ticket, or the scan re-comments forever
             await self.clickup.comment(task_id, f"{GATE_PREFIX} 📥 {decision}")
             log.info("clickup intake: sentry %s from ticket %s (%s)", issue_id, task_id, decision)
+            return
+
+        if kind == "memory":
+            project = arg.strip()
+            if self.settings.repo_for_project(project) is None:
+                why = reject(f"no repo mapped for project '{project or '(missing)'}' — "
+                             "use '[memory <project slug>] title'")
+                await self.clickup.comment(task_id, f"{GATE_PREFIX} could not adopt: {why}")
+                return
+            decision = self.intake_memory(project)
+            if "queued" in decision:
+                self.store.set_fields(f"mem-{project}", clickup_task_id=task_id,
+                                      clickup_task_url=task_url)
+            else:
+                reject(decision)  # pin the ticket, or the scan re-comments forever
+            await self.clickup.comment(task_id, f"{GATE_PREFIX} 📥 {decision}")
+            log.info("clickup intake: memory %s from ticket %s (%s)", project, task_id, decision)
             return
 
         pm = PROJECT_LINE_RE.search(desc)

@@ -164,6 +164,22 @@ class TestClickUpIntake:
         assert len(worker.clickup.comments_posted) == 1
         assert worker.store.get("task-t1")["attempts"] == 1
 
+    def test_memory_ticket_queues_a_bootstrap(self, worker):
+        worker.clickup = FakeClickUp(tasks=[_cu_task("tm1", "[memory web] bootstrap docs")])
+        asyncio.run(worker._poll_intake())
+        job = worker.store.get("mem-web")
+        assert job is not None and job["kind"] == "memory"
+        assert job["clickup_task_id"] == "tm1"
+        asyncio.run(worker._poll_intake())  # idempotent
+        assert len(worker.clickup.comments_posted) == 1
+
+    def test_memory_unmapped_project_rejects_once(self, worker):
+        worker.clickup = FakeClickUp(tasks=[_cu_task("tm2", "[memory nope] ghost repo")])
+        asyncio.run(worker._poll_intake())
+        assert worker.store.get("cu-tm2")["status"] == "skipped"
+        asyncio.run(worker._poll_intake())
+        assert len(worker.clickup.comments_posted) == 1
+
     def test_outage_is_a_noop(self, worker):
         class Down(FakeClickUp):
             async def list_tasks(self, list_id=None):

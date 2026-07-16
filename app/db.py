@@ -156,6 +156,7 @@ MIGRATIONS = {  # table -> columns added after that table first shipped (in-plac
         "ask_count": "INTEGER NOT NULL DEFAULT 0",
         "gate_mode": "TEXT NOT NULL DEFAULT 'full'",
         "steer_note": "TEXT DEFAULT ''",  # human's live steer, moved into resume_answer on interrupt
+        "auto_retries": "INTEGER NOT NULL DEFAULT 0",  # transient-error retries spent (max 1; human redo resets)
     },
     "stage_runs": {
         "session_id": "TEXT DEFAULT ''",
