@@ -68,6 +68,24 @@ class Settings(BaseSettings):
     # ClickUp as an INTAKE channel: tasks named '[fix] …', '[feature] …' or
     # '[sentry <id>] …' in the autofix list are adopted and queued
     clickup_intake_enabled: bool = True
+    # Mirror engine state onto the gumo-speed workflow's custom fields (the
+    # Stage board, per-repo PR fields, Decisions, Dashboard link). Best-effort
+    # display only — never drives control flow (ENGINE.md §7).
+    clickup_field_sync_enabled: bool = True
+    # brain stage -> Stage dropdown option; 'build' resolves per-repo below
+    clickup_stage_field_map: str = ('{"0": "Brief", "1": "PRD", "2": "PRD", "3": "Contract", '
+                                    '"4": "Grounding", "5": "build", "6": "build", '
+                                    '"7": "Integration", "8": "Tech Review", "9": "Launch", '
+                                    '"shipped": "Dogfood", "merged": "Complete"}')
+    # repo -> its build-stage column and its PR url field
+    clickup_repo_stage_map: str = ('{"manrock007/gumoserver": "Backend", '
+                                   '"manrock007/gumowebclient": "Frontend - Web", '
+                                   '"manrock007/gumoclient": "Frontend - App"}')
+    clickup_pr_field_map: str = ('{"manrock007/gumoserver": "Backend PR", '
+                                 '"manrock007/gumowebclient": "Web PR", '
+                                 '"manrock007/gumoclient": "App PR"}')
+    # public dashboard base for the ticket's Dashboard deep link
+    public_base_url: str = "https://gumo.co.in/brain"
 
     # Dashboard basic auth (user "gumo"); dashboard + trigger disabled if empty
     dashboard_password: str = ""

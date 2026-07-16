@@ -575,6 +575,14 @@ class Worker:
         log.info("job %s advanced to phase 2 via %s", job_id, via)
         return "queued"
 
+    async def _sync_decision_field(self, task_id: str, stage: int, label: str, text: str):
+        """Mirror substantive gate answers into the ticket's `Decisions` field —
+        the original workflow's Grounding contract (append, never overwrite)."""
+        if not (text and task_id and self.settings.clickup_field_sync_enabled):
+            return
+        await self.clickup.field_append(task_id, "Decisions",
+                                        f"P{stage}{label}: {text[:400]}")
+
     async def _answer_feature(self, job: dict, action: str, text: str, via: str) -> str:
         job_id = job["issue_id"]
         stage = int(job.get("stage") or 0)
@@ -614,6 +622,7 @@ class Worker:
             self.store.guidance_add(job_id, target_stage, "redo", text, via,
                                     job.get("parked_head") or "")
             self.store.stage_run_gate_answered(job_id, stage, "redo")
+            await self._sync_decision_field(task_id, target_stage, " (redo)", text)
             if target_stage < stage:
                 await self._mark_superseded(job, target_stage)
             await self.clickup.comment(
@@ -640,6 +649,7 @@ class Worker:
                                     job.get("parked_head") or "")
             self.store.stage_run_gate_answered(job_id, stage, "answer")
             self._distill_chat(job, stage)
+            await self._sync_decision_field(task_id, stage, " (ask)", text)
             await self.clickup.comment(
                 task_id, f"{GATE_PREFIX} Answer received (via {via}) — resuming P{stage} "
                          "where it stopped.")
@@ -657,10 +667,14 @@ class Worker:
             self.store.guidance_add(job_id, stage, "proceed", guidance, via,
                                     job.get("parked_head") or "")
             self.store.stage_run_gate_answered(job_id, stage, "proceed")
+            await self._sync_decision_field(task_id, stage, "", text)
             await self.clickup.comment(
                 task_id, f"{GATE_PREFIX} P9 approved (via {via}) — pipeline complete. "
                          f"{'PR ready to un-draft: ' + job['pr_url'] if job.get('pr_url') else ''}")
             await self.clickup.set_status(task_id, final)
+            # conveyor mirror: the shipped feature sits in Dogfood until its PR
+            # merges (the shepherd then slides it to Complete)
+            await self.engine.sync_stage_field(job, "shipped")
             return final
 
         if not self.store.cas_status(job_id, ["awaiting_input"], "queued",
@@ -672,6 +686,7 @@ class Worker:
                                 job.get("parked_head") or "")
         self.store.stage_run_gate_answered(job_id, stage, "proceed")
         self._distill_chat(job, stage)
+        await self._sync_decision_field(task_id, stage, "", text)
         await self.clickup.comment(
             task_id, f"{GATE_PREFIX} P{stage} approved (via {via}) — running P{stage + 1} next.")
         self._enqueue(job_id, PRIO_HUMAN)
@@ -1052,6 +1067,9 @@ class Worker:
         if info.get("merged") or info.get("merged_at"):
             self.store.pr_set(url, state="merged", detail="")
             await self._shepherd_notify(pr, f"PR {repo}#{number} merged.")
+            job = self.store.get(pr["job_id"])
+            if job:  # conveyor mirror: merged feature slides to Complete
+                await self.engine.sync_stage_field(job, "merged")
             return
         if info.get("state") == "closed":
             self.store.pr_set(url, state="closed", detail="closed without merge")

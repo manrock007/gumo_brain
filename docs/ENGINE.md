@@ -291,6 +291,23 @@ id, duplicate) is pinned by a `cu-<task id>` skipped row carrying the reason —
 one explanatory comment, never a re-scan loop. Everything after adoption is
 the ordinary flow: status sync, gate comments, `/proceed`-family verbs.
 
+### ClickUp field sync (the gumo-speed conveyor mirror)
+
+The original people-driven workflow (the `gumo-speed` repo) tracks a feature
+as ONE ticket whose `Stage` dropdown is the board, with per-repo PR url
+fields, a `Decisions` log and doc links — and ClickUp automations key off
+those fields. The engine mirrors its state onto that contract (best-effort
+display only, gated by `clickup_field_sync_enabled`; the engine's store stays
+the record, §7): each feature stage sets `Stage` via
+`clickup_stage_field_map` (P0→Brief … P9→Launch; the build stages resolve
+per-repo via `clickup_repo_stage_map`; terminal `pr_opened`→Dogfood; the
+shepherd sets Complete on merge), `record_prs` fills `Backend PR`/`Web PR`/
+`App PR` via `clickup_pr_field_map`, substantive gate answers append to
+`Decisions` (read-then-append, never overwrite), and `Dashboard` deep-links
+to the job's inbox view. Fields are addressed by NAME and resolved at
+startup (`load_fields`); a missing field or option is a quiet no-op — the
+workspace schema belongs to the humans.
+
 ### Live steering (mid-run course-correction)
 
 A human can interrupt a *running* stage from the session view. With session

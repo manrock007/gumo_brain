@@ -7,6 +7,7 @@ nothing advances without an explicit STAGE_DONE and a human answer.
 """
 
 import asyncio
+import json
 import logging
 import re
 import time
@@ -190,6 +191,8 @@ class Engine:
                         await self._rekick_if_approved_head_moved(job_id, url)
                     continue
                 m = PR_URL_PARTS_RE.search(url)
+                if m:  # conveyor mirror: Backend PR / Web PR / App PR by repo
+                    await self.sync_pr_field(job_id, m.group(1), url)
                 if not m or not kickoff or not self.settings.pr_auto_ready:
                     continue
                 repo, number = m.group(1), int(m.group(2))
@@ -235,6 +238,9 @@ class Engine:
             self.store.set_status(job_id, "skipped", detail=f"no repo mapped for '{job.get('project')}'")
             return
         branch = f"brain/feat-{job_id}"
+        # conveyor mirror: slide the ticket's Stage card + link the live view
+        await self.sync_stage_field(job, str(stage))
+        await self.sync_dashboard_field(job)
 
         state = self.store.stage_state_get(job_id, stage) or {"attempts": 0, "base_sha": ""}
         # a STAGE_ASK resume continues the SAME attempt — no bump, no rewind
@@ -848,6 +854,59 @@ class Engine:
             test_block=_test_block(target) if stage in (7, 8) else "",
             canonical_project=self.settings.memory_canonical_project,
         )
+
+    # ---------- gumo-speed conveyor mirror (ClickUp custom fields) ----------
+
+    async def sync_stage_field(self, job: dict, key: str):
+        """Mirror the pipeline position onto the ticket's `Stage` dropdown —
+        the original workflow's board contract (the card slides across the
+        columns as the feature advances; ClickUp automations key off it).
+        key: '0'…'9' | 'shipped' | 'merged'. Best-effort display only; the
+        engine's own store stays the record (ENGINE.md §7)."""
+        if not self.settings.clickup_field_sync_enabled:
+            return
+        task_id = job.get("clickup_task_id") or ""
+        if not task_id or (job.get("kind") or "") != "feature":
+            return
+        try:
+            option = json.loads(self.settings.clickup_stage_field_map).get(str(key), "")
+            if option == "build":  # the build columns are per-surface (per repo)
+                target = self.settings.repo_for_project(job.get("project") or "")
+                option = json.loads(self.settings.clickup_repo_stage_map).get(
+                    target.repo if target else "", "")
+            if option:
+                await self.clickup.field_set(task_id, "Stage", option)
+        except Exception:
+            log.exception("Stage field sync failed for %s (non-fatal)", job.get("issue_id"))
+
+    async def sync_dashboard_field(self, job: dict):
+        """Point the ticket's `Dashboard` url field at this job's inbox deep
+        link — one click from the board to the live session view."""
+        if not self.settings.clickup_field_sync_enabled:
+            return
+        task_id = job.get("clickup_task_id") or ""
+        if not task_id:
+            return
+        try:
+            await self.clickup.field_set(
+                task_id, "Dashboard",
+                f"{self.settings.public_base_url}/#/job/{job['issue_id']}")
+        except Exception:
+            log.exception("Dashboard field sync failed for %s (non-fatal)", job.get("issue_id"))
+
+    async def sync_pr_field(self, job_id: str, repo: str, url: str):
+        """Fill the per-repo PR url field (`Backend PR` / `Web PR` / `App PR`)
+        the moment a run opens that repo's PR — the Tech Review stage of the
+        original workflow reads these fields."""
+        if not self.settings.clickup_field_sync_enabled:
+            return
+        try:
+            field = json.loads(self.settings.clickup_pr_field_map).get(repo, "")
+            job = self.store.get(job_id) or {}
+            if field and job.get("clickup_task_id"):
+                await self.clickup.field_set(job["clickup_task_id"], field, url)
+        except Exception:
+            log.exception("PR field sync failed for %s (non-fatal)", job_id)
 
     async def _comment(self, job, text, raw: bool = False):
         # ClickUp is best-effort visibility and NEVER drives progress (ENGINE.md
