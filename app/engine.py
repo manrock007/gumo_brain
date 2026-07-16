@@ -1201,9 +1201,15 @@ class Engine:
                                      BASE_ALLOWED_TOOLS + target.allow,
                                      self.settings.claude_timeout_seconds)
             await self._checkpoint(workspace, branch, job_id, stage=0)
+            # terminal outcomes comment the owning ticket: memory jobs are
+            # ClickUp-adopted now, and a silent job is indistinguishable from a
+            # stuck one from the outside (dogfood-found)
             if raw.status != "ok":
                 self.store.stage_run_close(run_id, raw.status, **self._meta(raw))
                 self.store.set_status(job_id, raw.status, detail=raw.text[:2000])
+                await self._comment(job, f"memory bootstrap run {run} ended with "
+                                         f"`{raw.status}`: {raw.text[:400]} — re-file the "
+                                         "`[memory]` ticket to retry.")
                 return
             marker, payload, found_pr = parse_stage_output(raw.text)
             self.store.stage_run_close(run_id, marker, **self._meta(raw))
@@ -1213,14 +1219,23 @@ class Engine:
                     pr_urls.append(u)
             if marker == "fail":
                 self.store.set_status(job_id, "no_fix", detail=payload[:2000])
+                await self._comment(job, f"memory bootstrap stopped (run {run} reported "
+                                         f"STAGE_FAIL): {payload[:600]}")
                 return
             if marker == "unparsed":  # fail closed — never advance/complete on an unmarked run
                 self.store.set_status(job_id, "error",
                                       detail=f"bootstrap run {run} ended without STAGE_DONE/"
                                              f"STAGE_FAIL: {payload[-1500:]}")
+                await self._comment(job, f"memory bootstrap run {run} ended without a "
+                                         "STAGE_DONE/STAGE_FAIL marker — re-file the "
+                                         "`[memory]` ticket to retry.")
                 return
         await self.memory.refresh_cache(project, workspace, target.base)
         if pr_urls:  # tracked, but no auto-ready/review — memory PRs are doc drafts
             await self.record_prs(job_id, pr_urls, kickoff=False)
         self.store.set_status(job_id, "pr_opened" if pr_url else "no_fix",
                               pr_url=pr_url, detail="memory bootstrap complete")
+        await self._comment(
+            job, "✅ memory bootstrap complete"
+                 + (f" — draft PR for review: {pr_url}" if pr_url
+                    else " — no PR was opened (see the job detail)."))

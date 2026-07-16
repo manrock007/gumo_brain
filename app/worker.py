@@ -1204,11 +1204,20 @@ class Worker:
         horizon = 2 * self.settings.claude_timeout_seconds + self.settings.reaper_grace_seconds
         while True:
             try:
-                for job in self.store.stale_running(horizon):
-                    log.warning("reaping stale run: %s (started %.0fs ago)",
-                                job["issue_id"], time.time() - (job["run_started_at"] or 0))
-                    self.store.set_status(job["issue_id"], "error",
-                                          detail="reaped: run went stale (process restart?) — redo to resume")
+                await self._reap_once(horizon)
             except Exception:
                 log.exception("reaper iteration failed")
             await asyncio.sleep(300)
+
+    async def _reap_once(self, horizon: float):
+        for job in self.store.stale_running(horizon):
+            log.warning("reaping stale run: %s (started %.0fs ago)",
+                        job["issue_id"], time.time() - (job["run_started_at"] or 0))
+            self.store.set_status(job["issue_id"], "error",
+                                  detail="reaped: run went stale (process restart?) — redo to resume")
+            # visibility on the owning ticket — a silently-reaped job looks
+            # identical to a slow one from ClickUp (dogfood-found)
+            await self.clickup.comment(
+                job.get("clickup_task_id") or "",
+                f"{GATE_PREFIX} ⚠️ the run went stale and was reaped — re-kick with "
+                "`/redo` (features) or re-file the intake ticket to retry.")
