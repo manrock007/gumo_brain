@@ -293,6 +293,7 @@ DASHBOARD_HTML = """<!doctype html>
   .ctx .ctx-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin:12px 0; }
   .ctx .ctx-grid input { width:100%; }
   .ctx .ctx-row { display:grid; grid-template-columns:.8fr 1.3fr .6fr 1.1fr 1.1fr 1.3fr 30px; gap:6px; margin-bottom:6px; }
+  .ctx .ctx-row input { min-width:0; } /* grid items must shrink below the input intrinsic width */
   .ctx label { display:block; font-size:10.5px; text-transform:uppercase; letter-spacing:.05em;
     color:var(--muted); font-weight:600; margin:10px 0 5px; }
   .ctx button.save { background:linear-gradient(135deg,var(--accent),var(--accent-2)); border:0; color:#fff; }
