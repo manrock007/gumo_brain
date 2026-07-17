@@ -98,7 +98,8 @@ CREATE TABLE IF NOT EXISTS stage_runs (
     duration_ms REAL,
     result_status TEXT DEFAULT '',
     session_id TEXT DEFAULT '',      -- the run's CLI session (resumable)
-    resumed INTEGER NOT NULL DEFAULT 0  -- 1 = this run continued a STAGE_ASK session
+    resumed INTEGER NOT NULL DEFAULT 0,  -- 1 = this run continued a STAGE_ASK session
+    transcript TEXT DEFAULT ''       -- run-transcript key under data_dir/transcripts (§13)
 );
 
 CREATE TABLE IF NOT EXISTS prs (
@@ -223,6 +224,7 @@ MIGRATIONS = {  # table -> columns added after that table first shipped (in-plac
     "stage_runs": {
         "session_id": "TEXT DEFAULT ''",
         "resumed": "INTEGER NOT NULL DEFAULT 0",
+        "transcript": "TEXT DEFAULT ''",
     },
     "gate_chat": {
         "cost_usd": "REAL",
@@ -814,6 +816,10 @@ class JobStore:
     def stage_run_mark_resumed(self, run_id: int):
         with self._conn() as c:
             c.execute("UPDATE stage_runs SET resumed = 1 WHERE id = ?", (run_id,))
+
+    def stage_run_set_transcript(self, run_id: int, key: str):
+        with self._conn() as c:
+            c.execute("UPDATE stage_runs SET transcript = ? WHERE id = ?", (key, run_id))
 
     def stage_run_gate_posted(self, run_id: int):
         with self._conn() as c:

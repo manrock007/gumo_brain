@@ -40,6 +40,7 @@ from .prompts import (
     build_task_plan_prompt,
 )
 from .sentry_api import SentryClient, format_stacktrace
+from . import transcripts
 
 log = logging.getLogger("brain.worker")
 
@@ -367,19 +368,29 @@ class Worker:
         branch = f"brain/sentry-{issue_id}"
 
         # live observation: v1 runs stream into the same broker the inbox detail
-        # pane subscribes to (session/stream), exactly like feature stages
+        # pane subscribes to (session/stream), exactly like feature stages —
+        # and every event tees into the run transcript (§13) for replay
         broker = self.engine.stage_broker
         broker.start(issue_id)
+        t_writer = transcripts.open_writer(
+            self.settings, issue_id, f"v1-p{phase}-{int(time.time())}",
+            {"kind": "v1", "phase": phase, "source": "sentry"})
+
+        def emit(event, data):
+            t_writer.write(event, data)
+            broker.publish(issue_id, event, data)
+
+        result = None
         try:
             # publish BEFORE the lock wait: the pane is already live (status is
             # running), and silence while another run holds the repo reads as a
             # hang. Moving start() inside the lock would be worse — a subscriber
             # with no turn gets an immediate 'done' and reads "run finished".
-            broker.publish(issue_id, "status",
-                           "waiting for the repository workspace (another run may be using it)")
+            emit("status",
+                 "waiting for the repository workspace (another run may be using it)")
             pname, brief = self._job_context(row)
             async with self.locks.for_repo(target.repo):  # workspace toucher
-                broker.publish(issue_id, "status", "preparing the repository workspace")
+                emit("status", "preparing the repository workspace")
                 if phase == 2:
                     prompt = build_phase2_prompt(
                         target=target, branch=branch, issue=issue_info, stacktrace=stacktrace,
@@ -399,10 +410,10 @@ class Worker:
 
                 log.info("running claude for issue %s phase %s (%s)", issue_id, phase, target.repo)
                 result = await run_claude(
-                    self.settings, target, workspace, prompt,
-                    on_event=lambda e, d: broker.publish(issue_id, e, d))
+                    self.settings, target, workspace, prompt, on_event=emit)
         finally:
             broker.finish(issue_id)
+            t_writer.close(result.status if result else "exception")
         log.info("issue %s -> %s %s", issue_id, result.status, result.pr_url or "")
         await self.engine.record_prs(issue_id, result.pr_urls)
 
@@ -462,12 +473,22 @@ class Worker:
         branch = f"brain/{job_id}"
 
         # live observation: stream this run to the inbox detail pane (see
-        # _process_sentry for the same wiring on the sentry path)
+        # _process_sentry for the same wiring on the sentry path), teeing every
+        # event into the run transcript (§13)
         broker = self.engine.stage_broker
         broker.start(job_id)
+        t_writer = transcripts.open_writer(
+            self.settings, job_id, f"v1-p{phase}-{int(time.time())}",
+            {"kind": "v1", "phase": phase, "source": "task"})
+
+        def emit(event, data):
+            t_writer.write(event, data)
+            broker.publish(job_id, event, data)
+
+        result = None
         try:
             pname, brief = self._job_context(row)
-            broker.publish(job_id, "status", "preparing the repository workspace")
+            emit("status", "preparing the repository workspace")
             if phase == 2:
                 prompt = build_task_implement_prompt(
                     target=target, branch=branch, task=task_info, request=request_text,
@@ -487,10 +508,10 @@ class Worker:
 
             log.info("running claude for request %s phase %s (%s)", job_id, phase, target.repo)
             result = await run_claude(
-                self.settings, target, workspace, prompt,
-                on_event=lambda e, d: broker.publish(job_id, e, d))
+                self.settings, target, workspace, prompt, on_event=emit)
         finally:
             broker.finish(job_id)
+            t_writer.close(result.status if result else "exception")
         log.info("request %s -> %s %s", job_id, result.status, result.pr_url or "")
         await self.engine.record_prs(job_id, result.pr_urls)
 
@@ -1044,13 +1065,17 @@ class Worker:
     async def prune_sessions_forever(self):
         """Daily janitor for session transcripts (docs/CONVERSATIONS.md §4):
         prune by file mtime with a keep-set — never by job terminal status alone,
-        which misses abandoned gates and unattributed v1 traffic."""
-        if not self.settings.session_persistence:
-            return
+        which misses abandoned gates and unattributed v1 traffic. Run transcripts
+        (§13) ride the same schedule — they have no keep-set (replay history, not
+        resume state) so age alone decides, even with session persistence off."""
         while True:
             await asyncio.sleep(86400)
             try:
-                self._prune_sessions()
+                pruned = transcripts.prune(self.settings, self.settings.transcript_ttl_days)
+                if pruned:
+                    log.info("transcript janitor pruned %d run transcripts", pruned)
+                if self.settings.session_persistence:
+                    self._prune_sessions()
             except Exception:
                 log.exception("session janitor failed")
 
