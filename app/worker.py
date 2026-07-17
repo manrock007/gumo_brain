@@ -89,6 +89,7 @@ class Worker:
         self.clickup = ClickUp(settings)
         self.locks = RepoLocks()
         self.engine = Engine(settings, store, self.clickup, locks=self.locks)
+        self.workspaces = None  # WorkspaceService, injected at startup (main.lifespan)
 
     def _enqueue(self, job_id: str, priority: int):
         self.queue.put_nowait((priority, next(self._seq), job_id, time.time()))
@@ -117,8 +118,16 @@ class Worker:
                 return f"issue {issue_id} in cooldown ({existing['status']})"
 
         self.store.insert(issue_id, source=source, forced=forced, title=title, project=project)
+        self._stamp_workspace(issue_id, project)
         self._enqueue(issue_id, PRIO_SWEEP if source == "sweep" else PRIO_SENTRY)
         return f"issue {issue_id} queued"
+
+    def _stamp_workspace(self, job_id: str, project: str):
+        """Record the owning workspace on the job row (slugs are global)."""
+        if self.workspaces and project:
+            ws = self.workspaces.for_project(project)
+            if ws:
+                self.store.set_fields(job_id, workspace_id=ws["id"])
 
     def intake_task(self, job_id: str, title: str, project: str, request: str,
                     clickup_task_id: str | None = None,
@@ -141,6 +150,7 @@ class Worker:
             clickup_task_id=clickup_task_id or "",
             clickup_task_url=clickup_task_url or "",
         )
+        self._stamp_workspace(job_id, project)
         self._enqueue(job_id, PRIO_HUMAN)
         return f"request {job_id} queued"
 
@@ -189,6 +199,7 @@ class Worker:
             owner=owner,
             related_jobs=related_jobs,
         )
+        self._stamp_workspace(job_id, project)
         self._enqueue(job_id, PRIO_HUMAN)
         return f"feature {job_id} queued at P0"
 
@@ -199,6 +210,7 @@ class Worker:
             return f"memory bootstrap for {project} already in progress ({existing['status']})"
         self.store.insert(job_id, source="manual", forced=True,
                           title=f"memory bootstrap: {project}", project=project, kind="memory")
+        self._stamp_workspace(job_id, project)
         self._enqueue(job_id, PRIO_HUMAN)
         return f"memory bootstrap for {project} queued"
 

@@ -145,6 +145,7 @@ class Engine:
         # per-job mid-run steer handles: job_id -> {event, stage}. Populated while a
         # stage runs; an HTTP steer request sets the event to interrupt in place.
         self._steer: dict[str, dict] = {}
+        self.workspaces = None  # WorkspaceService, injected at startup (main.lifespan)
 
     def request_steer(self, job_id: str, note: str, via: str = "dashboard") -> str:
         """Human course-correction from the live session page. Returns the outcome:

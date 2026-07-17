@@ -37,6 +37,7 @@ from .fixer import ensure_session_store
 from .memory import MemoryReader
 from .sentry_api import extract_issue_ref, verify_signature
 from .worker import GateConflict, Worker
+from .workspaces import WorkspaceError, WorkspaceService
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 log = logging.getLogger("brain")
@@ -70,7 +71,12 @@ async def lifespan(app: FastAPI):
     app.state.settings = settings  # auth dependencies resolve via app.state
     bootstrap_admin(store, settings)
     store.auth_sessions_prune()
+    workspaces = WorkspaceService(store, settings)
+    workspaces.ensure_default()  # upgrade path: wrap the §10 context into a workspace
+    app.state.workspaces = workspaces
     worker = Worker(settings, store)
+    worker.workspaces = workspaces
+    worker.engine.workspaces = workspaces
     tasks = [
         asyncio.create_task(worker.run_forever()),
         asyncio.create_task(worker.poll_clickup_forever()),
