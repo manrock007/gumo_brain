@@ -49,8 +49,7 @@ logic. This is the canonical repo hosting product-scope memory (`.gumo/product/`
 - `react-native` (manrock007/gumoclient) — the React Native mobile app.
 The clients consume the backend's API; cross-repo features ship server-first, then
 clients. Deeper, versioned product knowledge (what the product is, who it's for, the
-cross-repo API contract) lives in product memory (`.gumo/product/` and `.gumo/memory/`)
-— when memory is present it is more current than this note and takes precedence."""
+cross-repo API contract) lives in product memory (`.gumo/product/` and `.gumo/memory/`)."""
 
 # Project-context fields an operator may override at runtime (persisted in the
 # app_config table, applied over env/code defaults at startup and via the API).

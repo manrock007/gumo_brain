@@ -1174,7 +1174,8 @@ class Worker:
             findings=[{"id": c["id"], "path": c.get("path"),
                        "line": c.get("line") or c.get("original_line"),
                        "body": c.get("body")} for c in findings],
-            product_name=self.settings.product_name)
+            product_name=self.settings.product_name,
+            business_context=self.settings.business_context)
         # a DEDICATED clone + lock, NOT the main repo lock: a fix run can hold a
         # lock for a full claude timeout, and taking the main one would starve
         # pipeline stages / sentry jobs on that repo for the duration. The run

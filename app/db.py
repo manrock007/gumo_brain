@@ -344,13 +344,21 @@ class JobStore:
         return out
 
     def config_set(self, key: str, value):
+        self.config_set_many({key: value})
+
+    def config_set_many(self, values: dict):
+        """Upsert several overrides in ONE transaction — a partial override set
+        can be self-inconsistent (e.g. a repo map without its canonical slug)
+        and would be rejected wholesale at the next startup."""
+        now = time.time()
         with self._conn() as c:
-            c.execute(
-                """INSERT INTO app_config (key, value, updated_at) VALUES (?, ?, ?)
-                   ON CONFLICT(key) DO UPDATE SET
-                     value = excluded.value, updated_at = excluded.updated_at""",
-                (key, json.dumps(value), time.time()),
-            )
+            for key, value in values.items():
+                c.execute(
+                    """INSERT INTO app_config (key, value, updated_at) VALUES (?, ?, ?)
+                       ON CONFLICT(key) DO UPDATE SET
+                         value = excluded.value, updated_at = excluded.updated_at""",
+                    (key, json.dumps(value), now),
+                )
 
     def config_clear(self, keys: list[str] | None = None):
         """Remove overrides (all of them when keys is None) — revert to defaults."""

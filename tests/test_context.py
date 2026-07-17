@@ -161,6 +161,25 @@ def test_fix_and_task_prompts_carry_context():
     assert "Acme builds rockets." in prompt
 
 
+def test_business_block_states_memory_precedence():
+    """docs/ENGINE.md §10: the precedence note is stated in the prompt itself,
+    so it survives an operator replacing the default text."""
+    from app.prompts import business_block
+
+    block = business_block("Acme builds rockets.")
+    assert "takes precedence" in block
+
+
+def test_shepherd_prompt_carries_context():
+    from app.prompts import build_shepherd_prompt
+
+    prompt = build_shepherd_prompt(target=TARGET, pr_url="http://pr", branch="b",
+                                   findings=[], product_name="Acme",
+                                   business_context="Acme builds rockets.")
+    assert "Acme Engine's PR shepherd" in prompt
+    assert "Acme builds rockets." in prompt
+
+
 def test_bootstrap_prompt_carries_context():
     prompt = build_bootstrap_prompt(target=TARGET, branch="b", project="api",
                                     is_canonical=True, run=1, product_name="Acme",

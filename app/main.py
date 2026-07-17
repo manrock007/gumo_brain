@@ -55,10 +55,16 @@ async def lifespan(app: FastAPI):
     if settings.session_persistence:
         ensure_session_store(settings)
     store = JobStore(settings.db_path)
+    overrides = store.config_all()
     try:  # operator-saved project context (repos, business context) wins over env/defaults
-        settings.apply_runtime_overrides(store.config_all())
+        settings.apply_runtime_overrides(overrides)
     except ValueError as e:
-        log.error("stored project-context overrides are invalid, running on defaults: %s", e)
+        # apply is atomic, so nothing was changed; name the actual faulty source —
+        # with no stored overrides the canonical-in-map check is judging the
+        # env/code config itself
+        source = "stored overrides (app_config)" if overrides else "env/code config"
+        log.error("project context invalid in %s: %s — overrides NOT applied; "
+                  "fix via PUT /api/context (or the env) and restart", source, e)
     worker = Worker(settings, store)
     tasks = [
         asyncio.create_task(worker.run_forever()),
@@ -172,12 +178,33 @@ class ContextBody(BaseModel):
     canonical_project: str | None = None  # must be a slug in the (resulting) repo map
 
 
-def _context_payload() -> dict:
-    defaults = Settings()  # env/code defaults, no runtime overrides
+# env/code defaults with no runtime overrides, captured once — what DELETE
+# restores and what the dashboard shows as "defaults" (env is process-constant)
+_default_settings = Settings()
+
+
+def _live_unmapped_warning(store: JobStore) -> str:
+    """Live jobs whose recorded project slug is no longer in the repo map get
+    skipped at their next dispatch ('no repo mapped') — surface that at save
+    time instead of letting an approved pipeline die silently later."""
+    mapping = json.loads(settings.repo_map)
+    live = [j for j in store.by_status(["received", "queued", "running", "awaiting_input"])
+            if (j.get("project") or "") and j["project"] not in mapping]
+    if not live:
+        return ""
+    listed = ", ".join(f"{j['issue_id']} (project '{j['project']}')" for j in live[:10])
+    more = f" and {len(live) - 10} more" if len(live) > 10 else ""
+    return (f"warning: live jobs reference project slugs that are no longer mapped and "
+            f"will be SKIPPED at their next run: {listed}{more}. Re-add the slug(s) or "
+            f"finish those jobs first.")
+
+
+def _context_payload(warning: str = "") -> dict:
     return {
         "context": settings.project_context(),
-        "defaults": defaults.project_context(),
+        "defaults": _default_settings.project_context(),
         "overridden": sorted(app.state.store.config_all().keys()),
+        "warning": warning,
     }
 
 
@@ -190,9 +217,10 @@ async def get_context():
 async def put_context(body: ContextBody):
     """Update the project context. Only supplied fields change; values are
     validated atomically (a bad payload changes nothing), applied to the live
-    engine immediately, and persisted for future restarts. Runs already parked
-    or queued keep their recorded project slug — the new map applies from the
-    next run that resolves it."""
+    engine immediately, and persisted for future restarts. Jobs keep their
+    recorded project slug: if the new map still contains it, they continue
+    under the new mapping; if a slug was REMOVED, those jobs are skipped at
+    their next run — the response carries a warning listing them."""
     overrides = {
         "product_name": body.product_name,
         "business_context": body.business_context,
@@ -204,20 +232,22 @@ async def put_context(body: ContextBody):
     except (ValueError, TypeError) as e:
         raise HTTPException(status_code=400, detail=str(e))
     store: JobStore = app.state.store
-    for key, value in applied.items():
-        # repo_map is persisted decoded so the stored JSON stays one-layer
-        store.config_set(key, json.loads(value) if key == "repo_map" else value)
-    return _context_payload()
+    # one transaction: a crash mid-save must not persist half an override set
+    # (a partial set can be self-inconsistent and would be rejected at startup)
+    store.config_set_many({
+        key: json.loads(value) if key == "repo_map" else value  # store one-layer JSON
+        for key, value in applied.items()
+    })
+    return _context_payload(warning=_live_unmapped_warning(store))
 
 
 @app.delete("/api/context", dependencies=[Depends(require_auth)])
 async def reset_context():
     """Drop every stored override — revert to the env/code defaults."""
     app.state.store.config_clear()
-    defaults = Settings()
     for key in RUNTIME_CONTEXT_KEYS:
-        setattr(settings, key, getattr(defaults, key))
-    return _context_payload()
+        setattr(settings, key, getattr(_default_settings, key))
+    return _context_payload(warning=_live_unmapped_warning(app.state.store))
 
 
 class SubmitBody(BaseModel):

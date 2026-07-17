@@ -145,6 +145,39 @@ def test_context_requires_auth(client):
     assert client.delete("/api/context").status_code == 401
 
 
+def test_dashboard_rebrands_from_context(client):
+    """The rebrand hangs off an exact literal in DASHBOARD_HTML — pin it, and
+    prove the rendered page follows the configured product name."""
+    from app.dashboard import DASHBOARD_HTML
+
+    assert "the Gumo Engine" in DASHBOARD_HTML  # main.dashboard() replaces this
+    assert "the Gumo Engine" in client.get("/", headers=AUTH).text
+    r = client.put("/api/context", headers=AUTH, json={"product_name": "Acme"})
+    assert r.status_code == 200
+    page = client.get("/", headers=AUTH).text
+    assert "the Acme Engine" in page and "the Gumo Engine" not in page
+    client.delete("/api/context", headers=AUTH)
+
+
+def test_context_put_warns_about_unmapped_live_jobs(client):
+    """Removing a slug from the map must not silently doom live jobs — the
+    save response lists them (they will be skipped at next dispatch)."""
+    store = client.app.state.store
+    store.insert("task-live1", source="manual", title="t", project="gumo", kind="task")
+    r = client.put("/api/context", headers=AUTH, json={
+        "repo_map": {"api": {"repo": "acme/api"}}, "canonical_project": "api",
+    })
+    assert r.status_code == 200
+    assert "task-live1" in r.json()["warning"]
+    # partial update: only the sent fields became overrides
+    assert set(r.json()["overridden"]) == {"repo_map", "memory_canonical_project"}
+    # reset also warns while the job is still live and unmapped under defaults?
+    # (project 'gumo' IS in the defaults, so the warning clears)
+    r = client.delete("/api/context", headers=AUTH)
+    assert r.status_code == 200
+    assert r.json()["warning"] == ""
+
+
 def test_feature_stats_404(client):
     r = client.get("/api/features/none/stats", headers=AUTH)
     assert r.status_code == 404

@@ -12,7 +12,9 @@ BUSINESS_CONTEXT_CAP = 4000  # operator-supplied text must not crowd out the wor
 
 def business_block(business_context: str) -> str:
     """The operator-maintained product/business description, injected into every
-    run's prompt. Capped; product memory (when present) supersedes it."""
+    run's prompt. Capped; the precedence note must live in the block itself
+    (docs/ENGINE.md §10 — 'stated in the prompt'), not in the default text,
+    or it vanishes as soon as an operator saves their own context."""
     text = (business_context or "").strip()
     if not text:
         return ""
@@ -22,7 +24,10 @@ def business_block(business_context: str) -> str:
 
 ## Business context (operator-maintained)
 
-{text}"""
+{text}
+
+(Versioned product memory — `.gumo/` files or a memory section in this prompt, when
+present — is more current than this section and takes precedence over it.)"""
 
 
 def _common_header(target: RepoTarget, branch: str, issue: dict, stacktrace: str,
@@ -381,7 +386,8 @@ The reviewer asks:
 
 def build_shepherd_prompt(*, target: RepoTarget, pr_url: str, branch: str,
                           findings: list[dict],
-                          product_name: str = DEFAULT_PRODUCT_NAME) -> str:
+                          product_name: str = DEFAULT_PRODUCT_NAME,
+                          business_context: str = "") -> str:
     """One shepherd fix run: verify each review finding against the code and
     either fix it (commit + push to the PR branch) or rebut it. The engine
     posts the thread replies and the next `@sentry review` — the run only has
@@ -395,7 +401,7 @@ def build_shepherd_prompt(*, target: RepoTarget, pr_url: str, branch: str,
                    f"{(f.get('body') or '').strip()[:4000]}")
     return f"""You are the {product_name} Engine's PR shepherd. An automated reviewer (the Sentry \
 review bot) left findings on {pr_url}. You are inside a clone of `{target.repo}` with \
-the PR's branch `{branch}` checked out.
+the PR's branch `{branch}` checked out.{business_block(business_context)}
 
 Work through EVERY finding below, sequentially:
 

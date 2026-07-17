@@ -1148,12 +1148,19 @@ async function saveContext(btn) {
       allow: v('cr-allow') ? v('cr-allow').split(',').map(s => s.trim()).filter(Boolean) : [],
     };
   }
-  const body = {
-    product_name: document.getElementById('ctx-name').value.trim(),
-    canonical_project: document.getElementById('ctx-canon').value.trim(),
-    business_context: document.getElementById('ctx-biz').value,
-    repo_map,
-  };
+  // only send what actually changed: untouched fields must NOT become DB
+  // overrides, or they would pin today's defaults forever (shadowing future
+  // env/default improvements)
+  const cur = ctxData.context;
+  const body = {};
+  const name = document.getElementById('ctx-name').value.trim();
+  if (name !== cur.product_name) body.product_name = name;
+  const canon = document.getElementById('ctx-canon').value.trim();
+  if (canon !== cur.canonical_project) body.canonical_project = canon;
+  const biz = document.getElementById('ctx-biz').value;
+  if (biz !== cur.business_context) body.business_context = biz;
+  if (JSON.stringify(repo_map) !== JSON.stringify(cur.repo_map)) body.repo_map = repo_map;
+  if (!Object.keys(body).length) { msg.textContent = 'No changes to save.'; return; }
   btn.disabled = true; msg.textContent = 'Saving project context…';
   try {
     const r = await fetch('api/context', {
@@ -1162,7 +1169,8 @@ async function saveContext(btn) {
     const data = await r.json();
     if (r.ok) {
       ctxData = data; renderContext();
-      msg.textContent = 'Project context saved — new runs use it immediately.';
+      msg.textContent = 'Project context saved — new runs use it immediately.'
+        + (data.warning ? ' ' + data.warning : '');
       loadProjects(); refreshMemory(true);
     } else msg.textContent = 'Error: ' + (data.detail || r.status);
   } catch (e) { msg.textContent = 'Error: ' + e; }
@@ -1178,7 +1186,8 @@ async function resetContext(btn) {
     const data = await r.json();
     if (r.ok) {
       ctxData = data; renderContext();
-      msg.textContent = 'Project context reset to defaults.';
+      msg.textContent = 'Project context reset to defaults.'
+        + (data.warning ? ' ' + data.warning : '');
       loadProjects(); refreshMemory(true);
     } else msg.textContent = 'Error: ' + (data.detail || r.status);
   } catch (e) { msg.textContent = 'Error: ' + e; }

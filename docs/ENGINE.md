@@ -383,9 +383,10 @@ not code** — the same brain serves any software team:
 - **Product name** — the identity used in prompts ("the `<name>` Engine",
   "the `<name>` platform").
 - **Business context** — operator-maintained free text injected into EVERY
-  run's prompt (all P0–P9 stages, sentry fixes, tasks, memory bootstrap),
-  capped at 4k chars. It is the always-present baseline; product memory, when
-  present, is more current and takes precedence (stated in the prompt).
+  run's prompt (all P0–P9 stages, sentry fixes, tasks, memory bootstrap, the
+  PR shepherd), capped at 4k chars. It is the always-present baseline; product
+  memory, when present, is more current and takes precedence — the injected
+  block itself states this, so it holds for custom contexts too.
 
 Precedence: **DB overrides > env vars > code defaults** (the Gumo repos and a
 structural Gumo description ship as the defaults). Operators edit the context
@@ -393,6 +394,14 @@ in the dashboard's "Project context" panel or via `PUT /api/context`; saved
 values persist in the `app_config` table, apply to the live engine immediately
 (next run picks them up) and survive restarts. `DELETE /api/context` reverts
 to defaults. Validation is atomic and fail-closed: a malformed repo map or a
-canonical slug missing from the map is a 400 and nothing changes. The `.gumo/`
-directory names are engine namespace (like `.github/`), not product branding —
-they stay fixed regardless of context.
+canonical slug missing from the map is a 400 and nothing changes; persistence
+is one transaction. The `.gumo/` directory names are engine namespace (like
+`.github/`), not product branding — they stay fixed regardless of context.
+
+Edits and running work: jobs keep their recorded project slug. If the new map
+still contains the slug, they continue under the new mapping; if a slug was
+REMOVED, those jobs are skipped at their next dispatch ("no repo mapped") —
+the PUT/DELETE response carries a warning listing affected live jobs, and the
+dashboard surfaces it. A run already in flight when an edit lands resolves its
+context non-transactionally (it may see mixed old/new values in its briefing);
+the next run is consistent.
