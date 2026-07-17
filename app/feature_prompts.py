@@ -49,6 +49,14 @@ End your final message with exactly one of:
 - `STAGE_FAIL:` followed by 2-3 sentences on why this stage cannot be completed
   (missing information, out of scope, blocked) and what would unblock it.{ask_clause}
 
+Optionally, BEFORE the marker, report workflow friction you hit this stage —
+missing/unclear instructions, inputs you wished you had, process that fought
+you — one line each, on the pattern the team's improvement loop harvests:
+
+- `FRICTION: <what went wrong> · <how it could improve>`
+
+Report real friction only; no line when the stage ran clean.
+
 Nothing advances without one of these markers — an unmarked output parks the
 pipeline for human triage."""
 
@@ -203,7 +211,10 @@ and update any `.gumo/memory/architecture.md` / `map.md` sections this feature
 changed{product_scope_note}. (2) Finalize the PR body: link the ticket, summarize
 per-stage outcomes, test results, and human decisions. (3) Commit, push. Write
 `.gumo/features/{job_id}/P9-ship.md` with the final summary and a
-"ready to un-draft" checklist. Include `PR_URL: <url>` again in your output.""",
+"ready to un-draft" checklist. Include `PR_URL: <url>` again in your output.
+(4) If this feature ships behind a feature flag or has a defined success
+metric, also emit standalone lines `FLAG_NAME: <flag>` and/or
+`SUCCESS_METRIC: <metric>` — omit them when not applicable, never invent.""",
 }
 
 

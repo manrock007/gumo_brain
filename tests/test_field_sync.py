@@ -107,6 +107,64 @@ class TestPrAndDashboardFieldSync:
                    for _, f, v in fake.sets)
 
 
+class TestDocAndReportFieldSync:
+    def test_doc_fields_point_at_artifact_subtasks(self, worker):
+        fake = FakeFieldClickUp()
+        worker.engine.clickup = fake
+        job = _feature(worker, "feat-fs11")
+        worker.store.artifact_set("feat-fs11", "P1-prd.md", subtask_id="sub1")
+        worker.store.artifact_set("feat-fs11", "P3-design.md", subtask_id="sub3")
+        asyncio.run(worker.engine.sync_doc_fields(job))
+        assert ("cu1", "PRD Doc", "https://app.clickup.com/t/sub1") in fake.sets
+        assert ("cu1", "Contract Doc", "https://app.clickup.com/t/sub3") in fake.sets
+        assert any(f == "PRD Folder" and ".gumo/features/feat-fs11" in v
+                   for _, f, v in fake.sets)
+
+    def test_friction_lines_feed_the_improvements_log(self, worker):
+        fake = FakeFieldClickUp()
+        worker.engine.clickup = fake
+        job = _feature(worker, "feat-fs12", stage=7)
+        text = ("did the work\n"
+                "FRICTION: test plan lacked seed data shapes · include fixtures in P4\n"
+                "FRICTION: repo test cmd missing · configure test_cmd\n"
+                "STAGE_DONE: all green\n## Questions\n1. Approve?")
+        asyncio.run(worker.engine.sync_run_report_fields(job, 7, text))
+        lines = [line for _, f, line in fake.appends if f == "Gumo Workflow Improvements"]
+        assert len(lines) == 2
+        assert lines[0].startswith("P7 Test (engine) · ")
+        assert "seed data shapes" in lines[0]
+
+    def test_p9_flag_and_metric_fields(self, worker):
+        fake = FakeFieldClickUp()
+        worker.engine.clickup = fake
+        job = _feature(worker, "feat-fs13", stage=9)
+        text = ("FLAG_NAME: import_health_api\nSUCCESS_METRIC: ops MTTR on import incidents\n"
+                "STAGE_DONE: shipped\n## Questions\n1. Approve?")
+        asyncio.run(worker.engine.sync_run_report_fields(job, 9, text))
+        assert ("cu1", "Flag name", "import_health_api") in fake.sets
+        assert ("cu1", "Success metric", "ops MTTR on import incidents") in fake.sets
+
+    def test_clean_run_appends_nothing(self, worker):
+        fake = FakeFieldClickUp()
+        worker.engine.clickup = fake
+        job = _feature(worker, "feat-fs14")
+        asyncio.run(worker.engine.sync_run_report_fields(
+            job, 3, "STAGE_DONE: fine\n## Questions\n1. Approve?"))
+        assert fake.appends == [] and fake.sets == []
+
+
+class TestDriAdoption:
+    def test_feature_adoption_reads_dev_dri(self, worker):
+        from tests.test_intake_clickup import FakeClickUp, _cu_task
+
+        fake = FakeClickUp(tasks=[_cu_task("td1", "[feature] flagged feature")],
+                           bodies={"td1": "project: web\nbuild it"})
+        fake.fields = {"td1": {"assigned dev dri": [{"id": 4242, "username": "dev"}]}}
+        worker.clickup = fake
+        asyncio.run(worker._poll_intake())
+        assert worker.store.get("feat-td1")["owner"] == "4242"
+
+
 class TestDecisionsFieldSync:
     def test_proceed_guidance_appends(self, worker):
         fake = FakeFieldClickUp()

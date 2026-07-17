@@ -30,6 +30,15 @@ class FakeClickUp:
     async def load_statuses(self):
         pass
 
+    async def task_fields(self, task_id):
+        return self.fields.get(task_id, {}) if hasattr(self, "fields") else {}
+
+    async def field_set(self, task_id, field, value):
+        return True
+
+    async def field_append(self, task_id, field, line):
+        return True
+
 
 def _cu_task(task_id, name):
     return {"id": task_id, "name": name, "url": f"https://cu/{task_id}", "list_id": "L1"}

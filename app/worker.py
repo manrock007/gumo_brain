@@ -623,6 +623,11 @@ class Worker:
                                     job.get("parked_head") or "")
             self.store.stage_run_gate_answered(job_id, stage, "redo")
             await self._sync_decision_field(task_id, target_stage, " (redo)", text)
+            if self.settings.clickup_field_sync_enabled and text and task_id:
+                # a human redo IS workflow friction — feed the improvement loop
+                await self.clickup.field_append(
+                    task_id, self.settings.clickup_friction_field,
+                    f"P{target_stage} (human) · redo requested · {text[:300]}")
             if target_stage < stage:
                 await self._mark_superseded(job, target_stage)
             await self.clickup.comment(
@@ -938,10 +943,18 @@ class Worker:
         request = PROJECT_LINE_RE.sub("", desc).strip() or title
 
         if kind == "feature":
+            # the workflow contract: the ticket creator sets the DRI people
+            # fields; gates assign/notify that person (Dev DRI first, Founder
+            # as the fallback approver)
+            fields = await self.clickup.task_fields(task_id)
+            dri = fields.get("assigned dev dri") or fields.get("assigned founder dri")
+            owner = ""
+            if isinstance(dri, list) and dri:
+                owner = str((dri[0] or {}).get("id") or "")
             job_id = f"feat-{task_id}"
             decision = self.intake_feature(
                 job_id, title=title, project=project, request=request,
-                clickup_task_id=task_id, clickup_task_url=task_url,
+                clickup_task_id=task_id, clickup_task_url=task_url, owner=owner,
                 cu_list_id=t.get("list_id") or self.settings.clickup_list_id)
             adopted_as = ("FEATURE PIPELINE (P0 Intake → P9 Ship) — each stage posts its "
                           "artifact as a subtask and parks here for your `/proceed`, "

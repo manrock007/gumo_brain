@@ -94,6 +94,21 @@ class ClickUp:
             log.exception("ClickUp field_set %s failed for task %s", field_name, task_id)
             return False
 
+    async def task_fields(self, task_id: str) -> dict:
+        """Custom-field VALUES on a task, keyed by lowercased field name —
+        intake reads the DRI people fields and any pre-set state from here."""
+        if not self.enabled or not task_id:
+            return {}
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.get(f"{API}/task/{task_id}", headers=self._headers)
+                r.raise_for_status()
+                return {(f.get("name") or "").lower(): f.get("value")
+                        for f in r.json().get("custom_fields", [])}
+        except Exception:
+            log.exception("ClickUp task_fields failed for %s", task_id)
+            return {}
+
     async def field_append(self, task_id: str, field_name: str, line: str) -> bool:
         """Append a line to a text field (read-then-write — the workflow contract
         says shared fields accumulate across stages, never overwrite)."""

@@ -308,6 +308,18 @@ to the job's inbox view. Fields are addressed by NAME and resolved at
 startup (`load_fields`); a missing field or option is a quiet no-op — the
 workspace schema belongs to the humans.
 
+Full-parity extras: `PRD Doc`/`Contract Doc` point at the artifact-mirror
+subtasks (the brain's EDITABLE equivalent of the workflow's Drive docs —
+edits there sync back to git) and the folder field at the branch's `.gumo`
+tree; feature adoption reads the `Assigned Dev DRI`/`Assigned Founder DRI`
+people fields into `owner` (gates assign that person, as the original
+automations did); stage runs may emit `FRICTION: <what> · <improvement>`
+lines that append to `Gumo Workflow Improvements` (human redos append there
+too — the `gumo-improve` harvest loop reads this field); P9 may emit
+`FLAG_NAME:`/`SUCCESS_METRIC:` lines that fill the launch fields. Literal
+Google Docs remain out (the brain has no Drive credentials; the subtask
+mirrors supersede them functionally).
+
 ### Live steering (mid-run course-correction)
 
 A human can interrupt a *running* stage from the session view. With session

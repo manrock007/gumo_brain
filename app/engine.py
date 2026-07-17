@@ -443,6 +443,8 @@ class Engine:
         marker, payload, pr_url = parse_stage_output(raw.text)
         # track EVERY PR this run mentioned (not just the last) + lifecycle kickoff
         await self.record_prs(job_id, all_pr_urls(raw.text))
+        # conveyor mirror: FRICTION -> improvements log, FLAG/METRIC -> launch fields
+        await self.sync_run_report_fields(job, stage, raw.text)
 
         if marker == "done" and stage_kind(stage) == "doc":
             # engine owns the artifact for document stages
@@ -610,6 +612,8 @@ class Engine:
         owner = (job.get("owner") or "").strip()
         if owner:
             await self.clickup.set_assignee(job.get("clickup_task_id") or "", owner)
+        # conveyor mirror: doc/folder fields point at the editable artifacts
+        await self.sync_doc_fields(job)
         log.info("job %s parked at P%s gate", job_id, stage)
 
     # ---------- helpers ----------
@@ -893,6 +897,61 @@ class Engine:
                 f"{self.settings.public_base_url}/#/job/{job['issue_id']}")
         except Exception:
             log.exception("Dashboard field sync failed for %s (non-fatal)", job.get("issue_id"))
+
+    async def sync_doc_fields(self, job: dict):
+        """Point `PRD Doc` / `Contract Doc` at their editable artifact-mirror
+        subtasks and the folder field at the branch's `.gumo` tree — the
+        brain's equivalent of the workflow's per-feature Drive folder (the
+        subtasks are BETTER than the original's Drive docs: human edits there
+        sync back into git, which the Drive connector never could)."""
+        if not self.settings.clickup_field_sync_enabled:
+            return
+        task_id = job.get("clickup_task_id") or ""
+        if not task_id or (job.get("kind") or "") != "feature":
+            return
+        try:
+            dmap = json.loads(self.settings.clickup_doc_field_map)
+            for state in self.store.artifacts_for(job["issue_id"]):
+                field = dmap.get(state["artifact"])
+                if field and state["subtask_id"]:
+                    await self.clickup.field_set(
+                        task_id, field, f"https://app.clickup.com/t/{state['subtask_id']}")
+            target = self.settings.repo_for_project(job.get("project") or "")
+            if target and self.settings.clickup_folder_field:
+                await self.clickup.field_set(
+                    task_id, self.settings.clickup_folder_field,
+                    f"https://github.com/{target.repo}/tree/brain/feat-{job['issue_id']}"
+                    f"/.gumo/features/{job['issue_id']}")
+        except Exception:
+            log.exception("doc field sync failed for %s (non-fatal)", job.get("issue_id"))
+
+    FRICTION_RE = re.compile(r"^FRICTION:\s*(.+)$", re.MULTILINE)
+    FLAG_RE = re.compile(r"^FLAG_NAME:\s*(.+)$", re.MULTILINE)
+    METRIC_RE = re.compile(r"^SUCCESS_METRIC:\s*(.+)$", re.MULTILINE)
+
+    async def sync_run_report_fields(self, job: dict, stage: int, text: str):
+        """Harvest the run's self-reported protocol lines into the workflow
+        fields: FRICTION -> the append-only improvements log (the gumo-improve
+        harvest loop reads it), FLAG_NAME / SUCCESS_METRIC (P9) -> their
+        launch fields."""
+        if not self.settings.clickup_field_sync_enabled:
+            return
+        task_id = job.get("clickup_task_id") or ""
+        if not task_id or (job.get("kind") or "") != "feature":
+            return
+        try:
+            for m in self.FRICTION_RE.finditer(text or ""):
+                await self.clickup.field_append(
+                    task_id, self.settings.clickup_friction_field,
+                    f"P{stage} {stage_name(stage)} (engine) · {m.group(1).strip()[:400]}")
+            fm = self.FLAG_RE.search(text or "")
+            if fm:
+                await self.clickup.field_set(task_id, "Flag name", fm.group(1).strip()[:200])
+            mm = self.METRIC_RE.search(text or "")
+            if mm:
+                await self.clickup.field_set(task_id, "Success metric", mm.group(1).strip()[:200])
+        except Exception:
+            log.exception("run-report field sync failed for %s (non-fatal)", job.get("issue_id"))
 
     async def sync_pr_field(self, job_id: str, repo: str, url: str):
         """Fill the per-repo PR url field (`Backend PR` / `Web PR` / `App PR`)

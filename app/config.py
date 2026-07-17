@@ -86,6 +86,12 @@ class Settings(BaseSettings):
                                  '"manrock007/gumoclient": "App PR"}')
     # public dashboard base for the ticket's Dashboard deep link
     public_base_url: str = "https://gumo.co.in/brain"
+    # artifact mirror -> doc url field (the brain's editable equivalent of the
+    # workflow's Google Docs), + the folder field pointing at the branch's
+    # .gumo tree, + the append-only friction log field
+    clickup_doc_field_map: str = '{"P1-prd.md": "PRD Doc", "P3-design.md": "Contract Doc"}'
+    clickup_folder_field: str = "PRD Folder"
+    clickup_friction_field: str = "Gumo Workflow Improvements"
 
     # Dashboard basic auth (user "gumo"); dashboard + trigger disabled if empty
     dashboard_password: str = ""
