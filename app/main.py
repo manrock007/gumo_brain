@@ -879,10 +879,10 @@ async def session_stream(job_id: str, user: dict = Depends(require_user)):
 
 @app.post("/api/jobs/{job_id}/session/steer")
 async def session_steer(job_id: str, body: SteerBody, user: dict = Depends(require_user)):
-    _job_scoped(job_id, user)
     """Course-correct a running stage. Interrupts the CLI and resumes its session
     with the note folded in when possible; otherwise records it as guidance for
     the next checkpoint. 202 either way with which path was taken."""
+    _job_scoped(job_id, user)
     note = body.note.strip()
     if not note:
         raise HTTPException(status_code=400, detail="empty note")

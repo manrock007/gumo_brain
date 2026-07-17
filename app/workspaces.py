@@ -75,7 +75,11 @@ class WorkspaceService:
 
     def sync_settings(self):
         """Rebuild the merged slug→target map into live Settings so every
-        existing `repo_for_project` call site keeps working unchanged."""
+        existing `repo_for_project` call site keeps working unchanged. Assigned
+        UNCONDITIONALLY: an empty result must clear the map too, or removed
+        repos would linger dispatchable in memory (sentry finding 1595917 —
+        not reachable via the API today, which refuses empty repo sets, but
+        any future delete surface would hit it)."""
         merged = {}
         for r in self.store.repo_rows_all():
             merged[r["slug"]] = {
@@ -83,8 +87,7 @@ class WorkspaceService:
                 "setup_cmd": r["setup_cmd"], "test_cmd": r["test_cmd"],
                 "allow": json.loads(r["allow"] or "[]"),
             }
-        if merged:
-            self.settings.repo_map = json.dumps(merged)
+        self.settings.repo_map = json.dumps(merged)
 
     # ---------- resolution ----------
 
@@ -238,6 +241,11 @@ class WorkspaceService:
                 clean[key] = value
             else:
                 value = str(value).strip()
+                # name is the one field that must never be blank; the OTHER
+                # empty strings are meaningful clears (product_name -> instance
+                # default, canonical_project -> no product scope, urls/lists off)
+                if key == "name" and not value:
+                    raise WorkspaceError("workspace name cannot be empty")
                 if key == "workspace_context" and len(value) > WORKSPACE_CONTEXT_CAP:
                     raise WorkspaceError(
                         f"workspace_context is capped at {WORKSPACE_CONTEXT_CAP} chars")

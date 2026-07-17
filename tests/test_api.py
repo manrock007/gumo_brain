@@ -144,6 +144,19 @@ def test_workspace_crud_and_repo_move(client):
     # unknown workspace on PATCH is a 404 (matches the members endpoint), not a 400
     assert client.patch("/api/workspaces/9999", headers=AUTH,
                         json={"name": "x"}).status_code == 404
+    # a blank name is refused; sync clears the merged map when repos empty
+    default_id_probe = ws_list[0]["id"]
+    assert client.patch(f"/api/workspaces/{default_id_probe}", headers=AUTH,
+                        json={"name": "  "}).status_code == 400
+    svc_probe = client.app.state.workspaces
+    import json as _json
+    svc_probe.store.workspace_repos_replace(default_id_probe, [])
+    svc_probe.sync_settings()
+    assert _json.loads(svc_probe.settings.repo_map) == {}  # no stale dispatch map
+    # restore for the rest of the test
+    svc_probe.store.workspace_repos_replace(default_id_probe, [
+        {"slug": s, **e} for s, e in ws_list[0]["repos"].items()])
+    svc_probe.sync_settings()
 
     # a second workspace cannot steal an existing slug
     r = client.post("/api/workspaces", headers=AUTH,
