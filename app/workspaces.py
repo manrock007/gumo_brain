@@ -55,20 +55,18 @@ class WorkspaceService:
             self.sync_settings()
             return
         mapping = json.loads(self.settings.repo_map)
-        ws = self.store.workspace_create(
+        ws = self.store.migrate_default_workspace(
             "default", self.settings.product_name or "Default",
-            product_name=self.settings.product_name,
-            workspace_context="",  # business_context stays instance-level (§10)
-            canonical_project=self.settings.memory_canonical_project,
-            clickup_list_id=self.settings.clickup_list_id,
-            clickup_enabled=int(bool(self.settings.clickup_token and self.settings.clickup_list_id)),
+            fields=dict(
+                product_name=self.settings.product_name,
+                workspace_context="",  # business_context stays instance-level (§10)
+                canonical_project=self.settings.memory_canonical_project,
+                clickup_list_id=self.settings.clickup_list_id,
+                clickup_enabled=int(bool(self.settings.clickup_token and self.settings.clickup_list_id)),
+            ),
+            repos=[{"slug": slug, **entry} for slug, entry in mapping.items()],
+            user_ids=[u["id"] for u in self.store.user_list()],
         )
-        self.store.workspace_repos_replace(ws["id"], [
-            {"slug": slug, **entry} for slug, entry in mapping.items()
-        ])
-        self.store.jobs_adopt_workspace(ws["id"])
-        for u in self.store.user_list():
-            self.store.workspace_member_set(ws["id"], u["id"], True)
         log.info("created default workspace '%s' with %d repos; adopted existing jobs/users",
                  ws["slug"], len(mapping))
         self.sync_settings()

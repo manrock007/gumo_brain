@@ -1043,10 +1043,14 @@ async function loadWorkspaces() {
     if (!r.ok) return;
     WORKSPACES = await r.json();
     if (!WORKSPACES.length) return;
-    if (!activeWs || !WORKSPACES.some((w) => w.id === activeWs)) activeWs = WORKSPACES[0].id;
+    // 0 = "All workspaces" (also where unowned/legacy jobs surface); a
+    // specific selection filters STRICTLY (sentry finding 1595858)
+    const valid = activeWs === 0 || WORKSPACES.some((w) => w.id === activeWs);
+    if (activeWs == null || !valid) activeWs = WORKSPACES.length > 1 ? 0 : WORKSPACES[0].id;
     const sw = document.getElementById('ws-switch');
-    sw.innerHTML = WORKSPACES.map((w) =>
-      `<option value="${w.id}" ${w.id === activeWs ? 'selected' : ''}>${esc(w.name)}</option>`).join('');
+    sw.innerHTML = '<option value="0"' + (activeWs === 0 ? ' selected' : '') + '>All workspaces</option>' +
+      WORKSPACES.map((w) =>
+        `<option value="${w.id}" ${w.id === activeWs ? 'selected' : ''}>${esc(w.name)}</option>`).join('');
     sw.style.display = WORKSPACES.length > 1 ? '' : 'none';
     scopeProjectPickers();
     if (ME && ME.role === 'admin') renderWorkspacesAdmin();
@@ -1061,8 +1065,8 @@ function setWorkspace(id) {
 }
 
 function jobInActiveWs(j) {
-  if (!activeWs || WORKSPACES.length < 2) return true;
-  return (j.workspace_id || null) === activeWs || j.workspace_id == null;
+  if (!activeWs || WORKSPACES.length < 2) return true;  // "All", or single-workspace instance
+  return (j.workspace_id || null) === activeWs;  // strict: unowned jobs live under "All" only
 }
 
 function scopeProjectPickers() {

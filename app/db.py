@@ -486,6 +486,35 @@ class JobStore:
             c.execute("UPDATE jobs SET workspace_id = ? WHERE workspace_id IS NULL",
                       (workspace_id,))
 
+    def migrate_default_workspace(self, slug: str, name: str, fields: dict,
+                                  repos: list[dict], user_ids: list[int]) -> dict:
+        """The upgrade migration in ONE transaction: workspace + repos + job
+        adoption + memberships commit together or not at all — a crash can
+        never leave a half-built default that the existence guard would then
+        treat as migrated (sentry finding 1595858)."""
+        now = time.time()
+        cols = ", ".join(fields)
+        marks = ", ".join("?" for _ in fields)
+        with self._conn() as c:
+            cur = c.execute(
+                f"INSERT INTO workspaces (slug, name{', ' + cols if cols else ''}, created_at, updated_at) "
+                f"VALUES (?, ?{', ' + marks if marks else ''}, ?, ?)",
+                (slug, name, *fields.values(), now, now),
+            )
+            ws_id = cur.lastrowid
+            for r in repos:
+                c.execute(
+                    "INSERT INTO workspace_repos (workspace_id, slug, repo, base, setup_cmd, test_cmd, allow) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (ws_id, r["slug"], r["repo"], r.get("base") or "main",
+                     r.get("setup_cmd"), r.get("test_cmd"), json.dumps(r.get("allow") or [])),
+                )
+            c.execute("UPDATE jobs SET workspace_id = ? WHERE workspace_id IS NULL", (ws_id,))
+            for uid in user_ids:
+                c.execute("INSERT OR IGNORE INTO workspace_members (workspace_id, user_id) VALUES (?, ?)",
+                          (ws_id, uid))
+        return self.workspace_get(ws_id)
+
     # ---------- users & auth sessions (docs/ENGINE.md §11) ----------
 
     def user_get(self, username: str) -> dict | None:
