@@ -269,6 +269,16 @@
 .settings-pane .sp-head { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
 .settings-pane .sp-head h2 { margin: 0; font-size: 17px; }
 .settings-pane .sp-msg { margin-left: auto; color: var(--fg-2); font-size: 12.5px; }
+
+/* first-run setup wizard (§14) */
+.setup-card { border-color: var(--accent); }
+.setup-steps { list-style: none; margin: 12px 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+.setup-steps li { display: flex; gap: 10px; align-items: baseline; }
+.setup-steps li.done .s-t { color: var(--muted); text-decoration: line-through; }
+.setup-steps .s-tick { color: var(--muted); font-weight: 700; width: 16px; flex-shrink: 0; }
+.setup-steps li.done .s-tick { color: var(--ok); }
+.setup-steps .s-t { font-weight: 600; font-size: 13px; }
+.setup-steps .s-h { color: var(--muted); font-size: 12px; margin-top: 2px; }
 .settings-pane .sp-body { display: flex; flex-direction: column; gap: 16px; }
 .settings-pane .u-row { display: grid; grid-template-columns: 1fr 1.2fr .7fr auto; gap: 8px; }
 .settings-pane .u-row input, .settings-pane .u-row select { margin-bottom: 0; min-width: 0; }

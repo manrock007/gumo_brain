@@ -276,6 +276,10 @@ class JobStore:
             row = c.execute("SELECT * FROM jobs WHERE issue_id = ?", (issue_id,)).fetchone()
             return dict(row) if row else None
 
+    def job_count(self) -> int:
+        with self._conn() as c:
+            return c.execute("SELECT COUNT(*) AS n FROM jobs").fetchone()["n"]
+
     def runs_today(self) -> int:
         """Claude invocations started since midnight (statuses past grading)."""
         midnight = time.time() - (time.time() % 86400)

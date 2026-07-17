@@ -82,8 +82,13 @@ function renderInbox() {
   items = items.filter(jobInActiveWs);
   if (filter === 'active') items = items.filter(j => LIVE.includes(j.status));
   if (filter === 'await') items = items.filter(j => j.status === 'awaiting_input');
+  // an unassigned member sees an empty instance by design (fail-closed
+  // membership) — say why, instead of a bare "nothing here"
+  const empty = (ME && ME.role === 'member' && WORKSPACES && !WORKSPACES.length)
+    ? 'no workspace access yet &mdash; ask your CtrlLoop admin to assign you to a workspace'
+    : 'nothing here';
   document.getElementById('inbox-list').innerHTML =
-    items.length ? items.map(row).join('') : '<div class="empty">nothing here</div>';
+    items.length ? items.map(row).join('') : `<div class="empty">${empty}</div>`;
 }
 
 let lastJobs = '';
@@ -970,6 +975,7 @@ async function loadMe() {
       document.getElementById('sp-users').style.display = '';
       document.getElementById('sp-workspaces').style.display = '';
       renderWorkspacesAdmin();
+      loadSetup();
     } else {
       // configuration is admin-only: hide the Project context editor for members
       const ctx = document.querySelector('details.ctx');
@@ -981,6 +987,42 @@ async function loadMe() {
         'Your password is temporary - set your own before doing anything else.';
     }
   } catch (e) { /* transient; refresh() handles persistent 401s */ }
+}
+
+// ---------- first-run setup wizard (§14, admins only) ----------
+// A checklist, not a form maze: every step auto-detects from live state and
+// points at the existing UI (or env) where the work actually happens.
+
+const SETUP_STEPS = [
+  ['business_context', 'Set your product name and business context',
+   'Open the Project context editor below and describe YOUR product — new runs use it immediately.'],
+  ['repos', 'Point a workspace at your repositories',
+   'Settings → Workspaces: replace the default repos with your own (slug, owner/repo, base branch, test command).'],
+  ['github_token', 'Provide a GitHub token',
+   'Set GITHUB_TOKEN in the deploy environment and restart — the engine clones and pushes with it.'],
+  ['memory', 'Bootstrap product memory',
+   'In the Project memory panel, Bootstrap reads a repo and opens its .gumo memory PR.'],
+  ['team', 'Invite your team',
+   'Settings → Users: add members with temporary passwords, then assign them to workspaces.'],
+];
+
+async function loadSetup() {
+  try {
+    const r = await fetch('api/setup');
+    if (!r.ok) return;
+    const data = await r.json();
+    const card = document.getElementById('setup-card');
+    if (!data.needed) { card.style.display = 'none'; return; }
+    card.style.display = '';
+    document.getElementById('setup-steps').innerHTML = SETUP_STEPS.map(([k, title, how]) =>
+      `<li class="${data.steps[k] ? 'done' : ''}"><span class="s-tick">${data.steps[k] ? '&#10003;' : '&#9675;'}</span>
+       <div><div class="s-t">${esc(title)}</div><div class="s-h">${esc(how)}</div></div></li>`).join('');
+  } catch (e) { /* advisory only */ }
+}
+
+async function dismissSetup() {
+  try { await fetch('api/setup/dismiss', { method: 'POST' }); } catch (e) {}
+  document.getElementById('setup-card').style.display = 'none';
 }
 
 async function signOut() {
@@ -1014,6 +1056,7 @@ function openAccount() {
 function closeSettings() {
   document.getElementById('settings-pane').style.display = 'none';
   document.getElementById('shell').style.display = '';
+  if (ME && ME.role === 'admin') loadSetup();  // refresh ticks after settings work
 }
 
 async function loadUsers() {
