@@ -228,16 +228,18 @@ async def put_context(body: ContextBody):
         "memory_canonical_project": body.canonical_project,
     }
     try:
-        applied = settings.apply_runtime_overrides(overrides)
+        staged = settings.stage_runtime_overrides(overrides)
     except (ValueError, TypeError) as e:
         raise HTTPException(status_code=400, detail=str(e))
     store: JobStore = app.state.store
-    # one transaction: a crash mid-save must not persist half an override set
-    # (a partial set can be self-inconsistent and would be rejected at startup)
+    # persist BEFORE touching live state, in one transaction: if the write
+    # fails, the request 500s with settings unchanged — live and persisted
+    # state never diverge (apply_staged cannot fail after validation)
     store.config_set_many({
         key: json.loads(value) if key == "repo_map" else value  # store one-layer JSON
-        for key, value in applied.items()
+        for key, value in staged.items()
     })
+    settings.apply_staged(staged)
     return _context_payload(warning=_live_unmapped_warning(store))
 
 

@@ -145,6 +145,24 @@ def test_context_requires_auth(client):
     assert client.delete("/api/context").status_code == 401
 
 
+def test_context_put_persist_failure_leaves_live_state(client, monkeypatch):
+    """Persist-before-apply: if the DB write fails, the request errors and the
+    LIVE settings are untouched — live and persisted state never diverge."""
+    import sqlite3
+
+    import pytest as _pytest
+
+    store = client.app.state.store
+
+    def boom(values):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(store, "config_set_many", boom)
+    with _pytest.raises(sqlite3.OperationalError):
+        client.put("/api/context", headers=AUTH, json={"product_name": "Acme"})
+    assert client.get("/api/context", headers=AUTH).json()["context"]["product_name"] == "Gumo"
+
+
 def test_dashboard_rebrands_from_context(client):
     """The rebrand hangs off an exact literal in DASHBOARD_HTML — pin it, and
     prove the rendered page follows the configured product name."""

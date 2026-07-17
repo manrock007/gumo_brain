@@ -219,11 +219,12 @@ class Settings(BaseSettings):
     def clickup_enabled(self) -> bool:
         return bool(self.clickup_token and self.clickup_list_id)
 
-    def apply_runtime_overrides(self, overrides: dict) -> dict:
-        """Layer project-context overrides over the current values. Called at
-        startup (DB-persisted overrides) and on every PUT /api/context. Atomic:
-        everything is validated first, so a ValueError leaves settings untouched.
-        Returns the normalized values that were applied (what to persist)."""
+    def stage_runtime_overrides(self, overrides: dict) -> dict:
+        """Validate + normalize project-context overrides WITHOUT applying them.
+        Raises ValueError on any problem; returns the normalized values. Callers
+        that must persist-before-apply (PUT /api/context) stage first, write the
+        DB, then apply_staged — so a failed write never leaves live state ahead
+        of the persisted state."""
         staged: dict = {}
         for key in RUNTIME_CONTEXT_KEYS:
             if overrides.get(key) is None:
@@ -246,8 +247,19 @@ class Settings(BaseSettings):
             raise ValueError(
                 f"canonical project '{canonical}' is not a project slug in the repo map"
             )
+        return staged
+
+    def apply_staged(self, staged: dict):
+        """Apply already-validated overrides to the live settings (cannot fail)."""
         for key, value in staged.items():
             setattr(self, key, value)
+
+    def apply_runtime_overrides(self, overrides: dict) -> dict:
+        """Validate and apply in one step — for callers with no persistence to
+        order against (startup, tests). Atomic: a ValueError leaves settings
+        untouched. Returns the normalized values that were applied."""
+        staged = self.stage_runtime_overrides(overrides)
+        self.apply_staged(staged)
         return staged
 
     def project_context(self) -> dict:
