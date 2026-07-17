@@ -121,6 +121,7 @@
   <div class="sp-head">
     <button class="d-back" onclick="closeSettings()">&larr;</button>
     <h2 id="sp-title">Settings</h2>
+    <span class="sp-msg" id="sp-msg"></span>
   </div>
   <div class="sp-body">
     <div class="panel" id="sp-users" style="display:none">
@@ -151,7 +152,7 @@
     </div>
     <div class="panel" id="sp-account">
       <h2>Account</h2>
-      <div class="hint" id="acct-hint">Changing your password signs you out everywhere.</div>
+      <div class="hint" id="acct-hint">Changing your password signs out your other sessions; this one stays signed in.</div>
       <form onsubmit="return changePassword(event)">
         <input id="pw-cur" type="password" placeholder="current password" required>
         <input id="pw-new" type="password" placeholder="new password (min 8)" required>

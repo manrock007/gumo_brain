@@ -38,6 +38,7 @@ from .memory import MemoryReader
 from .sentry_api import extract_issue_ref, verify_signature
 from .worker import GateConflict, Worker
 from .workspaces import WorkspaceError, WorkspaceNotFound, WorkspaceService
+from . import transcripts
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 log = logging.getLogger("brain")
@@ -200,14 +201,26 @@ async def me(user: dict = Depends(require_user)):
 
 
 @app.post("/api/me/password")
-async def change_password(body: PasswordBody, user: dict = Depends(require_user)):
+async def change_password(body: PasswordBody, response: Response,
+                          user: dict = Depends(require_user)):
     store: JobStore = app.state.store
     verify_login(store, settings, user["username"], body.current)  # re-authenticate
     if len(body.new) < 8:
         raise HTTPException(status_code=400, detail="new password must be at least 8 characters")
     store.user_set(user["username"], pw_hash=hash_password(body.new), must_change_pw=0)
-    store.auth_sessions_revoke_user(user["id"])  # sign out everywhere, incl. this session
-    return {"ok": True, "detail": "password changed — sign in again"}
+    # rotate, don't strand: revoke EVERY session (any stolen token dies), then
+    # re-issue for this browser so the person stays signed in. Dumping them to
+    # the login page mid first-sign-in made a successful temp-password change
+    # look like a failure — the flag was already cleared, but all they saw was
+    # a logout and, on any error, a message rendered into the hidden dashboard.
+    store.auth_sessions_revoke_user(user["id"])
+    token = issue_session(store, settings, user)
+    response.set_cookie(
+        SESSION_COOKIE, token, httponly=True, samesite="lax",
+        secure=settings.session_cookie_secure,
+        max_age=settings.auth_session_ttl_days * 86400, path="/",
+    )
+    return {"ok": True, "detail": "password changed — other sessions signed out"}
 
 
 @app.get("/api/users", dependencies=[Depends(require_admin)])
@@ -836,6 +849,9 @@ async def session_snapshot(job_id: str, user: dict = Depends(require_user)):
             "updated_at": job.get("updated_at"),
         },
         "runs": store.stage_runs_for(job_id) if feature else [],
+        # recorded run transcripts (§13): the index the Activity accordion is
+        # built from — bodies are fetched per run on expand
+        "transcripts": transcripts.list_for_job(settings, job_id),
         "guidance": store.guidance_for(job_id),
         "artifacts": artifacts,
         # every PR this packet opened, with lifecycle state (draft -> ready ->
@@ -854,6 +870,25 @@ async def session_snapshot(job_id: str, user: dict = Depends(require_user)):
         "steer_available": feature and job["status"] == "running",
         "steer_immediate": bool(settings.session_persistence),
     }
+
+
+@app.get("/api/jobs/{job_id}/transcripts")
+async def job_transcripts(job_id: str, user: dict = Depends(require_user)):
+    """The job's recorded run transcripts (docs/ENGINE.md §13): key + header +
+    size per run, oldest first — the index behind the Activity accordion."""
+    _job_scoped(job_id, user)
+    return {"transcripts": transcripts.list_for_job(settings, job_id)}
+
+
+@app.get("/api/jobs/{job_id}/transcripts/{key}")
+async def job_transcript(job_id: str, key: str, user: dict = Depends(require_user)):
+    """One run's replayable activity — the same status/delta events the live
+    session stream showed, read back from the write-through JSONL."""
+    _job_scoped(job_id, user)
+    events = transcripts.read_events(settings, job_id, key)
+    if events is None:
+        raise HTTPException(status_code=404, detail=f"no transcript '{key}'")
+    return {"key": key, "events": events}
 
 
 @app.get("/api/jobs/{job_id}/session/stream")

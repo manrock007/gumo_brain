@@ -240,7 +240,7 @@ function stageCards(data) {
       : `${s.n > 1 ? s.n + '&times; &middot; ' : ''}${fmtMMSS(s.dur)} &middot; $${s.cost.toFixed(2)}${s.status ? ' &middot; ' + esc(s.status) : ''}`;
     const inner = isLive
       ? `<div class="inner" id="live-slot"></div>`
-      : `<div class="inner">${a ? `<div class="art">${esc(a.content || '(empty)')}${a.truncated ? '… (truncated)' : ''}</div>` : '<div class="lead" style="margin-top:8px">no artifact for this stage</div>'}</div>`;
+      : `<div class="inner">${a ? `<div class="art">${esc(a.content || '(empty)')}${a.truncated ? '… (truncated)' : ''}</div>` : '<div class="lead" style="margin-top:8px">no artifact for this stage</div>'}${transcriptAccordions(data, stg)}</div>`;
     h += `<details class="stage${isLive ? ' live' : ''}" data-key="st-${stg}"${isLive ? ' open' : ''}>
       <summary><span class="sx">P${stg}</span><span class="snm">${esc(STAGE_NAMES[stg] || '')}</span>
       ${!isLive && s.status === 'done' ? '<span class="tick">&#10003;</span>' : ''}<span class="sm">${meta}</span></summary>
@@ -352,10 +352,13 @@ function renderDetail(data) {
     ? '<div class="daydiv">&mdash; pipeline &mdash;</div>' + stageCards(data)
     : '';
   // v1 items have no stage cards — the live run gets its own activity box
-  // (the feature live-slot lives inside the current stage card instead)
-  const activity = (!feature && data.live)
-    ? '<div class="daydiv">&mdash; live activity &mdash;</div>'
-      + '<div class="stage live"><div class="inner" id="live-slot" style="border-top:0"></div></div>'
+  // (the feature live-slot lives inside the current stage card instead), and
+  // past runs replay from their transcripts (§13)
+  const pastRuns = !feature ? transcriptAccordions(data, null) : '';
+  const activity = (!feature && (data.live || pastRuns))
+    ? '<div class="daydiv">&mdash; activity &mdash;</div>'
+      + (data.live ? '<div class="stage live"><div class="inner" id="live-slot" style="border-top:0"></div></div>' : '')
+      + (pastRuns ? `<div class="stage"><div class="inner" style="border-top:0">${pastRuns}</div></div>` : '')
     : '';
   const convo = data.chat_available
     ? '<div class="daydiv">&mdash; conversation &mdash;</div>'
@@ -363,6 +366,7 @@ function renderDetail(data) {
     : '';
   document.getElementById('d-thread').innerHTML = pipeline + activity + prSection(data) + convo + gatePacket(data);
   restoreThread(st);
+  wireTranscripts(j.issue_id);
 
   // re-seat the persistent live log + streaming chat bubble after the rebuild
   const slot = document.getElementById('live-slot');
@@ -440,6 +444,69 @@ function statsTable(data) {
 
 // (non-feature items render through renderDetail too — the session snapshot
 // serves all kinds; chat_available / steer_available flags shape the composer)
+
+// ---------- run transcripts (§13): replayable Activity accordions ----------
+// Every run records its status/delta events write-through on the server; these
+// accordions replay them after the live stream is gone — the fix for "the chat
+// only shows messages, not what the system actually did".
+
+function transcriptAccordions(data, stg) {
+  const list = (data.transcripts || []).filter(t => {
+    const h = t.header || {};
+    return stg == null ? h.kind !== 'stage' : Number(h.stage) === stg;
+  });
+  return list.map(t => {
+    const h = t.header || {};
+    const label = h.kind === 'stage'
+      ? 'activity &middot; attempt ' + esc(String(h.attempt || '?'))
+      : 'activity &middot; ' + (Number(h.phase) > 1 ? 'implementation run' : 'analysis run');
+    const when = t.mtime ? ' &middot; ' + esc(fmtAgo(t.mtime)) : '';
+    return `<details class="sub" data-key="tr-${esc(t.key)}" data-tr="${esc(t.key)}">
+      <summary>${label}${when}</summary><div class="tr-body"></div></details>`;
+  }).join('');
+}
+
+function wireTranscripts(jobId) {
+  for (const d of document.querySelectorAll('#d-thread details[data-tr]')) {
+    if (d.dataset.wired) continue;
+    d.dataset.wired = '1';
+    d.addEventListener('toggle', () => { if (d.open) loadTranscript(jobId, d); });
+    if (d.open) loadTranscript(jobId, d);  // reopened by restoreThread across rebuilds
+  }
+}
+
+async function loadTranscript(jobId, det) {
+  const body = det.querySelector('.tr-body');
+  if (!body || body.dataset.loaded) return;
+  body.dataset.loaded = '1';
+  body.innerHTML = '<div class="empty">loading&hellip;</div>';
+  try {
+    const r = await fetch('api/jobs/' + encodeURIComponent(jobId)
+      + '/transcripts/' + encodeURIComponent(det.dataset.tr));
+    const data = await r.json();
+    body.innerHTML = r.ok
+      ? (renderTranscript(data.events || []) || '<div class="empty">no recorded activity</div>')
+      : '<div class="empty">Error: ' + esc(data.detail || r.status) + '</div>';
+  } catch (e) {
+    body.dataset.loaded = '';  // transient — retry on the next toggle
+    body.innerHTML = '<div class="empty">Error: ' + esc(String(e)) + '</div>';
+  }
+}
+
+function renderTranscript(events) {
+  // consecutive deltas merge into one text block, mirroring the live log
+  let h = '', text = '';
+  const flush = () => { if (text.trim()) h += `<div class="ev text">${esc(text)}</div>`; text = ''; };
+  for (const ev of events) {
+    if (ev.e === 'delta') { text += ev.d || ''; continue; }
+    flush();
+    if (ev.e === 'status') h += `<div class="ev status">${esc(ev.d || '')}</div>`;
+    else if (ev.e === 'end') h += `<div class="ev done">run finished &middot; ${esc(ev.d || '')}</div>`;
+    else if (ev.e === 'truncated') h += `<div class="ev status">${esc(ev.d || '(truncated)')}</div>`;
+  }
+  flush();
+  return h;
+}
 
 // ---------- live stage stream (api/jobs/{id}/session/stream) ----------
 
@@ -923,6 +990,16 @@ async function signOut() {
 
 // ---------- settings pane (Phase 1: Users for admins + Account) ----------
 
+// messages must surface where the person actually is: #msg lives in the
+// dashboard toolbar, which is display:none while the settings pane is open —
+// writing errors there made a failed password change look like success
+function uiMsg(text) {
+  const sp = document.getElementById('settings-pane');
+  const el = (sp && sp.style.display !== 'none')
+    ? document.getElementById('sp-msg') : document.getElementById('msg');
+  if (el) el.textContent = text;
+}
+
 function openSettings() {
   document.getElementById('shell').style.display = 'none';
   document.getElementById('settings-pane').style.display = '';
@@ -961,15 +1038,14 @@ async function loadUsers() {
 }
 
 async function patchUser(username, body, okMsg) {
-  const msg = document.getElementById('msg');
   try {
     const r = await fetch('api/users/' + encodeURIComponent(username), {
       method: 'PATCH', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
     });
     const data = await r.json();
-    msg.textContent = r.ok ? okMsg : 'Error: ' + (data.detail || r.status);
+    uiMsg(r.ok ? okMsg : 'Error: ' + (data.detail || r.status));
     if (r.ok) loadUsers();
-  } catch (e) { msg.textContent = 'Error: ' + e; }
+  } catch (e) { uiMsg('Error: ' + e); }
 }
 
 function resetUserPw(username) {
@@ -986,7 +1062,7 @@ function setUserRole(username, role) {
 
 async function createUser(ev) {
   ev.preventDefault();
-  const msg = document.getElementById('msg'), btn = document.getElementById('nu-go');
+  const btn = document.getElementById('nu-go');
   btn.disabled = true;
   try {
     const r = await fetch('api/users', {
@@ -998,21 +1074,21 @@ async function createUser(ev) {
       }),
     });
     const data = await r.json();
-    msg.textContent = r.ok ? 'User created - share the temporary password with them.'
-                           : 'Error: ' + (data.detail || r.status);
+    uiMsg(r.ok ? 'User created - share the temporary password with them.'
+               : 'Error: ' + (data.detail || r.status));
     if (r.ok) {
       document.getElementById('nu-name').value = '';
       document.getElementById('nu-pass').value = '';
       loadUsers();
     }
-  } catch (e) { msg.textContent = 'Error: ' + e; }
+  } catch (e) { uiMsg('Error: ' + e); }
   btn.disabled = false;
   return false;
 }
 
 async function changePassword(ev) {
   ev.preventDefault();
-  const msg = document.getElementById('msg'), btn = document.getElementById('pw-go');
+  const btn = document.getElementById('pw-go');
   btn.disabled = true;
   try {
     const r = await fetch('api/me/password', {
@@ -1023,9 +1099,11 @@ async function changePassword(ev) {
       }),
     });
     const data = await r.json();
-    if (r.ok) { location.href = 'login'; return false; }
-    msg.textContent = 'Error: ' + (data.detail || r.status);
-  } catch (e) { msg.textContent = 'Error: ' + e; }
+    // the server rotates this session's cookie in the response — the person
+    // stays signed in and lands straight on the dashboard, temp flag cleared
+    if (r.ok) { location.href = '.'; return false; }
+    uiMsg('Error: ' + (data.detail || r.status));
+  } catch (e) { uiMsg('Error: ' + e); }
   btn.disabled = false;
   return false;
 }
@@ -1123,7 +1201,6 @@ function wsRepoRow(slug, e) {
 }
 
 async function saveWorkspace(id, btn) {
-  const msg = document.getElementById('msg');
   const card = document.querySelector(`.ws-card[data-ws="${id}"]`);
   const v = (cls) => card.querySelector('.' + cls).value.trim();
   const repos = [];
@@ -1133,7 +1210,7 @@ async function saveWorkspace(id, btn) {
     repos.push({ slug: rv('wr-slug'), repo: rv('wr-repo'), base: rv('wr-base') || 'main',
                  setup_cmd: rv('wr-setup') || null, test_cmd: rv('wr-test') || null });
   }
-  btn.disabled = true; msg.textContent = 'Saving workspace…';
+  btn.disabled = true; uiMsg('Saving workspace…');
   try {
     const r = await fetch('api/workspaces/' + id, {
       method: 'PATCH', headers: {'Content-Type': 'application/json'},
@@ -1146,16 +1223,15 @@ async function saveWorkspace(id, btn) {
     });
     const data = await r.json();
     if (r.ok) {
-      msg.textContent = 'Workspace saved.' + (data.warning ? ' ' + data.warning : '');
+      uiMsg('Workspace saved.' + (data.warning ? ' ' + data.warning : ''));
       await loadWorkspaces(); loadProjects(); refreshMemory(true);
-    } else msg.textContent = 'Error: ' + (data.detail || r.status);
-  } catch (e) { msg.textContent = 'Error: ' + e; }
+    } else uiMsg('Error: ' + (data.detail || r.status));
+  } catch (e) { uiMsg('Error: ' + e); }
   btn.disabled = false;
 }
 
 async function createWorkspace(ev) {
   ev.preventDefault();
-  const msg = document.getElementById('msg');
   try {
     const r = await fetch('api/workspaces', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -1163,9 +1239,9 @@ async function createWorkspace(ev) {
                              name: document.getElementById('nw-name').value.trim() }),
     });
     const data = await r.json();
-    msg.textContent = r.ok ? 'Workspace created — add repos below.' : 'Error: ' + (data.detail || r.status);
+    uiMsg(r.ok ? 'Workspace created — add repos below.' : 'Error: ' + (data.detail || r.status));
     if (r.ok) { document.getElementById('nw-slug').value = ''; document.getElementById('nw-name').value = ''; loadWorkspaces(); }
-  } catch (e) { msg.textContent = 'Error: ' + e; }
+  } catch (e) { uiMsg('Error: ' + e); }
   return false;
 }
 

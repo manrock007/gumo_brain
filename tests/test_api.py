@@ -383,13 +383,23 @@ def test_lockout_after_repeated_failures(client):
     assert r.status_code == 429  # locked even with the right password
 
 
-def test_change_password_revokes_sessions(client):
+def test_change_password_rotates_session(client):
+    """A self password change revokes every OTHER session and the old token,
+    but the caller stays signed in on a freshly rotated cookie — being dumped
+    to the login page made a successful temp-password change look broken."""
     client.post("/api/users", headers=AUTH,
                 json={"username": "dev3", "password": "devpass123"})
     login = client.post("/api/login", json={"username": "dev3", "password": "devpass123"})
     assert login.status_code == 200
+    old_token = client.cookies.get("ctrlloop_session")
     r = client.post("/api/me/password", json={"current": "devpass123", "new": "newpass456"})
     assert r.status_code == 200
-    assert client.get("/api/me").status_code == 401  # old session revoked
+    new_token = client.cookies.get("ctrlloop_session")
+    assert new_token and new_token != old_token  # rotated, not reused
+    me = client.get("/api/me")  # the fresh cookie keeps this browser signed in
+    assert me.status_code == 200 and me.json()["must_change_pw"] is False
+    # the pre-change token (any other device/session) is dead
+    client.cookies.set("ctrlloop_session", old_token)
+    assert client.get("/api/me").status_code == 401
     fresh = {"Authorization": "Basic " + base64.b64encode(b"dev3:newpass456").decode()}
     assert client.get("/api/me", headers=fresh).json()["must_change_pw"] is False
