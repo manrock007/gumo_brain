@@ -609,6 +609,10 @@ class Engine:
             f"{evidence}{warnings}\n\n---\n{actions}"
         )
         await self._comment(job, gate_body, raw=True)
+        if self.workspaces:
+            await self.workspaces.notify_gate(
+                job, f"\u23f8\ufe0f {job.get('title') or job['issue_id']} — parked at the "
+                     f"P{stage} {stage_name(stage)} gate, waiting for a decision.")
         owner = (job.get("owner") or "").strip()
         if owner:
             await self.clickup.set_assignee(job.get("clickup_task_id") or "", owner)

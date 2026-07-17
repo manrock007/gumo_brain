@@ -137,6 +137,32 @@ class WorkspaceService:
         ws = self.for_project(project_slug)
         return (ws or {}).get("canonical_project") or self.settings.memory_canonical_project
 
+    # ---------- integrations (§12: ClickUp optional, Slack nudges) ----------
+
+    def clickup_route(self, project_slug: str) -> tuple[bool, str | None]:
+        """(enabled, list_id) for tickets on this project's workspace. Falls
+        back to instance settings for unmapped slugs (legacy behavior)."""
+        ws = self.for_project(project_slug)
+        if ws is None:
+            return bool(self.settings.clickup_token and self.settings.clickup_list_id), None
+        return bool(self.settings.clickup_token and ws["clickup_enabled"]), \
+            (ws["clickup_list_id"] or None)
+
+    async def notify_gate(self, job: dict, text: str):
+        """Best-effort Slack nudge at gate park — the dashboard-only nudge
+        channel for workspaces without ClickUp (and extra signal with it)."""
+        ws = self.for_job(job)
+        url = (ws or {}).get("slack_webhook_url") or ""
+        if not url:
+            return
+        link = f"{self.settings.public_base_url}/#/job/{job.get('issue_id')}"
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=10) as client:
+                await client.post(url, json={"text": f"{text}\n{link}"})
+        except Exception:  # visibility only — never let a nudge break a gate
+            log.warning("slack gate nudge failed for %s (non-fatal)", job.get("issue_id"))
+
     # ---------- validated writes ----------
 
     def create(self, slug: str, name: str, **fields) -> dict:

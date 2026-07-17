@@ -15,6 +15,7 @@
     <span class="brand-sub">the Gumo Engine</span>
   </div>
   <div class="topbar-meta">
+    <select class="ws-switch" id="ws-switch" onchange="setWorkspace(this.value)" title="Workspace"></select>
     <span class="live-ind"><span class="live-dot"></span>live</span>
     <span class="me-chip" id="me-chip">&hellip;</span>
     <button class="tb-btn" id="nav-settings" style="display:none" onclick="openSettings()">Settings</button>
@@ -132,6 +133,19 @@
           <input id="nu-pass" placeholder="temporary password (min 8)" required>
           <select id="nu-role"><option value="member" selected>member</option><option value="admin">admin</option></select>
           <button id="nu-go">Add user</button>
+        </div>
+      </form>
+    </div>
+    <div class="panel" id="sp-workspaces" style="display:none">
+      <h2>Workspaces</h2>
+      <div class="hint">A workspace is one product surface (App, Dashboard, &hellip;) with its own repos, canonical memory repo, context, ClickUp list and Slack nudges. Project slugs are unique across all workspaces.</div>
+      <div id="ws-admin-list"><div class="empty">loading&hellip;</div></div>
+      <form onsubmit="return createWorkspace(event)">
+        <div class="u-row">
+          <input id="nw-slug" placeholder="slug (a-z 0-9 -)" required>
+          <input id="nw-name" placeholder="display name" required>
+          <span></span>
+          <button id="nw-go">Add workspace</button>
         </div>
       </form>
     </div>

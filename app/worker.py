@@ -331,10 +331,15 @@ class Worker:
         row = self.store.get(issue_id)
         task_id = row.get("clickup_task_id")
         if not task_id:
-            created = await self.clickup.create_task(
-                name=f"[{project_slug}] {issue.get('title', 'unknown')}",
-                description=self._ticket_description(issue, row),
-            )
+            cu_on, cu_list = (self.workspaces.clickup_route(project_slug)
+                              if self.workspaces else (True, None))
+            created = None
+            if cu_on:
+                created = await self.clickup.create_task(
+                    name=f"[{project_slug}] {issue.get('title', 'unknown')}",
+                    description=self._ticket_description(issue, row),
+                    list_id=cu_list,
+                )
             if created:
                 task_id, task_url = created
                 self.store.set_fields(issue_id, clickup_task_id=task_id, clickup_task_url=task_url)
@@ -546,6 +551,11 @@ class Worker:
             f"to drop this — or answer directly on the {ENGINE_NAME} dashboard.",
         )
         await self.clickup.set_status(task_id, "awaiting_input")
+        job = self.store.get(job_id)
+        if self.workspaces and job:
+            await self.workspaces.notify_gate(
+                job, f"\u23f8\ufe0f {job.get('title') or job_id} — waiting for your decision "
+                     "before any code changes.")
 
     def request_steer(self, job_id: str, note: str, via: str = "dashboard") -> str:
         """Live mid-run course-correction from the session page. Delegates to the

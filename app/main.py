@@ -394,10 +394,14 @@ async def trigger(body: TriggerBody, user: dict = Depends(require_user)):
     row = app.state.store.get(issue_id)
     task_url = row.get("clickup_task_url") if row else None
     if row and not row.get("clickup_task_id"):
-        created = await worker.clickup.create_task(
-            name=f"[{project}] {title}",
-            description=worker._ticket_description(issue, row),
-        )
+        cu_on, cu_list = _ws_svc().clickup_route(project)
+        created = None
+        if cu_on:
+            created = await worker.clickup.create_task(
+                name=f"[{project}] {title}",
+                description=worker._ticket_description(issue, row),
+                list_id=cu_list,
+            )
         if created:
             task_id, task_url = created
             app.state.store.set_fields(issue_id, clickup_task_id=task_id, clickup_task_url=task_url)
@@ -560,7 +564,9 @@ async def _prepare_ticket(worker: Worker, body: SubmitBody, prefix: str,
     if not title:
         raise HTTPException(status_code=400, detail="provide a ClickUp URL, or a title")
     request_text = summary or title
-    created = await worker.clickup.create_task(
+    cu_on, cu_list = _ws_svc().clickup_route(project)
+    created = None if not cu_on else await worker.clickup.create_task(
+        list_id=cu_list,
         name=f"[{project}] {title}",
         description=(
             f"{intro}\n**Project:** {project}\n\n{request_text}\n\n"
@@ -571,7 +577,7 @@ async def _prepare_ticket(worker: Worker, body: SubmitBody, prefix: str,
     if created:
         task_id, task_url = created
         job_id = f"{prefix}-{task_id}"
-        list_id = settings.clickup_list_id
+        list_id = cu_list or settings.clickup_list_id
     else:  # ClickUp outage degrades tracking, never fixing
         task_id, task_url, list_id = None, None, ""
         job_id = f"{prefix}-{uuid.uuid4().hex[:10]}"
