@@ -9,7 +9,7 @@
 
 <body>
 <header class="topbar">
-  <div class="brand">
+  <div class="brand" onclick="goHome()" title="Dashboard">
     <span class="logo">cl</span>
     <span class="brand-name">CtrlLoop</span>
     <span class="brand-sub">the Gumo Engine</span>
@@ -127,6 +127,7 @@
 </div>
 
 <div class="settings-pane" id="settings-pane" style="display:none">
+  <div class="sp-inner">
   <div class="sp-head">
     <button class="d-back" onclick="closeSettings()">&larr;</button>
     <h2 id="sp-title">Settings</h2>
@@ -168,6 +169,7 @@
         <button id="pw-go">Change password</button>
       </form>
     </div>
+  </div>
   </div>
 </div>
 

@@ -1055,7 +1055,23 @@ function openSettings() {
 function openAccount() {
   openSettings();
   document.getElementById('sp-title').textContent = 'Settings';
-  document.getElementById('pw-cur').focus();
+  // the Account panel sits below Users/Workspaces for admins — bring the
+  // password form into view, or a forced first sign-in can't find it. The
+  // panels above populate async and shift the layout, so anchor again after
+  // they settle.
+  const showForm = () => {
+    document.getElementById('sp-account').scrollIntoView({ block: 'start' });
+    document.getElementById('pw-cur').focus();
+  };
+  showForm();
+  setTimeout(showForm, 500);
+}
+
+function goHome() {
+  // the brand is the universal way back: dismiss settings, close any open
+  // item, land on the plain dashboard
+  closeSettings();
+  if (typeof closeItem === 'function') closeItem();
 }
 function closeSettings() {
   document.getElementById('settings-pane').style.display = 'none';
@@ -1073,9 +1089,13 @@ async function loadUsers() {
       const flags = [u.disabled ? 'disabled' : '', u.must_change_pw ? 'temp pw' : '']
         .filter(Boolean).join(' · ');
       const self = ME && u.username === ME.username;
+      // no self-reset: the admin reset ARMS the temp-pw flag (it hands out a
+      // new temporary credential) — resetting yourself just loops the forced
+      // change forever. Your own password changes live in Account below.
       return `<tr><td>${name}</td><td>${esc(u.role)}</td><td>${esc(flags)}</td><td>
-        <button onclick="resetUserPw('${esc(u.username)}')">Reset password</button>
-        ${self ? '' : `<button onclick="toggleUser('${esc(u.username)}', ${u.disabled ? 'false' : 'true'})">${u.disabled ? 'Enable' : 'Disable'}</button>
+        ${self ? '<span class="hint" style="margin:0">you &mdash; change your password in Account below</span>'
+               : `<button onclick="resetUserPw('${esc(u.username)}')">Reset password</button>
+        <button onclick="toggleUser('${esc(u.username)}', ${u.disabled ? 'false' : 'true'})">${u.disabled ? 'Enable' : 'Disable'}</button>
         <button onclick="setUserRole('${esc(u.username)}', '${u.role === 'admin' ? 'member' : 'admin'}')">Make ${u.role === 'admin' ? 'member' : 'admin'}</button>`}
       </td></tr>`;
     }).join('');
