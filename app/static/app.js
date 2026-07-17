@@ -954,7 +954,8 @@ async function submitFeature(ev) {
 // ---------- keyboard + init ----------
 
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && document.activeElement
+  // Enter sends (chat convention); Shift+Enter makes a newline
+  if (e.key === 'Enter' && !e.shiftKey && document.activeElement
       && document.activeElement.id === 'c-in') { e.preventDefault(); sendComposer(); }
   else if (e.key === 'Escape' && sel
       && (!document.activeElement || document.activeElement.id !== 'c-in')) closeItem();
@@ -1196,13 +1197,17 @@ async function loadWorkspaces() {
     if (!WORKSPACES.length) return;
     // 0 = "All workspaces" (also where unowned/legacy jobs surface); a
     // specific selection filters STRICTLY (sentry finding 1595858)
-    const valid = activeWs === 0 || WORKSPACES.some((w) => w.id === activeWs);
+    const valid = (activeWs === 0 && WORKSPACES.length > 1)
+      || WORKSPACES.some((w) => w.id === activeWs);
     if (activeWs == null || !valid) activeWs = WORKSPACES.length > 1 ? 0 : WORKSPACES[0].id;
+    // the switcher is also the "which workspace am I in" indicator, so it
+    // stays visible with a single workspace; "All" only exists with several
     const sw = document.getElementById('ws-switch');
-    sw.innerHTML = '<option value="0"' + (activeWs === 0 ? ' selected' : '') + '>All workspaces</option>' +
+    sw.innerHTML = (WORKSPACES.length > 1
+        ? '<option value="0"' + (activeWs === 0 ? ' selected' : '') + '>All workspaces</option>' : '') +
       WORKSPACES.map((w) =>
         `<option value="${w.id}" ${w.id === activeWs ? 'selected' : ''}>${esc(w.name)}</option>`).join('');
-    sw.style.display = WORKSPACES.length > 1 ? '' : 'none';
+    sw.style.display = '';
     scopeProjectPickers();
     if (ME && ME.role === 'admin') renderWorkspacesAdmin();
   } catch (e) {}
