@@ -128,7 +128,13 @@
 
 <div class="settings-pane" id="settings-pane" style="display:none">
   <div class="sp-inner">
-  <div class="sp-head">
+  <div class="pw-banner" id="pw-banner" style="display:none">
+    <strong>Set your own password to continue.</strong>
+    You signed in with a temporary password&mdash;an admin gave it out, so it
+    shouldn't stay yours. Enter it below as the current password, choose a new
+    one, and you'll be taken to the dashboard.
+  </div>
+  <div class="sp-head" id="sp-head">
     <button class="d-back" onclick="closeSettings()">&larr;</button>
     <h2 id="sp-title">Settings</h2>
     <span class="sp-msg" id="sp-msg"></span>

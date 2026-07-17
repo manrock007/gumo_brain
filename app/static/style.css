@@ -269,6 +269,17 @@
    so without this the Account form below Users/Workspaces is unreachable */
 .settings-pane { flex: 1; overflow-y: auto; padding: 0 20px; }
 .settings-pane .sp-inner { max-width: 760px; margin: 26px auto; }
+
+/* forced first sign-in: a temporary password blocks everything else — say it
+   loudly and show ONLY the password form */
+.pw-banner { border: 1px solid var(--accent); border-left-width: 4px; border-radius: var(--r);
+  background: color-mix(in srgb, var(--accent) 8%, var(--surface)); padding: 13px 16px;
+  margin-bottom: 18px; line-height: 1.55; }
+.pw-banner strong { display: block; margin-bottom: 3px; }
+body.forced-pw .settings-pane .panel:not(#sp-account) { display: none; }
+body.forced-pw .settings-pane .d-back { display: none; }
+/* the setup checklist lives outside the pane and is shown via inline style */
+body.forced-pw #setup-card { display: none !important; }
 .settings-pane .sp-head { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
 .settings-pane .sp-head h2 { margin: 0; font-size: 17px; }
 .settings-pane .sp-msg { margin-left: auto; color: var(--fg-2); font-size: 12.5px; }
