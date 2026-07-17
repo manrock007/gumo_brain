@@ -17,7 +17,7 @@ from pathlib import Path
 from .artifacts import ArtifactSync, artifact_path, feature_dir, list_artifacts, normalize
 from .chatstream import ChatBroker
 from .clickup import ClickUp
-from .config import Settings
+from .config import ENGINE_COMMENT_PREFIXES, GATE_PREFIX, Settings  # noqa: F401 — re-exported for worker
 from .db import JobStore
 from . import fastlane
 from .feature_prompts import (
@@ -49,7 +49,6 @@ from .prompts import _test_block, build_v1_chat_prompt, build_v1_fastlane_system
 
 log = logging.getLogger("brain.engine")
 
-GATE_PREFIX = "**[gumo_brain]**"
 DOC_STAGE_TOOLS = ["Read", "Grep", "Glob"]
 # chat runs are read-only by DENY, not just allow: --allowedTools is additive to any
 # settings-file grants living in the (persistent) workspace, so write tools must be
@@ -147,7 +146,7 @@ class Engine:
         # stage runs; an HTTP steer request sets the event to interrupt in place.
         self._steer: dict[str, dict] = {}
 
-    def request_steer(self, job_id: str, note: str) -> str:
+    def request_steer(self, job_id: str, note: str, via: str = "dashboard") -> str:
         """Human course-correction from the live session page. Returns the outcome:
         'interrupting' — a stage is running and session persistence is on, so the
         run is interrupted and will resume the same session with `note` folded in;
@@ -164,7 +163,7 @@ class Engine:
             return "interrupting"
         # fallback: record as guidance so the next run/gate sees it
         stage = handle["stage"] if handle else int(self.store.get(job_id).get("stage") or 0)
-        self.store.guidance_add(job_id, stage, "steer", note, "dashboard")
+        self.store.guidance_add(job_id, stage, "steer", note, via)
         log.info("job %s: steer queued to next checkpoint (P%s)", job_id, stage)
         return "queued"
 

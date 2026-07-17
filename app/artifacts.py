@@ -17,6 +17,7 @@ import re
 from pathlib import Path
 
 from .clickup import ClickUp
+from .config import GATE_PREFIX
 from .db import JobStore
 from .fixer import git
 
@@ -234,7 +235,7 @@ class ArtifactSync:
                 self.store.set_fields(job_id, mirror_ok=0)
                 await self.clickup.comment(
                     job.get("clickup_task_id") or "",
-                    "**[gumo_brain]** Artifact mirroring to subtasks is unavailable for this "
+                    f"{GATE_PREFIX} Artifact mirroring to subtasks is unavailable for this "
                     "ticket — read artifacts in git and answer gates on the dashboard or here.",
                 )
             return
@@ -255,7 +256,7 @@ class ArtifactSync:
         await self._create_mirror(job, artifact, content)
         await self.clickup.comment(
             job.get("clickup_task_id") or "",
-            f"**[gumo_brain]** The `{artifact}` subtask disappeared; I recreated it from git "
+            f"{GATE_PREFIX} The `{artifact}` subtask disappeared; I recreated it from git "
             "(the source of truth). Any edits made to the old subtask were not received.",
         )
 

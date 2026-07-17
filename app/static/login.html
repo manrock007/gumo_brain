@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in — CtrlLoop</title>
+<link rel="stylesheet" href="static/style.css">
+<style>
+  .login-wrap { min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+  .login-card { width: 320px; background: var(--surface); border: 1px solid var(--line);
+    border-radius: var(--r-lg); box-shadow: var(--shadow); padding: 26px 26px 22px; }
+  .login-brand { display: flex; align-items: center; gap: 10px; margin-bottom: 4px; }
+  .login-sub { color: var(--muted); font-size: 12.5px; margin: 0 0 18px; }
+  .login-card input { width: 100%; box-sizing: border-box; padding: 10px 12px; margin-bottom: 10px;
+    border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--surface-2);
+    color: var(--fg); font: inherit; font-size: 14px; }
+  .login-card input:focus { outline: 0; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-weak); }
+  .login-card button { width: 100%; padding: 10px 0; border: 0; border-radius: var(--r-sm);
+    background: linear-gradient(135deg, var(--accent), var(--accent-2)); color: #fff;
+    font: inherit; font-size: 14px; font-weight: 650; cursor: pointer; }
+  .login-card button:disabled { opacity: .5; }
+  .login-err { color: var(--err); font-size: 12.5px; min-height: 18px; margin: 8px 0 0; }
+  .login-hint { color: var(--muted); font-size: 11.5px; margin-top: 14px; }
+</style>
+</head>
+<body>
+<div class="login-wrap">
+  <div class="login-card">
+    <div class="login-brand">
+      <span class="logo">cl</span>
+      <span class="brand-name" style="font-size:16px">CtrlLoop</span>
+    </div>
+    <p class="login-sub">the Gumo Engine</p>
+    <form onsubmit="return doLogin(event)">
+      <input id="l-user" placeholder="username" autocomplete="username" required autofocus>
+      <input id="l-pass" type="password" placeholder="password" autocomplete="current-password" required>
+      <button id="l-go">Sign in</button>
+      <div class="login-err" id="l-err"></div>
+    </form>
+    <div class="login-hint">Locked out or need an account? Ask your CtrlLoop admin.</div>
+  </div>
+</div>
+<script>
+async function doLogin(ev) {
+  ev.preventDefault();
+  const btn = document.getElementById('l-go'), err = document.getElementById('l-err');
+  btn.disabled = true; err.textContent = '';
+  try {
+    const r = await fetch('api/login', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        username: document.getElementById('l-user').value.trim(),
+        password: document.getElementById('l-pass').value,
+      }),
+    });
+    if (r.ok) { location.href = '.'; return false; }
+    const data = await r.json().catch(() => ({}));
+    err.textContent = data.detail || ('sign-in failed (' + r.status + ')');
+  } catch (e) { err.textContent = 'network error — try again'; }
+  btn.disabled = false;
+  return false;
+}
+</script>
+</body>
+</html>

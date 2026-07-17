@@ -19,9 +19,9 @@ import time
 from pathlib import Path
 
 from .clickup import ClickUp
-from .config import Settings
+from .config import ENGINE_NAME, Settings
 from .db import JobStore
-from .engine import GATE_PREFIX, Engine, RepoLocks
+from .engine import ENGINE_COMMENT_PREFIXES, GATE_PREFIX, Engine, RepoLocks
 from .fixer import (
     BASE_ALLOWED_TOOLS,
     TRANSIENT_ERROR_RE,
@@ -391,14 +391,14 @@ class Worker:
             await self.clickup.comment(task_id or "", f"Draft PR opened: {result.pr_url}")
             await self.sentry.post_comment(
                 issue_id,
-                f"gumo_brain opened a draft PR for this issue: {result.pr_url}"
+                f"{ENGINE_NAME} opened a draft PR for this issue: {result.pr_url}"
                 + (f" (tracking: {row.get('clickup_task_url')})" if row.get("clickup_task_url") else ""),
             )
         elif result.status == "no_fix":
             analysis = result.detail.split("NO_FIX:", 1)[-1].strip()[:1500]
             await self.clickup.comment(task_id or "", f"No PR opened.\n\n{analysis}")
             await self.sentry.post_comment(
-                issue_id, f"gumo_brain investigated but did not open a PR:\n\n{analysis}"
+                issue_id, f"{ENGINE_NAME} investigated but did not open a PR:\n\n{analysis}"
             )
         else:  # error / timeout
             await self.clickup.comment(
@@ -525,11 +525,11 @@ class Worker:
             "**Human input needed before I change anything.**\n\n"
             f"{analysis}\n\n---\n"
             "Reply here with `/proceed <your decision/guidance>` to continue, or `/skip` "
-            "to drop this — or answer directly on the gumo_brain dashboard.",
+            f"to drop this — or answer directly on the {ENGINE_NAME} dashboard.",
         )
         await self.clickup.set_status(task_id, "awaiting_input")
 
-    def request_steer(self, job_id: str, note: str) -> str:
+    def request_steer(self, job_id: str, note: str, via: str = "dashboard") -> str:
         """Live mid-run course-correction from the session page. Delegates to the
         engine, which interrupts the running stage when it can (session persistence
         on) or records the note as guidance for the next checkpoint otherwise.
@@ -539,7 +539,7 @@ class Worker:
             raise KeyError(job_id)
         if (job.get("kind") or "sentry") != "feature":
             raise ValueError("steering is only valid for feature pipelines")
-        return self.engine.request_steer(job_id, note)
+        return self.engine.request_steer(job_id, note, via=via)
 
     async def answer_job(self, job_id: str, action: str, text: str, via: str) -> str:
         """Single resolution path for gate answers from BOTH channels.
@@ -561,12 +561,16 @@ class Worker:
             raise ValueError(f"job is '{job['status']}', not awaiting_input")
         task_id = job.get("clickup_task_id") or ""
 
+        # via is the channel, optionally with the acting user: "dashboard:manish"
+        from_dashboard = via.startswith("dashboard")
+
         if action == "skip":
             if not self.store.cas_status(job_id, ["awaiting_input"], "skipped",
                                          question="", detail=f"skipped by human via {via}"):
                 raise GateConflict("already answered")
-            if via == "dashboard":
-                await self.clickup.comment(task_id, f"{GATE_PREFIX} Decision (via dashboard): skip"
+            self.store.guidance_add(job_id, None, "skip", text, via)
+            if from_dashboard:
+                await self.clickup.comment(task_id, f"{GATE_PREFIX} Decision (via {via}): skip"
                                                     + (f" — {text}" if text else ""))
             await self.clickup.set_status(task_id, "skipped")
             return "skipped"
@@ -575,8 +579,9 @@ class Worker:
         if not self.store.cas_status(job_id, ["awaiting_input"], "queued",
                                      guidance=guidance, phase=2, question=""):
             raise GateConflict("already answered")
-        if via == "dashboard":
-            await self.clickup.comment(task_id, f"{GATE_PREFIX} Decision (via dashboard): proceed — {guidance}")
+        self.store.guidance_add(job_id, None, "proceed", guidance, via)
+        if from_dashboard:
+            await self.clickup.comment(task_id, f"{GATE_PREFIX} Decision (via {via}): proceed — {guidance}")
         else:
             await self.clickup.comment(task_id, "Got it — proceeding with the fix now.")
         self._enqueue(job_id, PRIO_HUMAN)
@@ -752,7 +757,7 @@ class Worker:
             f"**Source:** {row.get('source', 'webhook')} | "
             f"**Grade:** {row.get('grade_reasons') or 'n/a'}\n\n"
             f"{issue.get('culprit', '')}\n\n"
-            "_Automated fix attempt by gumo_brain. Claude posts progress below. "
+            f"_Automated fix attempt by {ENGINE_NAME}. Claude posts progress below. "
             "If it asks for input, reply `/proceed <guidance>` or `/skip`._"
         )
 
@@ -828,7 +833,7 @@ class Worker:
                     break
             if action is None:
                 # engine-authored comments (gate posts, chat mirrors) are inert
-                if text.startswith(GATE_PREFIX):
+                if text.startswith(ENGINE_COMMENT_PREFIXES):
                     if use_marker:
                         self.store.set_fields(job["issue_id"], comment_marker=c["id"])
                     continue
@@ -1235,7 +1240,7 @@ class Worker:
         job = self.store.get(pr["job_id"])
         if job:
             await self.clickup.comment(job.get("clickup_task_id") or "",
-                                       f"**[gumo_brain]** 🐑 {message}")
+                                       f"{GATE_PREFIX} 🐑 {message}")
 
     async def reap_forever(self):
         """A 'running' row older than any plausible live run means the process

@@ -1,4 +1,4 @@
-# gumo_brain — the Gumo Engine
+# CtrlLoop (formerly gumo_brain — the Gumo Engine)
 
 Self-hosted **software-development engine**: Sentry errors, manual requests, and full
 **feature pipelines** in; **draft PRs** out — with humans approving every consequential
@@ -69,7 +69,11 @@ Also runs a periodic **sweep** that grades the top unresolved Sentry issues of t
 
 ## Endpoints
 
-All `api/*` and `/` behind basic auth (user `gumo`); `/health` and the webhook are open.
+All `api/*` and `/` require a signed-in user (cookie session via `/login`, or
+per-user HTTP Basic for automation — docs/ENGINE.md §11); `/health`, `/login`,
+static assets and the webhook are open. Roles: admin (configuration + users)
+and member (submits work, answers gates). See MIGRATION-CTRLLOOP.md for the
+rename/infra checklist.
 
 - `GET /` — dashboard: intake (Sentry fix / request / **feature pipeline**), queue
   columns with inline gate answering (Proceed / Redo / Skip), feature **stage strips**
