@@ -121,17 +121,16 @@ def _basic_credentials(request: Request) -> tuple[str, str] | None:
 def current_user(request: Request) -> dict | None:
     """Resolve the acting user. An explicit Authorization header is a
     deliberate credential and takes precedence over ambient cookies — and if
-    it is wrong, we fail rather than silently falling back to the cookie
-    (otherwise a script with bad credentials acts as whoever's browser
-    session is lying around). None when unauthenticated."""
+    it is wrong, the request FAILS (verify_login's 401/429 propagates).
+    Swallowing that error and falling back to the cookie would let a script
+    with bad or revoked credentials silently act as whatever browser session
+    shares the cookie jar, and would mask a lockout (429) as a generic 401.
+    Returns None only when no credential was presented at all."""
     store: JobStore = request.app.state.store
     settings: Settings = request.app.state.settings
     creds = _basic_credentials(request)
     if creds:
-        try:
-            return verify_login(store, settings, creds[0], creds[1])
-        except HTTPException:
-            return None
+        return verify_login(store, settings, creds[0], creds[1])  # raises on failure
     token = request.cookies.get(SESSION_COOKIE)
     if token:
         return store.auth_session_user(_token_hash(token))

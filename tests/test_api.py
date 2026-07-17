@@ -279,6 +279,23 @@ def test_login_flow_and_roles(client):
     client.post("/api/logout")
 
 
+def test_bad_basic_never_falls_back_to_cookie(client):
+    """An explicit Authorization header that fails must fail the request —
+    not silently downgrade to whatever session cookie is in the jar — and a
+    lockout surfaces as 429, not a generic 401 (sentry finding 1595191)."""
+    assert client.post("/api/login",
+                       json={"username": "gumo", "password": "test"}).status_code == 200
+    assert client.get("/api/me").status_code == 200  # cookie works
+    bad = {"Authorization": "Basic " + base64.b64encode(b"gumo:wrong").decode()}
+    assert client.get("/api/me", headers=bad).status_code == 401  # no cookie fallback
+    assert client.get("/api/me").status_code == 200  # cookie untouched without the header
+    # drive the account into lockout via bad Basic, then the SAME bad header
+    # yields 429 (locked) rather than 401 — the status is not masked
+    for _ in range(4):
+        client.get("/api/me", headers=bad)
+    assert client.get("/api/me", headers=bad).status_code == 429
+
+
 def test_lockout_after_repeated_failures(client):
     client.post("/api/users", headers=AUTH,
                 json={"username": "dev2", "password": "devpass123"})
