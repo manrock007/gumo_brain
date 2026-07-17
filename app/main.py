@@ -3,20 +3,34 @@ import html
 import json
 import logging
 import re
-import secrets
 import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+    StreamingResponse,
+)
 from pydantic import BaseModel
 
+from .auth import (
+    SESSION_COOKIE,
+    bootstrap_admin,
+    current_user,
+    hash_password,
+    issue_session,
+    require_admin,
+    require_user,
+    revoke_session,
+    verify_login,
+)
 from .chatstream import ChatBroker
-from .config import RUNTIME_CONTEXT_KEYS, Settings, get_settings
-from .dashboard import DASHBOARD_HTML
+from .config import ENGINE_NAME, RUNTIME_CONTEXT_KEYS, Settings, get_settings
 from .db import JobStore
 from .feature_prompts import stage_name
 from .fixer import ensure_session_store
@@ -28,25 +42,13 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname
 log = logging.getLogger("brain")
 
 settings = get_settings()
-basic = HTTPBasic()
 
 ISSUE_URL_RE = re.compile(r"/issues/(\d+)")
 SHORT_ID_RE = re.compile(r"^[A-Z][A-Z0-9_-]*-[A-Z0-9]+$")
 # https://app.clickup.com/t/86abcd123 or /t/<team_id>/CUSTOM-123, or a bare task id
 CLICKUP_URL_RE = re.compile(r"app\.clickup\.com/t/(?:\d+/)?([A-Za-z0-9_-]+)")
 CLICKUP_ID_RE = re.compile(r"^[A-Za-z0-9_-]{4,}$")
-
-
-def require_auth(credentials: HTTPBasicCredentials = Depends(basic)):
-    if not settings.dashboard_password:
-        raise HTTPException(status_code=503, detail="dashboard disabled: DASHBOARD_PASSWORD not set")
-    user_ok = secrets.compare_digest(credentials.username.encode(), b"gumo")
-    pass_ok = secrets.compare_digest(
-        credentials.password.encode(), settings.dashboard_password.encode()
-    )
-    if not (user_ok and pass_ok):
-        raise HTTPException(status_code=401, detail="unauthorized",
-                            headers={"WWW-Authenticate": "Basic"})
+USERNAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{1,31}$")
 
 
 @asynccontextmanager
@@ -65,6 +67,9 @@ async def lifespan(app: FastAPI):
         source = "stored overrides (app_config)" if overrides else "env/code config"
         log.error("project context invalid in %s: %s — overrides NOT applied; "
                   "fix via PUT /api/context (or the env) and restart", source, e)
+    app.state.settings = settings  # auth dependencies resolve via app.state
+    bootstrap_admin(store, settings)
+    store.auth_sessions_prune()
     worker = Worker(settings, store)
     tasks = [
         asyncio.create_task(worker.run_forever()),
@@ -81,7 +86,7 @@ async def lifespan(app: FastAPI):
         t.cancel()
 
 
-app = FastAPI(title="gumo_brain", lifespan=lifespan)
+app = FastAPI(title=ENGINE_NAME, lifespan=lifespan)
 
 
 @app.get("/health")
@@ -89,15 +94,167 @@ async def health():
     return {"status": "ok", "queued": app.state.worker.queue.qsize()}
 
 
-@app.get("/", response_class=HTMLResponse, dependencies=[Depends(require_auth)])
-async def dashboard():
+# The UI lives in app/static (docs/ENGINE.md §11): index behind auth (browser
+# sessions redirect to the login page; per-user HTTP Basic still works for
+# curl), the login page and assets public. All paths are relative so the app
+# survives reverse-proxy prefixes (e.g. /brain/).
+STATIC_DIR = Path(__file__).parent / "static"
+_INDEX_HTML = (STATIC_DIR / "index.html").read_text()
+
+
+@app.get("/", response_class=HTMLResponse)
+async def dashboard(request: Request):
+    if app.state.store.user_count() == 0:
+        return HTMLResponse(
+            f"<h3>{ENGINE_NAME}: no users configured</h3>"
+            "<p>Set <code>CTRLLOOP_ADMIN_PASSWORD</code> (or the legacy "
+            "<code>DASHBOARD_PASSWORD</code>) and restart.</p>", status_code=503)
+    if current_user(request) is None:
+        return RedirectResponse("login")  # relative: survives proxy prefixes
     # brand subtitle follows the configured product name (docs/ENGINE.md §10)
-    return DASHBOARD_HTML.replace(
+    return _INDEX_HTML.replace(
         "the Gumo Engine", f"the {html.escape(settings.product_name)} Engine", 1
     )
 
 
-@app.get("/api/jobs", dependencies=[Depends(require_auth)])
+@app.get("/login", response_class=HTMLResponse)
+async def login_page(request: Request):
+    if current_user(request) is not None:
+        return RedirectResponse(".")
+    return FileResponse(STATIC_DIR / "login.html")
+
+
+@app.get("/static/style.css")
+async def static_css():
+    return FileResponse(STATIC_DIR / "style.css", media_type="text/css")
+
+
+@app.get("/static/app.js")
+async def static_js():
+    return FileResponse(STATIC_DIR / "app.js", media_type="text/javascript")
+
+
+# ---------- auth (docs/ENGINE.md §11) ----------
+
+
+class LoginBody(BaseModel):
+    username: str
+    password: str
+
+
+class PasswordBody(BaseModel):
+    current: str
+    new: str
+
+
+class UserCreateBody(BaseModel):
+    username: str
+    password: str
+    role: str = "member"
+
+
+class UserPatchBody(BaseModel):
+    role: str | None = None
+    disabled: bool | None = None
+    password: str | None = None  # admin reset — forces a change at next login
+
+
+def _public_user(u: dict) -> dict:
+    return {"username": u["username"], "role": u["role"],
+            "disabled": bool(u.get("disabled")),
+            "must_change_pw": bool(u.get("must_change_pw"))}
+
+
+@app.post("/api/login")
+async def login(body: LoginBody, request: Request, response: Response):
+    store: JobStore = app.state.store
+    user = verify_login(store, settings, body.username.strip(), body.password)
+    token = issue_session(store, settings, user)
+    response.set_cookie(
+        SESSION_COOKIE, token, httponly=True, samesite="lax",
+        secure=settings.session_cookie_secure,
+        max_age=settings.auth_session_ttl_days * 86400, path="/",
+    )
+    return _public_user(user)
+
+
+@app.post("/api/logout")
+async def logout(request: Request, response: Response):
+    token = request.cookies.get(SESSION_COOKIE)
+    if token:
+        revoke_session(app.state.store, token)
+    response.delete_cookie(SESSION_COOKIE, path="/")
+    return {"ok": True}
+
+
+@app.get("/api/me")
+async def me(user: dict = Depends(require_user)):
+    return _public_user(user)
+
+
+@app.post("/api/me/password")
+async def change_password(body: PasswordBody, user: dict = Depends(require_user)):
+    store: JobStore = app.state.store
+    verify_login(store, settings, user["username"], body.current)  # re-authenticate
+    if len(body.new) < 8:
+        raise HTTPException(status_code=400, detail="new password must be at least 8 characters")
+    store.user_set(user["username"], pw_hash=hash_password(body.new), must_change_pw=0)
+    store.auth_sessions_revoke_user(user["id"])  # sign out everywhere, incl. this session
+    return {"ok": True, "detail": "password changed — sign in again"}
+
+
+@app.get("/api/users", dependencies=[Depends(require_admin)])
+async def users_list():
+    return app.state.store.user_list()
+
+
+@app.post("/api/users", dependencies=[Depends(require_admin)])
+async def users_create(body: UserCreateBody):
+    store: JobStore = app.state.store
+    username = body.username.strip()
+    if not USERNAME_RE.match(username):
+        raise HTTPException(status_code=400,
+                            detail="username: 2-32 chars, letters/digits/._- , starting alphanumeric")
+    if body.role not in ("admin", "member"):
+        raise HTTPException(status_code=400, detail="role must be 'admin' or 'member'")
+    if len(body.password) < 8:
+        raise HTTPException(status_code=400, detail="password must be at least 8 characters")
+    if store.user_get(username):
+        raise HTTPException(status_code=409, detail=f"user '{username}' already exists")
+    user = store.user_create(username, hash_password(body.password), role=body.role,
+                             must_change_pw=True)
+    return _public_user(user)
+
+
+@app.patch("/api/users/{username}")
+async def users_patch(username: str, body: UserPatchBody,
+                      admin: dict = Depends(require_admin)):
+    store: JobStore = app.state.store
+    user = store.user_get(username)
+    if user is None:
+        raise HTTPException(status_code=404, detail=f"unknown user '{username}'")
+    if body.role is not None:
+        if body.role not in ("admin", "member"):
+            raise HTTPException(status_code=400, detail="role must be 'admin' or 'member'")
+        if user["username"] == admin["username"] and body.role != "admin":
+            raise HTTPException(status_code=400, detail="you cannot demote yourself")
+        store.user_set(username, role=body.role)
+    if body.disabled is not None:
+        if user["username"] == admin["username"] and body.disabled:
+            raise HTTPException(status_code=400, detail="you cannot disable yourself")
+        store.user_set(username, disabled=int(body.disabled))
+        if body.disabled:
+            store.auth_sessions_revoke_user(user["id"])
+    if body.password is not None:
+        if len(body.password) < 8:
+            raise HTTPException(status_code=400, detail="password must be at least 8 characters")
+        store.user_set(username, pw_hash=hash_password(body.password), must_change_pw=1,
+                       failed_attempts=0, locked_until=None)
+        store.auth_sessions_revoke_user(user["id"])
+    return _public_user(store.user_get(username))
+
+
+@app.get("/api/jobs", dependencies=[Depends(require_user)])
 async def jobs():
     rows = app.state.store.recent()
     for r in rows:
@@ -110,7 +267,7 @@ class TriggerBody(BaseModel):
     issue: str
 
 
-@app.post("/api/trigger", dependencies=[Depends(require_auth)])
+@app.post("/api/trigger", dependencies=[Depends(require_user)])
 async def trigger(body: TriggerBody):
     """Manual fix trigger: Sentry issue id / short id / URL in, ClickUp ticket out."""
     worker: Worker = app.state.worker
@@ -158,7 +315,7 @@ async def trigger(body: TriggerBody):
     }
 
 
-@app.get("/api/projects", dependencies=[Depends(require_auth)])
+@app.get("/api/projects", dependencies=[Depends(require_user)])
 async def projects():
     """Configured Sentry-project -> repo mappings, for the dashboard's project picker."""
     mapping = json.loads(settings.repo_map)
@@ -208,12 +365,12 @@ def _context_payload(warning: str = "") -> dict:
     }
 
 
-@app.get("/api/context", dependencies=[Depends(require_auth)])
+@app.get("/api/context", dependencies=[Depends(require_user)])
 async def get_context():
     return _context_payload()
 
 
-@app.put("/api/context", dependencies=[Depends(require_auth)])
+@app.put("/api/context", dependencies=[Depends(require_admin)])
 async def put_context(body: ContextBody):
     """Update the project context. Only supplied fields change; values are
     validated atomically (a bad payload changes nothing), applied to the live
@@ -243,7 +400,7 @@ async def put_context(body: ContextBody):
     return _context_payload(warning=_live_unmapped_warning(store))
 
 
-@app.delete("/api/context", dependencies=[Depends(require_auth)])
+@app.delete("/api/context", dependencies=[Depends(require_admin)])
 async def reset_context():
     """Drop every stored override — revert to the env/code defaults."""
     app.state.store.config_clear()
@@ -320,11 +477,11 @@ async def _prepare_ticket(worker: Worker, body: SubmitBody, prefix: str,
     }
 
 
-@app.post("/api/tasks", dependencies=[Depends(require_auth)])
+@app.post("/api/tasks", dependencies=[Depends(require_user)])
 async def submit_task(body: SubmitBody):
     """Manually reported request (bug fix / change request) — 2-phase HITL flow."""
     worker: Worker = app.state.worker
-    t = await _prepare_ticket(worker, body, "task", "**Manual request via gumo_brain dashboard**")
+    t = await _prepare_ticket(worker, body, "task", f"**Manual request via the {ENGINE_NAME} dashboard**")
     decision = worker.intake_task(
         t["job_id"], title=t["title"], project=t["project"], request=t["request"],
         clickup_task_id=t["task_id"], clickup_task_url=t["task_url"],
@@ -334,18 +491,18 @@ async def submit_task(body: SubmitBody):
     if t["adopted"]:
         await worker.clickup.comment(
             t["task_id"] or "",
-            "gumo_brain picked this up. I'll analyse the code first and post my plan + "
+            f"{ENGINE_NAME} picked this up. I'll analyse the code first and post my plan + "
             "questions here — reply `/proceed <guidance>` or `/skip`, or answer on the dashboard.",
         )
     return {"job_id": t["job_id"], "title": t["title"], "project": t["project"],
             "decision": decision, "clickup_task_url": t["task_url"]}
 
 
-@app.post("/api/features", dependencies=[Depends(require_auth)])
+@app.post("/api/features", dependencies=[Depends(require_user)])
 async def submit_feature(body: SubmitBody):
     """Feature pipeline: P0-P9 with a human gate after every stage (docs/ENGINE.md)."""
     worker: Worker = app.state.worker
-    t = await _prepare_ticket(worker, body, "feat", "**Feature pipeline via gumo_brain**")
+    t = await _prepare_ticket(worker, body, "feat", f"**Feature pipeline via {ENGINE_NAME}**")
     decision = worker.intake_feature(
         t["job_id"], title=t["title"], project=t["project"], request=t["request"],
         clickup_task_id=t["task_id"], clickup_task_url=t["task_url"],
@@ -358,7 +515,7 @@ async def submit_feature(body: SubmitBody):
     if t["adopted"]:
         await worker.clickup.comment(
             t["task_id"] or "",
-            "gumo_brain adopted this ticket as a FEATURE PIPELINE (P0 Intake → P9 Ship). "
+            f"{ENGINE_NAME} adopted this ticket as a FEATURE PIPELINE (P0 Intake → P9 Ship). "
             "Each stage posts its artifact as a subtask you can edit directly; every stage "
             "parks here for your `/proceed`, `/redo` or `/skip` (or answer on the dashboard).",
         )
@@ -371,8 +528,8 @@ class AnswerBody(BaseModel):
     answer: str = ""
 
 
-@app.post("/api/jobs/{job_id}/answer", dependencies=[Depends(require_auth)])
-async def answer_job(job_id: str, body: AnswerBody):
+@app.post("/api/jobs/{job_id}/answer")
+async def answer_job(job_id: str, body: AnswerBody, user: dict = Depends(require_user)):
     """Answer a parked gate from the dashboard. The decision is recorded on the
     ClickUp ticket; a lost race against a ClickUp comment answer returns 409."""
     action = body.action.strip().lower()
@@ -380,7 +537,8 @@ async def answer_job(job_id: str, body: AnswerBody):
         raise HTTPException(status_code=400, detail="action must be 'proceed', 'redo' or 'skip'")
     worker: Worker = app.state.worker
     try:
-        status = await worker.answer_job(job_id, action, body.answer.strip(), via="dashboard")
+        status = await worker.answer_job(job_id, action, body.answer.strip(),
+                                         via=f"dashboard:{user['username']}")
     except KeyError:
         raise HTTPException(status_code=404, detail=f"unknown job '{job_id}'")
     except ValueError as e:
@@ -390,7 +548,7 @@ async def answer_job(job_id: str, body: AnswerBody):
     return {"job_id": job_id, "status": status}
 
 
-@app.get("/api/features/{job_id}/stats", dependencies=[Depends(require_auth)])
+@app.get("/api/features/{job_id}/stats", dependencies=[Depends(require_user)])
 async def feature_stats(job_id: str):
     """Per-stage telemetry — the receipts behind the 10x claim. Chat cost rides
     gate_chat rows, never stage_runs (attempt/redo receipts stay clean)."""
@@ -435,8 +593,8 @@ async def _chat_answer(job: dict, message: str):
         chat_broker.finish(job_id)
 
 
-@app.post("/api/jobs/{job_id}/chat", dependencies=[Depends(require_auth)])
-async def gate_chat_post(job_id: str, body: ChatBody):
+@app.post("/api/jobs/{job_id}/chat")
+async def gate_chat_post(job_id: str, body: ChatBody, user: dict = Depends(require_user)):
     """Ask the engine a question at a parked gate (docs/CONVERSATIONS.md §2).
     Persist-then-poll: the message is stored and 202-acknowledged immediately;
     a background task answers when the repo workspace frees, and the dashboard
@@ -466,7 +624,7 @@ async def gate_chat_post(job_id: str, body: ChatBody):
     if _chat_pending(store, job_id, stage, settings.chat_timeout_seconds, attempt):
         raise HTTPException(status_code=409, detail="an answer is already in flight — wait for it")
 
-    store.chat_add(job_id, stage, attempt, "human", message)
+    store.chat_add(job_id, stage, attempt, "human", message, author=user["username"])
     chat_broker.start(job_id)  # new turn: reset the stream buffer
     task = asyncio.create_task(_chat_answer(job, message))
     _chat_tasks.add(task)  # keep a strong ref — bare create_task results can be GC'd mid-flight
@@ -474,7 +632,7 @@ async def gate_chat_post(job_id: str, body: ChatBody):
     return JSONResponse(status_code=202, content={"job_id": job_id, "status": "pending"})
 
 
-@app.get("/api/jobs/{job_id}/chat", dependencies=[Depends(require_auth)])
+@app.get("/api/jobs/{job_id}/chat", dependencies=[Depends(require_user)])
 async def gate_chat_get(job_id: str):
     store: JobStore = app.state.store
     job = store.get(job_id)
@@ -494,7 +652,7 @@ async def gate_chat_get(job_id: str):
     }
 
 
-@app.get("/api/jobs/{job_id}/chat/stream", dependencies=[Depends(require_auth)])
+@app.get("/api/jobs/{job_id}/chat/stream", dependencies=[Depends(require_user)])
 async def gate_chat_stream(job_id: str):
     """SSE stream of the in-flight chat turn (docs/CONVERSATIONS.md §5):
     'delta' (answer text chunks), 'status' (progress lines), 'done'. A late or
@@ -526,7 +684,7 @@ class SteerBody(BaseModel):
 SESSION_ARTIFACT_MAX = 24000  # per-artifact body cap in the session snapshot payload
 
 
-@app.get("/api/jobs/{job_id}/session", dependencies=[Depends(require_auth)])
+@app.get("/api/jobs/{job_id}/session", dependencies=[Depends(require_user)])
 async def session_snapshot(job_id: str):
     """Everything the detail pane shows for one item: meta, the stage timeline
     (features), gate decisions, the current branch artifacts, the conversation,
@@ -582,7 +740,7 @@ async def session_snapshot(job_id: str):
     }
 
 
-@app.get("/api/jobs/{job_id}/session/stream", dependencies=[Depends(require_auth)])
+@app.get("/api/jobs/{job_id}/session/stream", dependencies=[Depends(require_user)])
 async def session_stream(job_id: str):
     """SSE of the running stage's live activity — 'status' (tool calls / progress),
     'delta' (assistant text), 'done'. Reconnecting subscribers replay the buffered
@@ -605,8 +763,8 @@ async def session_stream(job_id: str):
                                       "X-Accel-Buffering": "no"})
 
 
-@app.post("/api/jobs/{job_id}/session/steer", dependencies=[Depends(require_auth)])
-async def session_steer(job_id: str, body: SteerBody):
+@app.post("/api/jobs/{job_id}/session/steer")
+async def session_steer(job_id: str, body: SteerBody, user: dict = Depends(require_user)):
     """Course-correct a running stage. Interrupts the CLI and resumes its session
     with the note folded in when possible; otherwise records it as guidance for
     the next checkpoint. 202 either way with which path was taken."""
@@ -615,7 +773,7 @@ async def session_steer(job_id: str, body: SteerBody):
         raise HTTPException(status_code=400, detail="empty note")
     worker: Worker = app.state.worker
     try:
-        outcome = worker.request_steer(job_id, note)
+        outcome = worker.request_steer(job_id, note, via=f"dashboard:{user['username']}")
     except KeyError:
         raise HTTPException(status_code=404, detail=f"unknown job '{job_id}'")
     except ValueError as e:
@@ -623,7 +781,7 @@ async def session_steer(job_id: str, body: SteerBody):
     return JSONResponse(status_code=202, content={"job_id": job_id, "status": outcome})
 
 
-@app.get("/api/memory", dependencies=[Depends(require_auth)])
+@app.get("/api/memory", dependencies=[Depends(require_user)])
 async def memory_index():
     reader = MemoryReader(settings)
     mapping = json.loads(settings.repo_map)
@@ -634,14 +792,14 @@ async def memory_index():
     return out
 
 
-@app.get("/api/memory/{project}", dependencies=[Depends(require_auth)])
+@app.get("/api/memory/{project}", dependencies=[Depends(require_user)])
 async def memory_project(project: str):
     if settings.repo_for_project(project) is None:
         raise HTTPException(status_code=404, detail=f"unknown project '{project}'")
     return MemoryReader(settings).cached(project)
 
 
-@app.post("/api/memory/{project}/bootstrap", dependencies=[Depends(require_auth)])
+@app.post("/api/memory/{project}/bootstrap", dependencies=[Depends(require_user)])
 async def memory_bootstrap(project: str):
     if settings.repo_for_project(project) is None:
         raise HTTPException(status_code=404, detail=f"unknown project '{project}'")

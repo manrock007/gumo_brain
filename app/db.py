@@ -116,6 +116,27 @@ CREATE TABLE IF NOT EXISTS prs (
     updated_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL UNIQUE,
+    pw_hash TEXT NOT NULL,           -- argon2
+    role TEXT NOT NULL DEFAULT 'member',  -- admin | member
+    disabled INTEGER NOT NULL DEFAULT 0,
+    must_change_pw INTEGER NOT NULL DEFAULT 0,
+    failed_attempts INTEGER NOT NULL DEFAULT 0,
+    locked_until REAL,               -- lockout expiry (consecutive failures)
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS auth_sessions (
+    token_hash TEXT PRIMARY KEY,     -- sha256 of the cookie token (never the token itself)
+    user_id INTEGER NOT NULL,
+    created_at REAL NOT NULL,
+    expires_at REAL NOT NULL,
+    last_seen REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS app_config (
     key TEXT PRIMARY KEY,            -- project-context override key (config.RUNTIME_CONTEXT_KEYS)
     value TEXT NOT NULL,             -- JSON-encoded value
@@ -176,6 +197,7 @@ MIGRATIONS = {  # table -> columns added after that table first shipped (in-plac
         "session_id": "TEXT DEFAULT ''",
         "degraded": "INTEGER NOT NULL DEFAULT 0",
         "lane": "TEXT NOT NULL DEFAULT ''",
+        "author": "TEXT NOT NULL DEFAULT ''",  # human turns: acting username
     },
     "artifact_state": {
         "content": "TEXT NOT NULL DEFAULT ''",
@@ -328,6 +350,98 @@ class JobStore:
                 (cutoff,),
             ).fetchall()
             return [dict(r) for r in rows]
+
+    # ---------- users & auth sessions (docs/ENGINE.md §11) ----------
+
+    def user_get(self, username: str) -> dict | None:
+        with self._conn() as c:
+            row = c.execute("SELECT * FROM users WHERE username = ?",
+                            ((username or "").strip(),)).fetchone()
+            return dict(row) if row else None
+
+    def user_count(self) -> int:
+        with self._conn() as c:
+            return c.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
+
+    def user_list(self) -> list[dict]:
+        """All users WITHOUT pw_hash — safe for the admin UI."""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT id, username, role, disabled, must_change_pw, created_at, updated_at "
+                "FROM users ORDER BY username").fetchall()
+            return [dict(r) for r in rows]
+
+    def user_create(self, username: str, pw_hash: str, role: str = "member",
+                    must_change_pw: bool = True) -> dict:
+        now = time.time()
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO users (username, pw_hash, role, must_change_pw, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (username.strip(), pw_hash, role, int(must_change_pw), now, now),
+            )
+        return self.user_get(username)
+
+    def user_set(self, username: str, **fields):
+        cols = ", ".join(f"{k} = ?" for k in fields)
+        with self._conn() as c:
+            c.execute(f"UPDATE users SET {cols}, updated_at = ? WHERE username = ?",
+                      (*fields.values(), time.time(), username))
+
+    def user_record_failure(self, username: str, max_attempts: int, lockout_seconds: int):
+        """Bump the consecutive-failure counter; lock the account when it hits
+        the cap. Counter resets on success (auth.verify_login)."""
+        with self._conn() as c:
+            # every SET expression sees the OLD row, so both CASEs key off the
+            # same pre-increment counter: hitting the cap locks and resets it
+            c.execute(
+                """UPDATE users SET
+                     locked_until = CASE WHEN failed_attempts + 1 >= ? THEN ? ELSE locked_until END,
+                     failed_attempts = CASE WHEN failed_attempts + 1 >= ? THEN 0 ELSE failed_attempts + 1 END,
+                     updated_at = ?
+                   WHERE username = ?""",
+                (max_attempts, time.time() + lockout_seconds, max_attempts,
+                 time.time(), username),
+            )
+
+    # -- cookie sessions (token stored hashed; sha256 is fine for 256-bit random tokens)
+
+    def auth_session_create(self, token_hash: str, user_id: int, ttl_seconds: float):
+        now = time.time()
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO auth_sessions (token_hash, user_id, created_at, expires_at, last_seen) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (token_hash, user_id, now, now + ttl_seconds, now),
+            )
+
+    def auth_session_user(self, token_hash: str) -> dict | None:
+        """The (enabled) user behind a live session; touches last_seen."""
+        now = time.time()
+        with self._conn() as c:
+            row = c.execute(
+                """SELECT u.* FROM auth_sessions s JOIN users u ON u.id = s.user_id
+                   WHERE s.token_hash = ? AND s.expires_at > ? AND u.disabled = 0""",
+                (token_hash, now),
+            ).fetchone()
+            if row is None:
+                return None
+            c.execute("UPDATE auth_sessions SET last_seen = ? WHERE token_hash = ?",
+                      (now, token_hash))
+            return dict(row)
+
+    def auth_session_delete(self, token_hash: str):
+        with self._conn() as c:
+            c.execute("DELETE FROM auth_sessions WHERE token_hash = ?", (token_hash,))
+
+    def auth_sessions_revoke_user(self, user_id: int):
+        """Password change / disable kills every live session for the user."""
+        with self._conn() as c:
+            c.execute("DELETE FROM auth_sessions WHERE user_id = ?", (user_id,))
+
+    def auth_sessions_prune(self):
+        with self._conn() as c:
+            c.execute("DELETE FROM auth_sessions WHERE expires_at <= ?", (time.time(),))
 
     # ---------- app config (project-context overrides, key-value) ----------
 
@@ -566,14 +680,14 @@ class JobStore:
     def chat_add(self, job_id: str, stage: int, attempt: int, role: str, text: str,
                  cost_usd: float | None = None, num_turns: int | None = None,
                  duration_ms: float | None = None, session_id: str = "",
-                 degraded: bool = False, lane: str = "") -> int:
+                 degraded: bool = False, lane: str = "", author: str = "") -> int:
         with self._conn() as c:
             cur = c.execute(
                 """INSERT INTO gate_chat (job_id, stage, attempt, role, text,
-                     cost_usd, num_turns, duration_ms, session_id, degraded, lane, at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                     cost_usd, num_turns, duration_ms, session_id, degraded, lane, author, at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (job_id, stage, attempt, role, text, cost_usd, num_turns,
-                 duration_ms, session_id, int(degraded), lane, time.time()),
+                 duration_ms, session_id, int(degraded), lane, author, time.time()),
             )
             return cur.lastrowid
 

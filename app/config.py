@@ -39,6 +39,19 @@ DEFAULT_REPO_MAP = {
     },
 }
 
+# The engine's own identity (the tool), distinct from product_name (what a
+# team builds with it). Single source of truth for branding, gate-comment
+# prefixes and the git author.
+ENGINE_NAME = "CtrlLoop"
+ENGINE_SLUG = "ctrlloop"
+
+# Engine-authored ClickUp comments carry a fixed prefix the poller uses to
+# ignore its own comments. Pre-rename comments still in threads must stay
+# recognized, or parked jobs could misread them as human answers.
+GATE_PREFIX = f"**[{ENGINE_SLUG}]**"
+LEGACY_GATE_PREFIXES = ("**[gumo_brain]**",)
+ENGINE_COMMENT_PREFIXES = (GATE_PREFIX, *LEGACY_GATE_PREFIXES)
+
 DEFAULT_PRODUCT_NAME = "Gumo"
 
 DEFAULT_BUSINESS_CONTEXT = """\
@@ -141,8 +154,19 @@ class Settings(BaseSettings):
     clickup_folder_field: str = "PRD Folder"
     clickup_friction_field: str = "Gumo Workflow Improvements"
 
-    # Dashboard basic auth (user "gumo"); dashboard + trigger disabled if empty
+    # ---- Auth (docs/ENGINE.md §11) ----
+    # First-boot admin bootstrap: when the users table is empty, an admin
+    # account is created from these. Back-compat: if unset but the legacy
+    # DASHBOARD_PASSWORD is set, the admin is created as user "gumo" with that
+    # password, so existing deployments keep their credentials.
+    ctrlloop_admin_user: str = "admin"
+    ctrlloop_admin_password: str = ""
+    # Legacy single-credential dashboard auth (pre-CtrlLoop) — bootstrap seed only
     dashboard_password: str = ""
+    auth_session_ttl_days: int = 14
+    auth_lockout_attempts: int = 5      # consecutive failures before lockout
+    auth_lockout_seconds: int = 300
+    session_cookie_secure: bool = False  # set true behind TLS-terminating proxies
 
     # ---- Project context (docs/ENGINE.md §10) ----
     # What the engine works ON. Env vars seed the defaults; operator edits via

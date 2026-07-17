@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CtrlLoop</title>
+<link rel="stylesheet" href="static/style.css">
+</head>
+
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">cl</span>
+    <span class="brand-name">CtrlLoop</span>
+    <span class="brand-sub">the Gumo Engine</span>
+  </div>
+  <div class="topbar-meta">
+    <span class="live-ind"><span class="live-dot"></span>live</span>
+    <span class="me-chip" id="me-chip">&hellip;</span>
+    <button class="tb-btn" id="nav-settings" style="display:none" onclick="openSettings()">Settings</button>
+    <button class="tb-btn" onclick="openAccount()">Account</button>
+    <button class="tb-btn" onclick="signOut()">Sign out</button>
+  </div>
+</header>
+<div id="msg"></div>
+
+<div class="shell solo" id="shell">
+  <aside class="inbox">
+    <div class="inbox-h">
+      <h2>Inbox</h2>
+      <div class="filters">
+        <button class="fchip on" data-f="all" onclick="setFilter('all')">All</button>
+        <button class="fchip" data-f="active" onclick="setFilter('active')">Active</button>
+        <button class="fchip" data-f="await" onclick="setFilter('await')">Awaiting you</button>
+      </div>
+    </div>
+    <div id="inbox-list"><div class="empty">loading&hellip;</div></div>
+    <button class="newbtn" onclick="openNew()">+ New work &mdash; Sentry fix / request / feature pipeline</button>
+  </aside>
+
+  <section class="detail">
+    <div class="welcome" id="welcome">
+      <div class="section-label">New work</div>
+      <div class="intake">
+        <div class="panel">
+          <h2>Fix a Sentry issue</h2>
+          <form onsubmit="return trigger(event)">
+            <input id="ref" placeholder="Sentry issue id, short id (GUMO-1A) or URL" required>
+            <button id="go">Fix it</button>
+          </form>
+        </div>
+        <div class="panel">
+          <h2>Submit a request (bug fix / change)</h2>
+          <form onsubmit="return submitTask(event)">
+            <select id="task-project" required></select>
+            <input id="task-clickup" placeholder="ClickUp task URL (optional — adopts that ticket)">
+            <div class="hint">&hellip;or describe it and a ClickUp ticket is created for you:</div>
+            <input id="task-title" placeholder="Title">
+            <textarea id="task-summary" placeholder="What's wrong / what do you need? Steps, links, expected behaviour&hellip;"></textarea>
+            <div class="hint">Claude analyses first and comes back with its plan + questions before touching code.</div>
+            <button id="task-go">Submit</button>
+          </form>
+        </div>
+        <div class="panel">
+          <h2>Feature pipeline (P0&ndash;P9)</h2>
+          <form onsubmit="return submitFeature(event)">
+            <select id="feat-project" required></select>
+            <input id="feat-clickup" placeholder="ClickUp task URL (optional — adopts that ticket)">
+            <div class="hint">&hellip;or describe the feature and a ClickUp ticket is created:</div>
+            <input id="feat-title" placeholder="Title">
+            <textarea id="feat-summary" placeholder="What should be built? Goal, users, constraints, links&hellip;"></textarea>
+            <input id="feat-owner" placeholder="Owner — ClickUp user id (optional, gets gate notifications)">
+            <select id="feat-gatemode">
+              <option value="full" selected>full &mdash; pause at every stage (default)</option>
+              <option value="light">light &mdash; pause at P0/P1/P3/P9 + questions</option>
+            </select>
+            <input id="feat-related" placeholder="Related pipeline job id(s) (optional, comma-separated)">
+            <div class="hint">P0 Intake &rarr; P9 Ship; every stage parks in the inbox (and on ClickUp) for your Proceed / Redo / Skip.</div>
+            <button id="feat-go">Start pipeline</button>
+          </form>
+        </div>
+      </div>
+      <details class="brain">
+        <summary>Product brain <span class="hint" style="display:inline">&mdash; per-repo memory freshness</span></summary>
+        <div id="brain-body"><div class="empty">loading&hellip;</div></div>
+      </details>
+      <details class="brain ctx" style="margin-top:14px">
+        <summary>Project context <span class="hint" style="display:inline">&mdash; the repos + business context the engine works on</span></summary>
+        <div id="ctx-body"><div class="empty">loading&hellip;</div></div>
+      </details>
+    </div>
+
+    <div id="dpane" style="display:none; flex:1; min-height:0; flex-direction:column;">
+      <div class="d-top">
+        <button class="d-back" onclick="closeItem()">&larr;</button>
+        <span class="d-title" id="d-title">&hellip;</span>
+        <span class="badge" id="d-status"></span>
+        <span class="d-strip" id="d-strip"></span>
+        <span class="d-links" id="d-links"></span>
+        <div class="d-sub" id="d-sub"></div>
+      </div>
+      <div class="thread" id="d-thread"></div>
+      <div class="composer" id="composer">
+        <div class="tabs">
+          <button class="tab on" id="tab-ask" onclick="setMode('ask')">Ask</button>
+          <button class="tab steer" id="tab-steer" onclick="setMode('steer')">Steer the run</button>
+        </div>
+        <textarea id="c-in" data-draft="" placeholder=""></textarea>
+        <div class="row2">
+          <button class="send" id="c-send" onclick="sendComposer()">Send</button>
+          <span class="cerr" id="c-err"></span>
+          <span class="chint" id="c-hint"></span>
+        </div>
+      </div>
+    </div>
+  </section>
+</div>
+
+<div class="settings-pane" id="settings-pane" style="display:none">
+  <div class="sp-head">
+    <button class="d-back" onclick="closeSettings()">&larr;</button>
+    <h2 id="sp-title">Settings</h2>
+  </div>
+  <div class="sp-body">
+    <div class="panel" id="sp-users" style="display:none">
+      <h2>Users</h2>
+      <div class="hint">Admins configure; members do the work. New users get a temporary password and must change it at first sign-in. Gate decisions are recorded under each user's name.</div>
+      <div id="users-list"><div class="empty">loading&hellip;</div></div>
+      <form onsubmit="return createUser(event)">
+        <div class="u-row">
+          <input id="nu-name" placeholder="username" required>
+          <input id="nu-pass" placeholder="temporary password (min 8)" required>
+          <select id="nu-role"><option value="member" selected>member</option><option value="admin">admin</option></select>
+          <button id="nu-go">Add user</button>
+        </div>
+      </form>
+    </div>
+    <div class="panel" id="sp-account">
+      <h2>Account</h2>
+      <div class="hint" id="acct-hint">Changing your password signs you out everywhere.</div>
+      <form onsubmit="return changePassword(event)">
+        <input id="pw-cur" type="password" placeholder="current password" required>
+        <input id="pw-new" type="password" placeholder="new password (min 8)" required>
+        <button id="pw-go">Change password</button>
+      </form>
+    </div>
+  </div>
+</div>
+
+<script src="static/app.js"></script>
+</body>
+</html>

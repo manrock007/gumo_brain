@@ -1,4 +1,8 @@
-# The Gumo Engine — feature pipeline, shared artifacts, product memory
+# CtrlLoop — feature pipeline, shared artifacts, product memory
+
+> Formerly "the Gumo Engine" / gumo_brain. The engine identity (CtrlLoop) is
+> distinct from the configured product identity (§10); Gumo remains the
+> default project context.
 
 > Status: AS-BUILT SPEC (v2 of gumo_brain). Reviewed by a 5-lens design critique
 > (sync protocol, memory, state machine, operator UX, prompt/token economics);
@@ -434,3 +438,35 @@ the PUT/DELETE response carries a warning listing affected live jobs, and the
 dashboard surfaces it. A run already in flight when an edit lands resolves its
 context non-transactionally (it may see mixed old/new values in its briefing);
 the next run is consistent.
+
+## 11. Users, roles & sessions
+
+Accounts live in the `users` table (argon2 hashes; never plaintext). Two
+roles: **admin** (edits configuration — project context, users; Phase 2 adds
+workspaces + integrations) and **member** (does the work: submit, gates,
+chat, steer). Two ways in, same accounts:
+
+- **Browser**: `/login` page → `POST /api/login` sets an HttpOnly cookie;
+  the 256-bit token is stored HASHED in `auth_sessions`. Unauthenticated
+  browser hits on `/` redirect to the login page.
+- **Automation**: per-user HTTP Basic on any API route. An explicit
+  Authorization header takes precedence over cookies and fails hard when
+  wrong (no silent fallback to whatever browser session is around).
+
+First boot with an empty users table bootstraps an admin from
+`CTRLLOOP_ADMIN_USER`/`CTRLLOOP_ADMIN_PASSWORD`; if only the legacy
+`DASHBOARD_PASSWORD` is set, the admin is created as user `gumo` with that
+password (existing deployments upgrade with unchanged credentials).
+Consecutive login failures lock the account temporarily. Admins create users
+with temporary passwords (forced change at first sign-in), reset, disable
+(revokes live sessions), and change roles; nobody can demote or disable
+themselves. Password changes revoke all of the user's sessions.
+
+**Attribution**: every gate decision, steer, and chat turn records the acting
+user (`guidance_log.via = "dashboard:<username>"`, `gate_chat.author`), and
+ClickUp gate comments carry it — "who approved P3" is always answerable.
+
+The UI is served from `app/static/` (index behind auth with the product-name
+substitution, login page + assets public; all paths relative so reverse-proxy
+prefixes work). The engine comment prefix is `**[ctrlloop]**`; the poller
+also recognizes the legacy `**[gumo_brain]**` prefix (§2 gate-park ordering).
