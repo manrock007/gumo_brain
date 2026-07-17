@@ -470,3 +470,31 @@ The UI is served from `app/static/` (index behind auth with the product-name
 substitution, login page + assets public; all paths relative so reverse-proxy
 prefixes work). The engine comment prefix is `**[ctrlloop]**`; the poller
 also recognizes the legacy `**[gumo_brain]**` prefix (§2 gate-park ordering).
+
+## 12. Workspaces — Business → Workspace → Repo
+
+A **workspace** is one product surface (App, Dashboard, …) owning: its repo
+map, its canonical repo for product-scope memory, its product name, its
+workspace context, its optional ClickUp list, and its optional Slack
+webhook. **Project slugs are unique across ALL workspaces** (DB index), so
+slug-keyed resolution — Sentry webhook routing, dispatch, the shepherd —
+stays deterministic, and `settings.repo_for_project` keeps working: the
+service rebuilds the merged map into live Settings after every edit.
+
+- **Context hierarchy in prompts**: business context (instance, §10) +
+  workspace context + repo memory (`.gumo/`, in the clone). Product name and
+  canonical repo resolve per workspace. The instance context API now owns
+  ONLY the business layer; repo topology edits there are refused with a
+  pointer to the workspace API.
+- **Membership**: `workspace_members` — members see and act on only assigned
+  workspaces, enforced in the API with 404s (no existence leaks); admins see
+  all. Jobs record `workspace_id` at intake.
+- **Migration**: first boot wraps the effective §10 context into a `default`
+  workspace and adopts existing jobs and users. Invisible upgrade.
+- **ClickUp optional per workspace**: tickets are created in the workspace's
+  list; a workspace with ClickUp off gets no tickets and degrades to
+  dashboard-only (everything already treats ClickUp as visibility, §7).
+  Sentry is per-workspace by construction: no mapped slugs → no sentry lane.
+- **Slack gate nudges**: at every gate park the workspace's incoming-webhook
+  (if set) receives the job, stage, and a dashboard deep link. Best-effort,
+  never drives control flow.

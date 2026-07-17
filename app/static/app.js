@@ -927,7 +927,7 @@ function openSettings() {
   document.getElementById('shell').style.display = 'none';
   document.getElementById('settings-pane').style.display = '';
   document.getElementById('sp-title').textContent = 'Settings';
-  if (ME && ME.role === 'admin') loadUsers();
+  if (ME && ME.role === 'admin') { loadUsers(); renderWorkspacesAdmin(); }
 }
 function openAccount() {
   openSettings();
