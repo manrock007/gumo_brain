@@ -665,12 +665,10 @@ async def answer_job(job_id: str, body: AnswerBody, user: dict = Depends(require
 
 @app.get("/api/features/{job_id}/stats")
 async def feature_stats(job_id: str, user: dict = Depends(require_user)):
-    _job_scoped(job_id, user)
     """Per-stage telemetry — the receipts behind the 10x claim. Chat cost rides
     gate_chat rows, never stage_runs (attempt/redo receipts stay clean)."""
+    _job_scoped(job_id, user)  # existence + access in one lookup
     store: JobStore = app.state.store
-    if store.get(job_id) is None:
-        raise HTTPException(status_code=404, detail=f"unknown job '{job_id}'")
     return {
         "runs": store.stage_runs_for(job_id),
         "guidance": store.guidance_for(job_id),

@@ -307,6 +307,10 @@ class Worker:
             project=project_slug,
             issue_url=issue.get("permalink", ""),
         )
+        # webhook intake has no project yet — stamp the workspace the moment
+        # the slug is known (before any skip path), or webhook-sourced jobs
+        # stay invisible to workspace members forever (sentry finding 1595670)
+        self._stamp_workspace(issue_id, project_slug)
 
         if phase == 1:
             grade = grade_issue(issue, self.settings, forced=forced)
