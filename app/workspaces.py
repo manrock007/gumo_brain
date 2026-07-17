@@ -200,7 +200,12 @@ class WorkspaceService:
             raise WorkspaceNotFound("unknown workspace")
         clean = self._clean_fields(fields)
         if repos is not None:
-            mapping = validate_repo_map({r.get("slug"): r for r in repos})
+            try:
+                mapping = validate_repo_map({r.get("slug"): r for r in repos})
+            except ValueError as e:
+                # plain ValueError would escape the endpoint's WorkspaceError
+                # handler and 500 — same validation failure, same 400
+                raise WorkspaceError(str(e))
             canonical = clean.get("canonical_project", ws["canonical_project"])
             if canonical and canonical not in mapping:
                 raise WorkspaceError(

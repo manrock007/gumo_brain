@@ -158,6 +158,14 @@ def test_workspace_crud_and_repo_move(client):
         {"slug": s, **e} for s, e in ws_list[0]["repos"].items()])
     svc_probe.sync_settings()
 
+    # invalid repos payloads are client errors, not 500s: validate_repo_map's
+    # plain ValueError must surface as a 400 (finding 1595977)
+    assert client.patch(f"/api/workspaces/{default_id_probe}", headers=AUTH,
+                        json={"repos": []}).status_code == 400
+    r = client.patch(f"/api/workspaces/{default_id_probe}", headers=AUTH,
+                     json={"repos": [{"slug": "bad", "repo": "not-owner-slash-name"}]})
+    assert r.status_code == 400 and "owner/name" in r.json()["detail"]
+
     # a second workspace cannot steal an existing slug
     r = client.post("/api/workspaces", headers=AUTH,
                     json={"slug": "app", "name": "App"})
