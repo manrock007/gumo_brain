@@ -72,6 +72,18 @@ def test_overrides_atomic_on_failure(tmp_path):
     assert s.repo_for_project("gumo") is not None
 
 
+def test_stale_canonical_never_blocks_unrelated_edits(tmp_path):
+    """Workspaces own canonical validation now: a legacy instance canonical
+    that no workspace carries anymore must not 400 a product_name-only edit
+    (sentry finding 1595745)."""
+    s = Settings(data_dir=str(tmp_path), memory_canonical_project="ghost")
+    applied = s.apply_runtime_overrides({"product_name": "Acme"})
+    assert applied == {"product_name": "Acme"} and s.product_name == "Acme"
+    # ...but staging either involved field still fail-closes
+    with pytest.raises(ValueError):
+        s.apply_runtime_overrides({"memory_canonical_project": "nope"})
+
+
 def test_overrides_skip_none_and_empty(tmp_path):
     s = Settings(data_dir=str(tmp_path))
     s.apply_runtime_overrides({"product_name": None, "memory_canonical_project": "  "})
@@ -138,10 +150,10 @@ def test_business_context_is_capped():
     prompt = build_stage_prompt(
         target=TARGET, branch="b", job=JOB, stage=0,
         memory_context="", artifact_names=[], inline_artifacts={},
-        guidance_entries=[], business_context="x" * 10000,
+        guidance_entries=[], business_context="x" * 20000,
     )
     assert "truncated" in prompt
-    assert "x" * 5000 not in prompt
+    assert "x" * 9000 not in prompt
 
 
 def test_fix_and_task_prompts_carry_context():

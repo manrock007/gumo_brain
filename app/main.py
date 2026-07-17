@@ -30,13 +30,14 @@ from .auth import (
     verify_login,
 )
 from .chatstream import ChatBroker
-from .config import ENGINE_NAME, RUNTIME_CONTEXT_KEYS, Settings, get_settings
+from .config import ENGINE_NAME, Settings, get_settings
 from .db import JobStore
 from .feature_prompts import stage_name
 from .fixer import ensure_session_store
 from .memory import MemoryReader
 from .sentry_api import extract_issue_ref, verify_signature
 from .worker import GateConflict, Worker
+from .workspaces import WorkspaceError, WorkspaceNotFound, WorkspaceService
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 log = logging.getLogger("brain")
@@ -70,7 +71,13 @@ async def lifespan(app: FastAPI):
     app.state.settings = settings  # auth dependencies resolve via app.state
     bootstrap_admin(store, settings)
     store.auth_sessions_prune()
+    workspaces = WorkspaceService(store, settings)
+    workspaces.ensure_default()  # upgrade path: wrap the §10 context into a workspace
+    app.state.workspaces = workspaces
     worker = Worker(settings, store)
+    worker.workspaces = workspaces
+    worker.engine.workspaces = workspaces
+    worker.engine.memory.canonical_resolver = workspaces.canonical_for
     tasks = [
         asyncio.create_task(worker.run_forever()),
         asyncio.create_task(worker.poll_clickup_forever()),
@@ -254,9 +261,98 @@ async def users_patch(username: str, body: UserPatchBody,
     return _public_user(store.user_get(username))
 
 
-@app.get("/api/jobs", dependencies=[Depends(require_user)])
-async def jobs():
+# ---------- workspaces (docs/ENGINE.md §12) ----------
+
+
+class WorkspaceCreateBody(BaseModel):
+    slug: str
+    name: str
+    product_name: str | None = None
+    workspace_context: str | None = None
+    canonical_project: str | None = None
+    clickup_list_id: str | None = None
+    clickup_enabled: bool | None = None
+    slack_webhook_url: str | None = None
+    gate_mode_default: str | None = None
+
+
+class WorkspacePatchBody(WorkspaceCreateBody):
+    slug: str | None = None  # slugs are immutable; ignored on patch
+    name: str | None = None
+    repos: list[dict] | None = None  # [{slug, repo, base?, setup_cmd?, test_cmd?, allow?}]
+
+
+class MemberBody(BaseModel):
+    username: str
+    member: bool
+
+
+def _ws_svc() -> WorkspaceService:
+    return app.state.workspaces
+
+
+def _job_scoped(job_id: str, user: dict) -> dict:
+    """The job, iff the user may see it — 404 either way so existence of
+    other workspaces' jobs never leaks to members."""
+    job = app.state.store.get(job_id)
+    if job is None or not _ws_svc().user_can_access(user, job.get("workspace_id")):
+        raise HTTPException(status_code=404, detail=f"unknown job '{job_id}'")
+    return job
+
+
+def _require_project_access(project: str, user: dict):
+    ws = _ws_svc().for_project(project)
+    if ws is None or not _ws_svc().user_can_access(user, ws["id"]):
+        raise HTTPException(status_code=400, detail=f"unknown project '{project}'")
+
+
+@app.get("/api/workspaces")
+async def workspaces_list(user: dict = Depends(require_user)):
+    svc = _ws_svc()
+    return [svc.public(w) for w in svc.user_workspaces(user)]
+
+
+@app.post("/api/workspaces", dependencies=[Depends(require_admin)])
+async def workspaces_create(body: WorkspaceCreateBody):
+    svc = _ws_svc()
+    try:
+        ws = svc.create(body.slug, body.name,
+                        **body.model_dump(exclude={"slug", "name"}, exclude_none=True))
+    except WorkspaceError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return svc.public(ws)
+
+
+@app.patch("/api/workspaces/{workspace_id}", dependencies=[Depends(require_admin)])
+async def workspaces_patch(workspace_id: int, body: WorkspacePatchBody):
+    svc = _ws_svc()
+    try:
+        ws = svc.update(workspace_id, repos=body.repos,
+                        **body.model_dump(exclude={"slug", "repos"}, exclude_none=True))
+    except WorkspaceNotFound as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except WorkspaceError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return svc.public(ws) | {"warning": _live_unmapped_warning(app.state.store)}
+
+
+@app.put("/api/workspaces/{workspace_id}/members", dependencies=[Depends(require_admin)])
+async def workspaces_member(workspace_id: int, body: MemberBody):
+    store: JobStore = app.state.store
+    if store.workspace_get(workspace_id) is None:
+        raise HTTPException(status_code=404, detail="unknown workspace")
+    target = store.user_get(body.username)
+    if target is None:
+        raise HTTPException(status_code=404, detail=f"unknown user '{body.username}'")
+    store.workspace_member_set(workspace_id, target["id"], body.member)
+    return _ws_svc().public(store.workspace_get(workspace_id))
+
+
+@app.get("/api/jobs")
+async def jobs(user: dict = Depends(require_user)):
     rows = app.state.store.recent()
+    svc = _ws_svc()
+    rows = [r for r in rows if svc.user_can_access(user, r.get("workspace_id"))]
     for r in rows:
         if r.get("kind") == "feature":
             r["stage_name"] = stage_name(int(r.get("stage") or 0))
@@ -267,8 +363,8 @@ class TriggerBody(BaseModel):
     issue: str
 
 
-@app.post("/api/trigger", dependencies=[Depends(require_user)])
-async def trigger(body: TriggerBody):
+@app.post("/api/trigger")
+async def trigger(body: TriggerBody, user: dict = Depends(require_user)):
     """Manual fix trigger: Sentry issue id / short id / URL in, ClickUp ticket out."""
     worker: Worker = app.state.worker
     ref = body.issue.strip()
@@ -290,6 +386,8 @@ async def trigger(body: TriggerBody):
 
     title = issue.get("title", "unknown")
     project = (issue.get("project") or {}).get("slug", "")
+    if user["role"] != "admin":
+        _require_project_access(project, user)
     decision = worker.intake(issue_id, source="manual", forced=True, title=title, project=project)
     if "queued" not in decision:
         raise HTTPException(status_code=409, detail=decision)
@@ -298,10 +396,14 @@ async def trigger(body: TriggerBody):
     row = app.state.store.get(issue_id)
     task_url = row.get("clickup_task_url") if row else None
     if row and not row.get("clickup_task_id"):
-        created = await worker.clickup.create_task(
-            name=f"[{project}] {title}",
-            description=worker._ticket_description(issue, row),
-        )
+        cu_on, cu_list = _ws_svc().clickup_route(project)
+        created = None
+        if cu_on:
+            created = await worker.clickup.create_task(
+                name=f"[{project}] {title}",
+                description=worker._ticket_description(issue, row),
+                list_id=cu_list,
+            )
         if created:
             task_id, task_url = created
             app.state.store.set_fields(issue_id, clickup_task_id=task_id, clickup_task_url=task_url)
@@ -315,11 +417,16 @@ async def trigger(body: TriggerBody):
     }
 
 
-@app.get("/api/projects", dependencies=[Depends(require_user)])
-async def projects():
-    """Configured Sentry-project -> repo mappings, for the dashboard's project picker."""
-    mapping = json.loads(settings.repo_map)
-    return [{"slug": slug, "repo": entry.get("repo", "")} for slug, entry in sorted(mapping.items())]
+@app.get("/api/projects")
+async def projects(user: dict = Depends(require_user)):
+    """Project slugs the user may target, with their workspace (picker + switcher)."""
+    svc = _ws_svc()
+    out = []
+    for ws in svc.user_workspaces(user):
+        for slug, entry in sorted(svc.public(ws)["repos"].items()):
+            out.append({"slug": slug, "repo": entry.get("repo", ""),
+                        "workspace": ws["slug"], "workspace_id": ws["id"]})
+    return out
 
 
 # ---------- project context (docs/ENGINE.md §10) ----------
@@ -378,11 +485,14 @@ async def put_context(body: ContextBody):
     recorded project slug: if the new map still contains it, they continue
     under the new mapping; if a slug was REMOVED, those jobs are skipped at
     their next run — the response carries a warning listing them."""
+    if body.repo_map is not None or body.canonical_project is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="repos and the canonical project are managed per workspace now — "
+                   "use PATCH /api/workspaces/{id} (Settings → Workspaces)")
     overrides = {
         "product_name": body.product_name,
         "business_context": body.business_context,
-        "repo_map": body.repo_map,
-        "memory_canonical_project": body.canonical_project,
     }
     try:
         staged = settings.stage_runtime_overrides(overrides)
@@ -402,10 +512,18 @@ async def put_context(body: ContextBody):
 
 @app.delete("/api/context", dependencies=[Depends(require_admin)])
 async def reset_context():
-    """Drop every stored override — revert to the env/code defaults."""
+    """Drop every stored override — revert the INSTANCE-owned fields to env/code
+    defaults. Repo topology belongs to workspaces (§12): resetting must never
+    clobber the workspace-merged map, and we re-sync it to be safe (finding
+    1595745/0 — a default-map settings.repo_map would silently skip sentry
+    issues for workspace-only projects until the next workspace edit)."""
     app.state.store.config_clear()
-    for key in RUNTIME_CONTEXT_KEYS:
+    # memory_canonical_project included: a cleared legacy override must not
+    # linger live until restart (finding 1595794/1). repo_map is deliberately
+    # NOT reset — workspaces own it; the sync below rebuilds the merged map.
+    for key in ("product_name", "business_context", "memory_canonical_project"):
         setattr(settings, key, getattr(_default_settings, key))
+    _ws_svc().sync_settings()
     return _context_payload(warning=_live_unmapped_warning(app.state.store))
 
 
@@ -456,7 +574,9 @@ async def _prepare_ticket(worker: Worker, body: SubmitBody, prefix: str,
     if not title:
         raise HTTPException(status_code=400, detail="provide a ClickUp URL, or a title")
     request_text = summary or title
-    created = await worker.clickup.create_task(
+    cu_on, cu_list = _ws_svc().clickup_route(project)
+    created = None if not cu_on else await worker.clickup.create_task(
+        list_id=cu_list,
         name=f"[{project}] {title}",
         description=(
             f"{intro}\n**Project:** {project}\n\n{request_text}\n\n"
@@ -467,7 +587,7 @@ async def _prepare_ticket(worker: Worker, body: SubmitBody, prefix: str,
     if created:
         task_id, task_url = created
         job_id = f"{prefix}-{task_id}"
-        list_id = settings.clickup_list_id
+        list_id = cu_list or settings.clickup_list_id
     else:  # ClickUp outage degrades tracking, never fixing
         task_id, task_url, list_id = None, None, ""
         job_id = f"{prefix}-{uuid.uuid4().hex[:10]}"
@@ -477,10 +597,12 @@ async def _prepare_ticket(worker: Worker, body: SubmitBody, prefix: str,
     }
 
 
-@app.post("/api/tasks", dependencies=[Depends(require_user)])
-async def submit_task(body: SubmitBody):
+@app.post("/api/tasks")
+async def submit_task(body: SubmitBody, user: dict = Depends(require_user)):
     """Manually reported request (bug fix / change request) — 2-phase HITL flow."""
     worker: Worker = app.state.worker
+    if user["role"] != "admin":
+        _require_project_access(body.project.strip(), user)
     t = await _prepare_ticket(worker, body, "task", f"**Manual request via the {ENGINE_NAME} dashboard**")
     decision = worker.intake_task(
         t["job_id"], title=t["title"], project=t["project"], request=t["request"],
@@ -498,10 +620,12 @@ async def submit_task(body: SubmitBody):
             "decision": decision, "clickup_task_url": t["task_url"]}
 
 
-@app.post("/api/features", dependencies=[Depends(require_user)])
-async def submit_feature(body: SubmitBody):
+@app.post("/api/features")
+async def submit_feature(body: SubmitBody, user: dict = Depends(require_user)):
     """Feature pipeline: P0-P9 with a human gate after every stage (docs/ENGINE.md)."""
     worker: Worker = app.state.worker
+    if user["role"] != "admin":
+        _require_project_access(body.project.strip(), user)
     t = await _prepare_ticket(worker, body, "feat", f"**Feature pipeline via {ENGINE_NAME}**")
     decision = worker.intake_feature(
         t["job_id"], title=t["title"], project=t["project"], request=t["request"],
@@ -535,6 +659,7 @@ async def answer_job(job_id: str, body: AnswerBody, user: dict = Depends(require
     action = body.action.strip().lower()
     if action not in ("proceed", "redo", "skip"):
         raise HTTPException(status_code=400, detail="action must be 'proceed', 'redo' or 'skip'")
+    _job_scoped(job_id, user)
     worker: Worker = app.state.worker
     try:
         status = await worker.answer_job(job_id, action, body.answer.strip(),
@@ -548,13 +673,12 @@ async def answer_job(job_id: str, body: AnswerBody, user: dict = Depends(require
     return {"job_id": job_id, "status": status}
 
 
-@app.get("/api/features/{job_id}/stats", dependencies=[Depends(require_user)])
-async def feature_stats(job_id: str):
+@app.get("/api/features/{job_id}/stats")
+async def feature_stats(job_id: str, user: dict = Depends(require_user)):
     """Per-stage telemetry — the receipts behind the 10x claim. Chat cost rides
     gate_chat rows, never stage_runs (attempt/redo receipts stay clean)."""
+    _job_scoped(job_id, user)  # existence + access in one lookup
     store: JobStore = app.state.store
-    if store.get(job_id) is None:
-        raise HTTPException(status_code=404, detail=f"unknown job '{job_id}'")
     return {
         "runs": store.stage_runs_for(job_id),
         "guidance": store.guidance_for(job_id),
@@ -604,9 +728,7 @@ async def gate_chat_post(job_id: str, body: ChatBody, user: dict = Depends(requi
         raise HTTPException(status_code=400, detail="empty message")
     store: JobStore = app.state.store
     worker: Worker = app.state.worker
-    job = store.get(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail=f"unknown job '{job_id}'")
+    job = _job_scoped(job_id, user)
     if (job.get("kind") or "") not in ("feature", "sentry", "task"):
         raise HTTPException(status_code=409, detail="chat is not available for this item kind")
     # chat spans the item's whole life: parked at a gate, mid-run (the inbox
@@ -632,12 +754,10 @@ async def gate_chat_post(job_id: str, body: ChatBody, user: dict = Depends(requi
     return JSONResponse(status_code=202, content={"job_id": job_id, "status": "pending"})
 
 
-@app.get("/api/jobs/{job_id}/chat", dependencies=[Depends(require_user)])
-async def gate_chat_get(job_id: str):
+@app.get("/api/jobs/{job_id}/chat")
+async def gate_chat_get(job_id: str, user: dict = Depends(require_user)):
     store: JobStore = app.state.store
-    job = store.get(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail=f"unknown job '{job_id}'")
+    job = _job_scoped(job_id, user)
     stage = int(job.get("stage") or 0)
     attempt = max(1, int(job.get("stage_attempts") or 1))
     turns = store.chat_for(job_id, stage)
@@ -652,15 +772,13 @@ async def gate_chat_get(job_id: str):
     }
 
 
-@app.get("/api/jobs/{job_id}/chat/stream", dependencies=[Depends(require_user)])
-async def gate_chat_stream(job_id: str):
+@app.get("/api/jobs/{job_id}/chat/stream")
+async def gate_chat_stream(job_id: str, user: dict = Depends(require_user)):
     """SSE stream of the in-flight chat turn (docs/CONVERSATIONS.md §5):
     'delta' (answer text chunks), 'status' (progress lines), 'done'. A late or
     reconnecting subscriber replays the buffered turn first. Pure UX on top of
     persist-then-poll — if this stream dies, the polling GET still delivers."""
-    store: JobStore = app.state.store
-    if store.get(job_id) is None:
-        raise HTTPException(status_code=404, detail=f"unknown job '{job_id}'")
+    _job_scoped(job_id, user)
 
     async def _events():
         max_s = settings.chat_timeout_seconds + settings.chat_fast_timeout_seconds + 120
@@ -684,8 +802,8 @@ class SteerBody(BaseModel):
 SESSION_ARTIFACT_MAX = 24000  # per-artifact body cap in the session snapshot payload
 
 
-@app.get("/api/jobs/{job_id}/session", dependencies=[Depends(require_user)])
-async def session_snapshot(job_id: str):
+@app.get("/api/jobs/{job_id}/session")
+async def session_snapshot(job_id: str, user: dict = Depends(require_user)):
     """Everything the detail pane shows for one item: meta, the stage timeline
     (features), gate decisions, the current branch artifacts, the conversation,
     and whether a run is live / steerable right now. All kinds — sentry/task
@@ -693,9 +811,7 @@ async def session_snapshot(job_id: str):
     Read-only; the live activity comes over the SSE stream."""
     store: JobStore = app.state.store
     worker: Worker = app.state.worker
-    job = store.get(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail=f"unknown job '{job_id}'")
+    job = _job_scoped(job_id, user)
     kind = job.get("kind") or "sentry"
     feature = kind == "feature"
     stage = int(job.get("stage") or 0)
@@ -740,14 +856,12 @@ async def session_snapshot(job_id: str):
     }
 
 
-@app.get("/api/jobs/{job_id}/session/stream", dependencies=[Depends(require_user)])
-async def session_stream(job_id: str):
+@app.get("/api/jobs/{job_id}/session/stream")
+async def session_stream(job_id: str, user: dict = Depends(require_user)):
     """SSE of the running stage's live activity — 'status' (tool calls / progress),
     'delta' (assistant text), 'done'. Reconnecting subscribers replay the buffered
     run. Keyed on its own broker so a gate chat never clobbers the stage stream."""
-    store: JobStore = app.state.store
-    if store.get(job_id) is None:
-        raise HTTPException(status_code=404, detail=f"unknown job '{job_id}'")
+    _job_scoped(job_id, user)
     broker = app.state.worker.engine.stage_broker
 
     async def _events():
@@ -768,6 +882,7 @@ async def session_steer(job_id: str, body: SteerBody, user: dict = Depends(requi
     """Course-correct a running stage. Interrupts the CLI and resumes its session
     with the note folded in when possible; otherwise records it as guidance for
     the next checkpoint. 202 either way with which path was taken."""
+    _job_scoped(job_id, user)
     note = body.note.strip()
     if not note:
         raise HTTPException(status_code=400, detail="empty note")
@@ -781,27 +896,30 @@ async def session_steer(job_id: str, body: SteerBody, user: dict = Depends(requi
     return JSONResponse(status_code=202, content={"job_id": job_id, "status": outcome})
 
 
-@app.get("/api/memory", dependencies=[Depends(require_user)])
-async def memory_index():
+@app.get("/api/memory")
+async def memory_index(user: dict = Depends(require_user)):
     reader = MemoryReader(settings)
-    mapping = json.loads(settings.repo_map)
+    svc = _ws_svc()
     out = {}
-    for slug in sorted(mapping):
-        cached = reader.cached(slug)  # one disk read per project, not two
-        out[slug] = cached.get("meta", {}) | {"exists": cached["exists"]}
+    for ws in svc.user_workspaces(user):
+        for slug in sorted(svc.public(ws)["repos"]):
+            cached = reader.cached(slug)  # one disk read per project, not two
+            out[slug] = cached.get("meta", {}) | {"exists": cached["exists"]}
     return out
 
 
-@app.get("/api/memory/{project}", dependencies=[Depends(require_user)])
-async def memory_project(project: str):
-    if settings.repo_for_project(project) is None:
+@app.get("/api/memory/{project}")
+async def memory_project(project: str, user: dict = Depends(require_user)):
+    ws = _ws_svc().for_project(project)
+    if ws is None or not _ws_svc().user_can_access(user, ws["id"]):
         raise HTTPException(status_code=404, detail=f"unknown project '{project}'")
     return MemoryReader(settings).cached(project)
 
 
-@app.post("/api/memory/{project}/bootstrap", dependencies=[Depends(require_user)])
-async def memory_bootstrap(project: str):
-    if settings.repo_for_project(project) is None:
+@app.post("/api/memory/{project}/bootstrap")
+async def memory_bootstrap(project: str, user: dict = Depends(require_user)):
+    ws = _ws_svc().for_project(project)
+    if ws is None or not _ws_svc().user_can_access(user, ws["id"]):
         raise HTTPException(status_code=404, detail=f"unknown project '{project}'")
     decision = app.state.worker.intake_memory(project)
     if "queued" not in decision:

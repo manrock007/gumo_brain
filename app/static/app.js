@@ -79,6 +79,7 @@ function row(j) {
 
 function renderInbox() {
   let items = jobsCache.slice().sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0));
+  items = items.filter(jobInActiveWs);
   if (filter === 'active') items = items.filter(j => LIVE.includes(j.status));
   if (filter === 'await') items = items.filter(j => j.status === 'awaiting_input');
   document.getElementById('inbox-list').innerHTML =
@@ -705,20 +706,15 @@ function ctxRepoRow(slug, e) {
 function renderContext() {
   const c = ctxData.context;
   const over = ctxData.overridden || [];
-  const rows = Object.entries(c.repo_map).map(([s, e]) => ctxRepoRow(s, e)).join('');
   const note = over.length
     ? 'Customized (' + esc(over.join(', ')) + ') &mdash; saved in the engine DB, survives restarts.'
     : 'Running on the built-in defaults.';
   document.getElementById('ctx-body').innerHTML = `
-    <div class="hint" style="margin-top:10px">${note} Every run is briefed from this: the repos the engine may work on (project slug &rarr; GitHub repo), which repo hosts product-scope memory, and the business context injected into every prompt.</div>
+    <div class="hint" style="margin-top:10px">${note} The BUSINESS layer of every run's briefing: who the company is and how it works. Repos, canonical memory repo and per-surface context live on each workspace (Settings &rarr; Workspaces).</div>
     <div class="ctx-grid">
-      <div><label>Product name</label><input id="ctx-name" value="${attr(c.product_name)}"></div>
-      <div><label>Canonical project &mdash; hosts .gumo/product/</label><input id="ctx-canon" value="${attr(c.canonical_project)}"></div>
+      <div><label>Default product name</label><input id="ctx-name" value="${attr(c.product_name)}"></div>
     </div>
-    <label>Repositories (project slug &rarr; repo)</label>
-    <div id="ctx-repos">${rows}</div>
-    <button type="button" onclick="ctxAddRow()">+ Add repo</button>
-    <label>Business context (injected into every run's prompt)</label>
+    <label>Business context (stacked above each workspace's context in every prompt)</label>
     <textarea id="ctx-biz">${esc(c.business_context)}</textarea>
     <div style="display:flex; gap:8px; margin-top:12px">
       <button type="button" class="save" onclick="saveContext(this)">Save context</button>
@@ -732,17 +728,6 @@ function ctxAddRow() {
 
 async function saveContext(btn) {
   const msg = document.getElementById('msg');
-  const repo_map = {};
-  for (const row of document.querySelectorAll('#ctx-repos .ctx-row')) {
-    const v = (cls) => row.querySelector('.' + cls).value.trim();
-    const slug = v('cr-slug');
-    if (!slug) continue;
-    repo_map[slug] = {
-      repo: v('cr-repo'), base: v('cr-base') || 'main',
-      setup_cmd: v('cr-setup') || null, test_cmd: v('cr-test') || null,
-      allow: v('cr-allow') ? v('cr-allow').split(',').map(s => s.trim()).filter(Boolean) : [],
-    };
-  }
   // only send what actually changed: untouched fields must NOT become DB
   // overrides, or they would pin today's defaults forever (shadowing future
   // env/default improvements)
@@ -750,11 +735,8 @@ async function saveContext(btn) {
   const body = {};
   const name = document.getElementById('ctx-name').value.trim();
   if (name !== cur.product_name) body.product_name = name;
-  const canon = document.getElementById('ctx-canon').value.trim();
-  if (canon !== cur.canonical_project) body.canonical_project = canon;
   const biz = document.getElementById('ctx-biz').value;
   if (biz !== cur.business_context) body.business_context = biz;
-  if (JSON.stringify(repo_map) !== JSON.stringify(cur.repo_map)) body.repo_map = repo_map;
   if (!Object.keys(body).length) { msg.textContent = 'No changes to save.'; return; }
   btn.disabled = true; msg.textContent = 'Saving project context…';
   try {
@@ -794,11 +776,18 @@ async function resetContext(btn) {
 async function loadProjects() {
   try {
     const ps = await (await fetch('api/projects')).json();
-    const opts = '<option value="" disabled selected>Project&hellip;</option>' +
-      ps.map(p => `<option value="${esc(p.slug)}">${esc(p.slug)} (${esc(p.repo)})</option>`).join('');
-    document.getElementById('task-project').innerHTML = opts;
-    document.getElementById('feat-project').innerHTML = opts;
+    window.PROJECTS_CACHE = ps;
+    renderProjectOptions(ps);
   } catch (e) { /* keep empty selects; submit will fail loudly */ }
+}
+
+function renderProjectOptions(ps) {
+  const scoped = (activeWs && WORKSPACES.length > 1)
+    ? ps.filter((p) => p.workspace_id === activeWs) : ps;
+  const opts = '<option value="" disabled selected>Project&hellip;</option>' +
+    scoped.map(p => `<option value="${esc(p.slug)}">${esc(p.slug)} (${esc(p.repo)})</option>`).join('');
+  document.getElementById('task-project').innerHTML = opts;
+  document.getElementById('feat-project').innerHTML = opts;
 }
 
 async function trigger(ev) {
@@ -912,6 +901,8 @@ async function loadMe() {
     if (ME.role === 'admin') {
       document.getElementById('nav-settings').style.display = '';
       document.getElementById('sp-users').style.display = '';
+      document.getElementById('sp-workspaces').style.display = '';
+      renderWorkspacesAdmin();
     } else {
       // configuration is admin-only: hide the Project context editor for members
       const ctx = document.querySelector('details.ctx');
@@ -936,7 +927,7 @@ function openSettings() {
   document.getElementById('shell').style.display = 'none';
   document.getElementById('settings-pane').style.display = '';
   document.getElementById('sp-title').textContent = 'Settings';
-  if (ME && ME.role === 'admin') loadUsers();
+  if (ME && ME.role === 'admin') { loadUsers(); renderWorkspacesAdmin(); }
 }
 function openAccount() {
   openSettings();
@@ -1040,3 +1031,152 @@ async function changePassword(ev) {
 }
 
 loadMe();
+
+// ---------- workspaces (Phase 2): switcher + scoping + admin editor ----------
+
+let WORKSPACES = [];
+let activeWs = parseInt(localStorage.getItem('cl-ws') || '0', 10) || null;
+
+async function loadWorkspaces() {
+  try {
+    const r = await fetch('api/workspaces');
+    if (!r.ok) return;
+    WORKSPACES = await r.json();
+    if (!WORKSPACES.length) return;
+    // 0 = "All workspaces" (also where unowned/legacy jobs surface); a
+    // specific selection filters STRICTLY (sentry finding 1595858)
+    const valid = activeWs === 0 || WORKSPACES.some((w) => w.id === activeWs);
+    if (activeWs == null || !valid) activeWs = WORKSPACES.length > 1 ? 0 : WORKSPACES[0].id;
+    const sw = document.getElementById('ws-switch');
+    sw.innerHTML = '<option value="0"' + (activeWs === 0 ? ' selected' : '') + '>All workspaces</option>' +
+      WORKSPACES.map((w) =>
+        `<option value="${w.id}" ${w.id === activeWs ? 'selected' : ''}>${esc(w.name)}</option>`).join('');
+    sw.style.display = WORKSPACES.length > 1 ? '' : 'none';
+    scopeProjectPickers();
+    if (ME && ME.role === 'admin') renderWorkspacesAdmin();
+  } catch (e) {}
+}
+
+function setWorkspace(id) {
+  activeWs = parseInt(id, 10);
+  localStorage.setItem('cl-ws', String(activeWs));
+  scopeProjectPickers();
+  lastJobs = ''; refresh(true); refreshMemory(true);
+}
+
+function jobInActiveWs(j) {
+  if (!activeWs || WORKSPACES.length < 2) return true;  // "All", or single-workspace instance
+  return (j.workspace_id || null) === activeWs;  // strict: unowned jobs live under "All" only
+}
+
+function scopeProjectPickers() {
+  // re-filter the intake pickers to the active workspace's slugs
+  if (window.PROJECTS_CACHE) renderProjectOptions(window.PROJECTS_CACHE);
+}
+
+async function renderWorkspacesAdmin() {
+  const box = document.getElementById('ws-admin-list');
+  if (!box) return;
+  let users = [];
+  try { users = await (await fetch('api/users')).json(); } catch (e) {}
+  box.innerHTML = WORKSPACES.map((w) => {
+    const repos = Object.entries(w.repos).map(([s, e]) => wsRepoRow(s, e)).join('');
+    const members = users.map((u) => `<label style="display:inline-flex;gap:4px;align-items:center">
+      <input type="checkbox" data-ws-member="${w.id}" value="${esc(u.username)}"
+        ${w.members.includes(u.username) ? 'checked' : ''}
+        onchange="setWsMember(${w.id}, '${esc(u.username)}', this.checked)">${esc(u.username)}</label>`).join('');
+    return `<div class="ws-card" data-ws="${w.id}">
+      <h3>${esc(w.name)} <span class="chip">${esc(w.slug)}</span></h3>
+      <div class="ws-inline">
+        <div><label>Product name</label><input class="w-product" value="${attr(w.product_name)}"></div>
+        <div><label>Canonical project (hosts .gumo/product/)</label><input class="w-canon" value="${attr(w.canonical_project)}"></div>
+      </div>
+      <label>Repositories (slug &rarr; repo &middot; base &middot; setup &middot; test)</label>
+      <div class="ws-repos">${repos}</div>
+      <button type="button" onclick="this.previousElementSibling.insertAdjacentHTML('beforeend', wsRepoRow('', {}))">+ Add repo</button>
+      <label>Workspace context (stacked under the business context in every run)</label>
+      <textarea class="w-ctx">${esc(w.workspace_context)}</textarea>
+      <div class="ws-inline" style="margin-top:8px">
+        <div><label>ClickUp list id (optional)</label><input class="w-culist" value="${attr(w.clickup_list_id)}"></div>
+        <div><label>Slack webhook URL (gate nudges, optional)</label><input class="w-slack" value="${attr(w.slack_webhook_url)}"></div>
+      </div>
+      <div class="ws-flags">
+        <label style="display:inline-flex;gap:5px;align-items:center">
+          <input type="checkbox" class="w-cuon" ${w.clickup_enabled ? 'checked' : ''}> ClickUp mirroring</label>
+        <span class="hint">members:</span><span class="ws-members">${members || '<span class="hint">none</span>'}</span>
+      </div>
+      <button type="button" class="save" onclick="saveWorkspace(${w.id}, this)">Save workspace</button>
+    </div>`;
+  }).join('');
+}
+
+function wsRepoRow(slug, e) {
+  e = e || {};
+  return `<div class="ws-repo-row">
+    <input class="wr-slug" placeholder="slug" value="${attr(slug)}">
+    <input class="wr-repo" placeholder="owner/name" value="${attr(e.repo || '')}">
+    <input class="wr-base" placeholder="base" value="${attr(e.base || '')}">
+    <input class="wr-setup" placeholder="setup cmd" value="${attr(e.setup_cmd || '')}">
+    <input class="wr-test" placeholder="test cmd" value="${attr(e.test_cmd || '')}">
+    <button type="button" onclick="this.parentNode.remove()" title="Remove">&#10007;</button>
+  </div>`;
+}
+
+async function saveWorkspace(id, btn) {
+  const msg = document.getElementById('msg');
+  const card = document.querySelector(`.ws-card[data-ws="${id}"]`);
+  const v = (cls) => card.querySelector('.' + cls).value.trim();
+  const repos = [];
+  for (const row of card.querySelectorAll('.ws-repo-row')) {
+    const rv = (cls) => row.querySelector('.' + cls).value.trim();
+    if (!rv('wr-slug')) continue;
+    repos.push({ slug: rv('wr-slug'), repo: rv('wr-repo'), base: rv('wr-base') || 'main',
+                 setup_cmd: rv('wr-setup') || null, test_cmd: rv('wr-test') || null });
+  }
+  btn.disabled = true; msg.textContent = 'Saving workspace…';
+  try {
+    const r = await fetch('api/workspaces/' + id, {
+      method: 'PATCH', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        product_name: v('w-product'), canonical_project: v('w-canon'),
+        workspace_context: card.querySelector('.w-ctx').value,
+        clickup_list_id: v('w-culist'), slack_webhook_url: v('w-slack'),
+        clickup_enabled: card.querySelector('.w-cuon').checked, repos,
+      }),
+    });
+    const data = await r.json();
+    if (r.ok) {
+      msg.textContent = 'Workspace saved.' + (data.warning ? ' ' + data.warning : '');
+      await loadWorkspaces(); loadProjects(); refreshMemory(true);
+    } else msg.textContent = 'Error: ' + (data.detail || r.status);
+  } catch (e) { msg.textContent = 'Error: ' + e; }
+  btn.disabled = false;
+}
+
+async function createWorkspace(ev) {
+  ev.preventDefault();
+  const msg = document.getElementById('msg');
+  try {
+    const r = await fetch('api/workspaces', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ slug: document.getElementById('nw-slug').value.trim(),
+                             name: document.getElementById('nw-name').value.trim() }),
+    });
+    const data = await r.json();
+    msg.textContent = r.ok ? 'Workspace created — add repos below.' : 'Error: ' + (data.detail || r.status);
+    if (r.ok) { document.getElementById('nw-slug').value = ''; document.getElementById('nw-name').value = ''; loadWorkspaces(); }
+  } catch (e) { msg.textContent = 'Error: ' + e; }
+  return false;
+}
+
+async function setWsMember(wsId, username, member) {
+  try {
+    await fetch(`api/workspaces/${wsId}/members`, {
+      method: 'PUT', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ username, member }),
+    });
+    loadWorkspaces();
+  } catch (e) {}
+}
+
+loadWorkspaces();

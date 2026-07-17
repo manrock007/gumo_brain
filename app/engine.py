@@ -145,6 +145,7 @@ class Engine:
         # per-job mid-run steer handles: job_id -> {event, stage}. Populated while a
         # stage runs; an HTTP steer request sets the event to interrupt in place.
         self._steer: dict[str, dict] = {}
+        self.workspaces = None  # WorkspaceService, injected at startup (main.lifespan)
 
     def request_steer(self, job_id: str, note: str, via: str = "dashboard") -> str:
         """Human course-correction from the live session page. Returns the outcome:
@@ -608,6 +609,10 @@ class Engine:
             f"{evidence}{warnings}\n\n---\n{actions}"
         )
         await self._comment(job, gate_body, raw=True)
+        if self.workspaces:
+            await self.workspaces.notify_gate(
+                job, f"\u23f8\ufe0f {job.get('title') or job['issue_id']} — parked at the "
+                     f"P{stage} {stage_name(stage)} gate, waiting for a decision.")
         owner = (job.get("owner") or "").strip()
         if owner:
             await self.clickup.set_assignee(job.get("clickup_task_id") or "", owner)
@@ -840,6 +845,7 @@ class Engine:
         elif stage == 9:
             put("P1-prd.md", 6000); put("P3-design.md", 6000)
 
+        pname, brief = self._job_context(job)
         edited_note = ""
         if edited:
             edited_note = ("\n\nNOTE: a human edited these artifacts since the last stage — "
@@ -855,9 +861,9 @@ class Engine:
             redo_notes=redo_notes,
             evidence_note=edited_note,
             test_block=_test_block(target) if stage in (7, 8) else "",
-            canonical_project=self.settings.memory_canonical_project,
-            product_name=self.settings.product_name,
-            business_context=self.settings.business_context,
+            canonical_project=(self.workspaces.canonical_for(job.get("project") or "")
+                               if self.workspaces else self.settings.memory_canonical_project),
+            product_name=pname, business_context=brief,
         )
 
     # ---------- gumo-speed conveyor mirror (ClickUp custom fields) ----------
@@ -968,6 +974,13 @@ class Engine:
         except Exception:
             log.exception("PR field sync failed for %s (non-fatal)", job_id)
 
+    def _job_context(self, job: dict) -> tuple[str, str]:
+        """(product_name, briefing) — workspace-aware when injected (§12)."""
+        if self.workspaces:
+            ws = self.workspaces.for_job(job)
+            return self.workspaces.product_name_for(ws), self.workspaces.briefing(ws)
+        return self.settings.product_name, self.settings.business_context
+
     async def _comment(self, job, text, raw: bool = False):
         # ClickUp is best-effort visibility and NEVER drives progress (ENGINE.md
         # §7) — a comment failure must never propagate and corrupt control flow
@@ -1062,14 +1075,14 @@ class Engine:
         job_id = job["issue_id"]
         if v1:
             system = build_v1_fastlane_system(job, self.store.guidance_for(job_id),
-                                              product_name=self.settings.product_name)
+                                              product_name=self._job_context(job)[0])
         else:
             names = list(dict.fromkeys([stage_artifact(stage), "P1-prd.md"]))
             system = build_fastlane_system(
                 job=job, stage=stage,
                 inline_artifacts=self.store.artifact_contents(job_id, names),
                 guidance_entries=self.store.guidance_for(job_id),
-                product_name=self.settings.product_name,
+                product_name=self._job_context(job)[0],
             )
         messages = build_fastlane_messages(
             self.store.chat_for(job_id, stage)[:-1],  # exclude the turn being answered
@@ -1130,7 +1143,7 @@ class Engine:
                 prompt = build_v1_chat_prompt(
                     target=target, job=job, message=message,
                     transcript=self.store.chat_for(job_id, stage)[:-1],
-                    product_name=self.settings.product_name,
+                    product_name=self._job_context(job)[0],
                 )
             chat_dir = (self.settings.claude_chat_config_dir
                         if self.settings.session_persistence else None)
@@ -1150,7 +1163,7 @@ class Engine:
                 prompt = build_v1_chat_prompt(
                     target=target, job=job, message=message,
                     transcript=self.store.chat_for(job_id, stage)[:-1],
-                    product_name=self.settings.product_name,
+                    product_name=self._job_context(job)[0],
                 )
                 async with store_lock:
                     raw = await run_claude_stream(
@@ -1247,7 +1260,7 @@ class Engine:
                     target=target, branch=branch, job=job, stage=stage, message=message,
                     transcript=self.store.chat_for(job_id, stage)[:-1],  # exclude the turn being answered
                     inline_artifacts=inline,
-                    product_name=self.settings.product_name,
+                    product_name=self._job_context(job)[0],
                 )
                 # serialize on whichever store this run touches: the dedicated
                 # chat store when persistence is on, else the shared default
@@ -1314,15 +1327,19 @@ class Engine:
         self.store.set_status(job_id, "running")
 
         workspace = await prepare_feature_workspace(self.settings, target, branch, stage=0)
-        is_canonical = project == self.settings.memory_canonical_project
+        is_canonical = project == (self.workspaces.canonical_for(project)
+                                   if self.workspaces else self.settings.memory_canonical_project)
         pr_url = None
         pr_urls: list[str] = []  # every explicit PR_URL line across both runs
         for run in (1, 2):
             run_id = self.store.stage_run_open(job_id, stage=run, attempt=1)
+            bws = self.workspaces.for_project(project) if self.workspaces else None
             prompt = build_bootstrap_prompt(target=target, branch=branch, project=project,
                                             is_canonical=is_canonical, run=run,
-                                            product_name=self.settings.product_name,
-                                            business_context=self.settings.business_context)
+                                            product_name=(self.workspaces.product_name_for(bws)
+                                                          if self.workspaces else self.settings.product_name),
+                                            business_context=(self.workspaces.briefing(bws)
+                                                              if self.workspaces else self.settings.business_context))
             raw = await self._invoke(workspace, prompt,
                                      BASE_ALLOWED_TOOLS + target.allow,
                                      self.settings.claude_timeout_seconds)

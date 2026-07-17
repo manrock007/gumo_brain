@@ -116,6 +116,39 @@ CREATE TABLE IF NOT EXISTS prs (
     updated_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS workspaces (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    slug TEXT NOT NULL UNIQUE,       -- url-safe handle, e.g. 'app'
+    name TEXT NOT NULL,              -- display name, e.g. 'App'
+    product_name TEXT NOT NULL DEFAULT '',
+    workspace_context TEXT NOT NULL DEFAULT '',  -- injected into runs (§10 hierarchy)
+    canonical_project TEXT NOT NULL DEFAULT '',  -- project slug hosting .gumo/product
+    clickup_list_id TEXT NOT NULL DEFAULT '',    -- empty + disabled -> dashboard-only
+    clickup_enabled INTEGER NOT NULL DEFAULT 0,
+    slack_webhook_url TEXT NOT NULL DEFAULT '',  -- gate nudges when ClickUp is off (or always)
+    gate_mode_default TEXT NOT NULL DEFAULT 'full',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS workspace_repos (
+    workspace_id INTEGER NOT NULL,
+    slug TEXT NOT NULL,              -- project slug; UNIQUE across ALL workspaces
+    repo TEXT NOT NULL,              -- owner/name
+    base TEXT NOT NULL DEFAULT 'main',
+    setup_cmd TEXT,
+    test_cmd TEXT,
+    allow TEXT NOT NULL DEFAULT '[]',  -- JSON list of extra allowed tools
+    PRIMARY KEY (workspace_id, slug)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_workspace_repos_slug ON workspace_repos(slug);
+
+CREATE TABLE IF NOT EXISTS workspace_members (
+    workspace_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    PRIMARY KEY (workspace_id, user_id)
+);
+
 CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     username TEXT NOT NULL UNIQUE,
@@ -185,6 +218,7 @@ MIGRATIONS = {  # table -> columns added after that table first shipped (in-plac
         "gate_mode": "TEXT NOT NULL DEFAULT 'full'",
         "steer_note": "TEXT DEFAULT ''",  # human's live steer, moved into resume_answer on interrupt
         "auto_retries": "INTEGER NOT NULL DEFAULT 0",  # transient-error retries spent (max 1; human redo resets)
+        "workspace_id": "INTEGER",  # owning workspace (Phase 2); NULL rows adopted by migration
     },
     "stage_runs": {
         "session_id": "TEXT DEFAULT ''",
@@ -350,6 +384,136 @@ class JobStore:
                 (cutoff,),
             ).fetchall()
             return [dict(r) for r in rows]
+
+    # ---------- workspaces (docs/ENGINE.md §12) ----------
+
+    def workspace_list(self) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute("SELECT * FROM workspaces ORDER BY name").fetchall()
+            return [dict(r) for r in rows]
+
+    def workspace_get(self, workspace_id: int) -> dict | None:
+        """By numeric id ONLY — slugs may be all-numeric, so id-vs-slug must
+        never be guessed from the value (sentry finding 1595569)."""
+        with self._conn() as c:
+            row = c.execute("SELECT * FROM workspaces WHERE id = ?",
+                            (int(workspace_id),)).fetchone()
+            return dict(row) if row else None
+
+    def workspace_get_by_slug(self, slug: str) -> dict | None:
+        with self._conn() as c:
+            row = c.execute("SELECT * FROM workspaces WHERE slug = ?",
+                            (str(slug),)).fetchone()
+            return dict(row) if row else None
+
+    def workspace_create(self, slug: str, name: str, **fields) -> dict:
+        now = time.time()
+        cols = ", ".join(fields)
+        marks = ", ".join("?" for _ in fields)
+        with self._conn() as c:
+            c.execute(
+                f"INSERT INTO workspaces (slug, name{', ' + cols if cols else ''}, created_at, updated_at) "
+                f"VALUES (?, ?{', ' + marks if marks else ''}, ?, ?)",
+                (slug, name, *fields.values(), now, now),
+            )
+        return self.workspace_get_by_slug(slug)
+
+    def workspace_set(self, workspace_id: int, **fields):
+        cols = ", ".join(f"{k} = ?" for k in fields)
+        with self._conn() as c:
+            c.execute(f"UPDATE workspaces SET {cols}, updated_at = ? WHERE id = ?",
+                      (*fields.values(), time.time(), workspace_id))
+
+    def workspace_repos_for(self, workspace_id: int) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute("SELECT * FROM workspace_repos WHERE workspace_id = ? ORDER BY slug",
+                             (workspace_id,)).fetchall()
+            return [dict(r) for r in rows]
+
+    def workspace_repos_replace(self, workspace_id: int, rows: list[dict]):
+        """Replace a workspace's repo set in one transaction. The UNIQUE index
+        on slug enforces global slug uniqueness — violations raise IntegrityError."""
+        with self._conn() as c:
+            c.execute("DELETE FROM workspace_repos WHERE workspace_id = ?", (workspace_id,))
+            for r in rows:
+                c.execute(
+                    "INSERT INTO workspace_repos (workspace_id, slug, repo, base, setup_cmd, test_cmd, allow) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (workspace_id, r["slug"], r["repo"], r.get("base") or "main",
+                     r.get("setup_cmd"), r.get("test_cmd"), json.dumps(r.get("allow") or [])),
+                )
+
+    def repo_rows_all(self) -> list[dict]:
+        """Every repo row across workspaces (slug is globally unique)."""
+        with self._conn() as c:
+            rows = c.execute("SELECT * FROM workspace_repos ORDER BY slug").fetchall()
+            return [dict(r) for r in rows]
+
+    def workspace_for_slug(self, project_slug: str) -> dict | None:
+        """The workspace owning a project slug — webhook routing + canonical
+        memory resolution."""
+        with self._conn() as c:
+            row = c.execute(
+                """SELECT w.* FROM workspace_repos r JOIN workspaces w ON w.id = r.workspace_id
+                   WHERE r.slug = ?""", (project_slug,)).fetchone()
+            return dict(row) if row else None
+
+    def workspace_members_get(self, workspace_id: int) -> list[str]:
+        with self._conn() as c:
+            rows = c.execute(
+                """SELECT u.username FROM workspace_members m JOIN users u ON u.id = m.user_id
+                   WHERE m.workspace_id = ? ORDER BY u.username""", (workspace_id,)).fetchall()
+            return [r["username"] for r in rows]
+
+    def workspace_member_set(self, workspace_id: int, user_id: int, member: bool):
+        with self._conn() as c:
+            if member:
+                c.execute("INSERT OR IGNORE INTO workspace_members (workspace_id, user_id) VALUES (?, ?)",
+                          (workspace_id, user_id))
+            else:
+                c.execute("DELETE FROM workspace_members WHERE workspace_id = ? AND user_id = ?",
+                          (workspace_id, user_id))
+
+    def workspace_ids_for_user(self, user_id: int) -> set[int]:
+        with self._conn() as c:
+            rows = c.execute("SELECT workspace_id FROM workspace_members WHERE user_id = ?",
+                             (user_id,)).fetchall()
+            return {r["workspace_id"] for r in rows}
+
+    def jobs_adopt_workspace(self, workspace_id: int):
+        """Migration helper: attach every unowned job to the given workspace."""
+        with self._conn() as c:
+            c.execute("UPDATE jobs SET workspace_id = ? WHERE workspace_id IS NULL",
+                      (workspace_id,))
+
+    def migrate_default_workspace(self, slug: str, name: str, fields: dict,
+                                  repos: list[dict], user_ids: list[int]) -> dict:
+        """The upgrade migration in ONE transaction: workspace + repos + job
+        adoption + memberships commit together or not at all — a crash can
+        never leave a half-built default that the existence guard would then
+        treat as migrated (sentry finding 1595858)."""
+        now = time.time()
+        cols = ", ".join(fields)
+        marks = ", ".join("?" for _ in fields)
+        with self._conn() as c:
+            cur = c.execute(
+                f"INSERT INTO workspaces (slug, name{', ' + cols if cols else ''}, created_at, updated_at) "
+                f"VALUES (?, ?{', ' + marks if marks else ''}, ?, ?)",
+                (slug, name, *fields.values(), now, now),
+            )
+            ws_id = cur.lastrowid
+            for r in repos:
+                c.execute(
+                    "INSERT INTO workspace_repos (workspace_id, slug, repo, base, setup_cmd, test_cmd, allow) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (ws_id, r["slug"], r["repo"], r.get("base") or "main",
+                     r.get("setup_cmd"), r.get("test_cmd"), json.dumps(r.get("allow") or [])),
+                )
+            c.execute("UPDATE jobs SET workspace_id = ? WHERE workspace_id IS NULL", (ws_id,))
+            for uid in user_ids:
+                c.execute("INSERT OR IGNORE INTO workspace_members (workspace_id, user_id) VALUES (?, ?)",
+                          (ws_id, uid))
+        return self.workspace_get(ws_id)
 
     # ---------- users & auth sessions (docs/ENGINE.md §11) ----------
 

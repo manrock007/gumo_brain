@@ -89,6 +89,7 @@ class Worker:
         self.clickup = ClickUp(settings)
         self.locks = RepoLocks()
         self.engine = Engine(settings, store, self.clickup, locks=self.locks)
+        self.workspaces = None  # WorkspaceService, injected at startup (main.lifespan)
 
     def _enqueue(self, job_id: str, priority: int):
         self.queue.put_nowait((priority, next(self._seq), job_id, time.time()))
@@ -117,8 +118,24 @@ class Worker:
                 return f"issue {issue_id} in cooldown ({existing['status']})"
 
         self.store.insert(issue_id, source=source, forced=forced, title=title, project=project)
+        self._stamp_workspace(issue_id, project)
         self._enqueue(issue_id, PRIO_SWEEP if source == "sweep" else PRIO_SENTRY)
         return f"issue {issue_id} queued"
+
+    def _job_context(self, job: dict) -> tuple[str, str]:
+        """(product_name, briefing) for a job's prompts — workspace-aware when
+        the service is injected, instance-wide otherwise (§10/§12)."""
+        if self.workspaces:
+            ws = self.workspaces.for_job(job)
+            return self.workspaces.product_name_for(ws), self.workspaces.briefing(ws)
+        return self.settings.product_name, self.settings.business_context
+
+    def _stamp_workspace(self, job_id: str, project: str):
+        """Record the owning workspace on the job row (slugs are global)."""
+        if self.workspaces and project:
+            ws = self.workspaces.for_project(project)
+            if ws:
+                self.store.set_fields(job_id, workspace_id=ws["id"])
 
     def intake_task(self, job_id: str, title: str, project: str, request: str,
                     clickup_task_id: str | None = None,
@@ -141,6 +158,7 @@ class Worker:
             clickup_task_id=clickup_task_id or "",
             clickup_task_url=clickup_task_url or "",
         )
+        self._stamp_workspace(job_id, project)
         self._enqueue(job_id, PRIO_HUMAN)
         return f"request {job_id} queued"
 
@@ -189,6 +207,7 @@ class Worker:
             owner=owner,
             related_jobs=related_jobs,
         )
+        self._stamp_workspace(job_id, project)
         self._enqueue(job_id, PRIO_HUMAN)
         return f"feature {job_id} queued at P0"
 
@@ -199,6 +218,7 @@ class Worker:
             return f"memory bootstrap for {project} already in progress ({existing['status']})"
         self.store.insert(job_id, source="manual", forced=True,
                           title=f"memory bootstrap: {project}", project=project, kind="memory")
+        self._stamp_workspace(job_id, project)
         self._enqueue(job_id, PRIO_HUMAN)
         return f"memory bootstrap for {project} queued"
 
@@ -287,6 +307,10 @@ class Worker:
             project=project_slug,
             issue_url=issue.get("permalink", ""),
         )
+        # webhook intake has no project yet — stamp the workspace the moment
+        # the slug is known (before any skip path), or webhook-sourced jobs
+        # stay invisible to workspace members forever (sentry finding 1595670)
+        self._stamp_workspace(issue_id, project_slug)
 
         if phase == 1:
             grade = grade_issue(issue, self.settings, forced=forced)
@@ -311,10 +335,15 @@ class Worker:
         row = self.store.get(issue_id)
         task_id = row.get("clickup_task_id")
         if not task_id:
-            created = await self.clickup.create_task(
-                name=f"[{project_slug}] {issue.get('title', 'unknown')}",
-                description=self._ticket_description(issue, row),
-            )
+            cu_on, cu_list = (self.workspaces.clickup_route(project_slug)
+                              if self.workspaces else (True, None))
+            created = None
+            if cu_on:
+                created = await self.clickup.create_task(
+                    name=f"[{project_slug}] {issue.get('title', 'unknown')}",
+                    description=self._ticket_description(issue, row),
+                    list_id=cu_list,
+                )
             if created:
                 task_id, task_url = created
                 self.store.set_fields(issue_id, clickup_task_id=task_id, clickup_task_url=task_url)
@@ -348,6 +377,7 @@ class Worker:
             # with no turn gets an immediate 'done' and reads "run finished".
             broker.publish(issue_id, "status",
                            "waiting for the repository workspace (another run may be using it)")
+            pname, brief = self._job_context(row)
             async with self.locks.for_repo(target.repo):  # workspace toucher
                 broker.publish(issue_id, "status", "preparing the repository workspace")
                 if phase == 2:
@@ -356,16 +386,14 @@ class Worker:
                         clickup_task_id=task_id,
                         analysis=row.get("analysis") or "(analysis missing)",
                         guidance=row.get("guidance") or "(no guidance recorded)",
-                        product_name=self.settings.product_name,
-                        business_context=self.settings.business_context,
+                        product_name=pname, business_context=brief,
                     )
                     workspace = await prepare_workspace(self.settings, target, branch, keep_branch=True)
                 else:
                     prompt = build_fix_prompt(
                         target=target, branch=branch, issue=issue_info, stacktrace=stacktrace,
                         clickup_task_id=task_id,
-                        product_name=self.settings.product_name,
-                        business_context=self.settings.business_context,
+                        product_name=pname, business_context=brief,
                     )
                     workspace = await prepare_workspace(self.settings, target, branch)
 
@@ -438,6 +466,7 @@ class Worker:
         broker = self.engine.stage_broker
         broker.start(job_id)
         try:
+            pname, brief = self._job_context(row)
             broker.publish(job_id, "status", "preparing the repository workspace")
             if phase == 2:
                 prompt = build_task_implement_prompt(
@@ -445,16 +474,14 @@ class Worker:
                     clickup_task_id=task_id or None,
                     analysis=row.get("analysis") or "(analysis missing)",
                     guidance=row.get("guidance") or "(no guidance recorded)",
-                    product_name=self.settings.product_name,
-                    business_context=self.settings.business_context,
+                    product_name=pname, business_context=brief,
                 )
                 workspace = await prepare_workspace(self.settings, target, branch, keep_branch=True)
             else:
                 prompt = build_task_plan_prompt(
                     target=target, branch=branch, task=task_info, request=request_text,
                     clickup_task_id=task_id or None,
-                    product_name=self.settings.product_name,
-                    business_context=self.settings.business_context,
+                    product_name=pname, business_context=brief,
                 )
                 workspace = await prepare_workspace(self.settings, target, branch)
 
@@ -528,6 +555,11 @@ class Worker:
             f"to drop this — or answer directly on the {ENGINE_NAME} dashboard.",
         )
         await self.clickup.set_status(task_id, "awaiting_input")
+        job = self.store.get(job_id)
+        if self.workspaces and job:
+            await self.workspaces.notify_gate(
+                job, f"\u23f8\ufe0f {job.get('title') or job_id} — waiting for your decision "
+                     "before any code changes.")
 
     def request_steer(self, job_id: str, note: str, via: str = "dashboard") -> str:
         """Live mid-run course-correction from the session page. Delegates to the
@@ -1205,13 +1237,13 @@ class Worker:
         if target is None or not branch:
             self.store.pr_set(pr["url"], detail=f"no repo target for {pr['repo']}")
             return None
+        spname, sbrief = self._job_context(self.store.get(pr["job_id"]) or {})
         prompt = build_shepherd_prompt(
             target=target, pr_url=pr["url"], branch=branch,
             findings=[{"id": c["id"], "path": c.get("path"),
                        "line": c.get("line") or c.get("original_line"),
                        "body": c.get("body")} for c in findings],
-            product_name=self.settings.product_name,
-            business_context=self.settings.business_context)
+            product_name=spname, business_context=sbrief)
         # a DEDICATED clone + lock, NOT the main repo lock: a fix run can hold a
         # lock for a full claude timeout, and taking the main one would starve
         # pipeline stages / sentry jobs on that repo for the duration. The run
