@@ -46,6 +46,7 @@ from .fixer import (
 from .github import GitHub
 from .memory import MemoryReader
 from .prompts import _test_block, build_v1_chat_prompt, build_v1_fastlane_system
+from . import transcripts
 
 log = logging.getLogger("brain.engine")
 
@@ -262,7 +263,18 @@ class Engine:
         self._steer[job_id] = {"event": steer_ev, "stage": stage}
         self.stage_broker.start(job_id)
 
+        # run transcript (§13): every stage run records its activity write-through,
+        # so the dashboard can replay what the engine did after the live stream is
+        # gone. The broker stays the live path; the writer is the durable one.
+        t_key = f"P{stage}-run{run_id}"
+        t_writer = transcripts.open_writer(
+            self.settings, job_id, t_key,
+            {"kind": "stage", "stage": stage, "stage_name": stage_name(stage),
+             "attempt": attempt, "run_id": run_id})
+        self.store.stage_run_set_transcript(run_id, t_key)
+
         def publish(event, data):
+            t_writer.write(event, data)
             self.stage_broker.publish(job_id, event, data)
 
         self.store.set_status(job_id, "running")
@@ -284,6 +296,11 @@ class Engine:
         finally:
             self._steer.pop(job_id, None)
             self.stage_broker.finish(job_id)
+            # stamp the closing status from the telemetry row (whichever path
+            # closed it) so a replay shows how the run actually ended
+            row = next((r for r in self.store.stage_runs_for(job_id)
+                        if r["id"] == run_id), None)
+            t_writer.close((row or {}).get("result_status") or "unknown")
 
     async def _run_stage_inner(self, job: dict, stage: int, run_id: int, target,
                                branch: str, queued_at: float | None,

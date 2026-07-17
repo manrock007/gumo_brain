@@ -217,6 +217,10 @@ class Settings(BaseSettings):
     # degrade to fresh runs (labeled), and sessions die with the container.
     session_persistence: bool = False
     session_ttl_days: int = 14
+    # Run transcripts (docs/ENGINE.md §13): replayable activity per run, written
+    # under data_dir/transcripts and pruned by the same daily janitor. Always on —
+    # they are plain files with a hard per-run cap, not a substrate change.
+    transcript_ttl_days: int = 30
     max_asks_per_stage: int = 3         # STAGE_ASK resumes per (job, stage, attempt)
     default_gate_mode: str = "full"     # full = every stage parks | light = P0/P1/P3/P9 + guards
 

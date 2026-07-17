@@ -30,7 +30,7 @@ from .auth import (
     verify_login,
 )
 from .chatstream import ChatBroker
-from .config import ENGINE_NAME, Settings, get_settings
+from .config import ENGINE_NAME, Settings, get_settings, validate_repo_map
 from .db import JobStore
 from .feature_prompts import stage_name
 from .fixer import ensure_session_store
@@ -38,6 +38,7 @@ from .memory import MemoryReader
 from .sentry_api import extract_issue_ref, verify_signature
 from .worker import GateConflict, Worker
 from .workspaces import WorkspaceError, WorkspaceNotFound, WorkspaceService
+from . import transcripts
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 log = logging.getLogger("brain")
@@ -74,6 +75,10 @@ async def lifespan(app: FastAPI):
     workspaces = WorkspaceService(store, settings)
     workspaces.ensure_default()  # upgrade path: wrap the §10 context into a workspace
     app.state.workspaces = workspaces
+    # first-run wizard (§14): a deployment that has already processed jobs is
+    # not a first run — never greet an upgrading operator with onboarding
+    if "setup_done" not in store.config_all() and store.job_count() > 0:
+        store.config_set("setup_done", "1")
     worker = Worker(settings, store)
     worker.workspaces = workspaces
     worker.engine.workspaces = workspaces
@@ -200,14 +205,26 @@ async def me(user: dict = Depends(require_user)):
 
 
 @app.post("/api/me/password")
-async def change_password(body: PasswordBody, user: dict = Depends(require_user)):
+async def change_password(body: PasswordBody, response: Response,
+                          user: dict = Depends(require_user)):
     store: JobStore = app.state.store
     verify_login(store, settings, user["username"], body.current)  # re-authenticate
     if len(body.new) < 8:
         raise HTTPException(status_code=400, detail="new password must be at least 8 characters")
     store.user_set(user["username"], pw_hash=hash_password(body.new), must_change_pw=0)
-    store.auth_sessions_revoke_user(user["id"])  # sign out everywhere, incl. this session
-    return {"ok": True, "detail": "password changed — sign in again"}
+    # rotate, don't strand: revoke EVERY session (any stolen token dies), then
+    # re-issue for this browser so the person stays signed in. Dumping them to
+    # the login page mid first-sign-in made a successful temp-password change
+    # look like a failure — the flag was already cleared, but all they saw was
+    # a logout and, on any error, a message rendered into the hidden dashboard.
+    store.auth_sessions_revoke_user(user["id"])
+    token = issue_session(store, settings, user)
+    response.set_cookie(
+        SESSION_COOKIE, token, httponly=True, samesite="lax",
+        secure=settings.session_cookie_secure,
+        max_age=settings.auth_session_ttl_days * 86400, path="/",
+    )
+    return {"ok": True, "detail": "password changed — other sessions signed out"}
 
 
 @app.get("/api/users", dependencies=[Depends(require_admin)])
@@ -259,6 +276,38 @@ async def users_patch(username: str, body: UserPatchBody,
                        failed_attempts=0, locked_until=None)
         store.auth_sessions_revoke_user(user["id"])
     return _public_user(store.user_get(username))
+
+
+# ---------- first-run setup (docs/ENGINE.md §14) ----------
+
+
+@app.get("/api/setup", dependencies=[Depends(require_admin)])
+async def setup_status():
+    """The first-run checklist: auto-detected live state per onboarding step.
+    `needed` flips off once dismissed — and deployments that already processed
+    jobs are auto-dismissed at boot, so upgrades never see the wizard."""
+    store: JobStore = app.state.store
+    reader = MemoryReader(settings)
+    live_map = json.loads(settings.repo_map)
+    # a fresh install still carries the code-default Gumo context and repos —
+    # "configured" means the operator actually made them theirs (semantic
+    # compare: the workspace migration re-serializes the same default map)
+    default_map = validate_repo_map(json.loads(_default_settings.repo_map))
+    steps = {
+        "business_context": settings.business_context != _default_settings.business_context
+                            or settings.product_name != _default_settings.product_name,
+        "repos": live_map != default_map,
+        "github_token": bool(settings.github_token),
+        "memory": any(reader.cached(slug)["exists"] for slug in live_map),
+        "team": store.user_count() > 1,
+    }
+    return {"needed": "setup_done" not in store.config_all(), "steps": steps}
+
+
+@app.post("/api/setup/dismiss", dependencies=[Depends(require_admin)])
+async def setup_dismiss():
+    app.state.store.config_set("setup_done", "1")
+    return {"ok": True}
 
 
 # ---------- workspaces (docs/ENGINE.md §12) ----------
@@ -517,7 +566,11 @@ async def reset_context():
     clobber the workspace-merged map, and we re-sync it to be safe (finding
     1595745/0 — a default-map settings.repo_map would silently skip sentry
     issues for workspace-only projects until the next workspace edit)."""
-    app.state.store.config_clear()
+    store: JobStore = app.state.store
+    setup_done = "setup_done" in store.config_all()
+    store.config_clear()
+    if setup_done:  # onboarding state is not a context override — a reset must
+        store.config_set("setup_done", "1")  # not resurrect the first-run wizard
     # memory_canonical_project included: a cleared legacy override must not
     # linger live until restart (finding 1595794/1). repo_map is deliberately
     # NOT reset — workspaces own it; the sync below rebuilds the merged map.
@@ -836,6 +889,9 @@ async def session_snapshot(job_id: str, user: dict = Depends(require_user)):
             "updated_at": job.get("updated_at"),
         },
         "runs": store.stage_runs_for(job_id) if feature else [],
+        # recorded run transcripts (§13): the index the Activity accordion is
+        # built from — bodies are fetched per run on expand
+        "transcripts": transcripts.list_for_job(settings, job_id),
         "guidance": store.guidance_for(job_id),
         "artifacts": artifacts,
         # every PR this packet opened, with lifecycle state (draft -> ready ->
@@ -854,6 +910,25 @@ async def session_snapshot(job_id: str, user: dict = Depends(require_user)):
         "steer_available": feature and job["status"] == "running",
         "steer_immediate": bool(settings.session_persistence),
     }
+
+
+@app.get("/api/jobs/{job_id}/transcripts")
+async def job_transcripts(job_id: str, user: dict = Depends(require_user)):
+    """The job's recorded run transcripts (docs/ENGINE.md §13): key + header +
+    size per run, oldest first — the index behind the Activity accordion."""
+    _job_scoped(job_id, user)
+    return {"transcripts": transcripts.list_for_job(settings, job_id)}
+
+
+@app.get("/api/jobs/{job_id}/transcripts/{key}")
+async def job_transcript(job_id: str, key: str, user: dict = Depends(require_user)):
+    """One run's replayable activity — the same status/delta events the live
+    session stream showed, read back from the write-through JSONL."""
+    _job_scoped(job_id, user)
+    events = transcripts.read_events(settings, job_id, key)
+    if events is None:
+        raise HTTPException(status_code=404, detail=f"no transcript '{key}'")
+    return {"key": key, "events": events}
 
 
 @app.get("/api/jobs/{job_id}/session/stream")

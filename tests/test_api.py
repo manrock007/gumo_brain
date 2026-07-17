@@ -383,13 +383,104 @@ def test_lockout_after_repeated_failures(client):
     assert r.status_code == 429  # locked even with the right password
 
 
-def test_change_password_revokes_sessions(client):
+def test_setup_wizard_lifecycle(client):
+    """§14: a fresh install gets the checklist with untouched steps unticked;
+    real configuration ticks them; dismiss persists and survives a context
+    reset; members never see instance onboarding."""
+    data = client.get("/api/setup", headers=AUTH).json()
+    assert data["needed"] is True
+    # code-default Gumo context/repos are not "configured" — they must be made
+    # the operator's own (semantic compare vs the normalized default map)
+    assert data["steps"]["business_context"] is False
+    assert data["steps"]["repos"] is False
+    assert data["steps"]["team"] is False
+    client.put("/api/context", headers=AUTH, json={"product_name": "Acme"})
+    assert client.get("/api/setup", headers=AUTH).json()["steps"]["business_context"] is True
+    client.post("/api/users", headers=AUTH, json={"username": "m1", "password": "password1"})
+    assert client.get("/api/setup", headers=AUTH).json()["steps"]["team"] is True
+    mem = {"Authorization": "Basic " + base64.b64encode(b"m1:password1").decode()}
+    assert client.get("/api/setup", headers=mem).status_code == 403
+    assert client.post("/api/setup/dismiss", headers=AUTH).status_code == 200
+    assert client.get("/api/setup", headers=AUTH).json()["needed"] is False
+    # a context reset clears overrides but must NOT resurrect the wizard
+    client.delete("/api/context", headers=AUTH)
+    assert client.get("/api/setup", headers=AUTH).json()["needed"] is False
+
+
+def test_run_transcripts_recorded_and_scoped(client):
+    """§13: run transcripts are written write-through, indexed and replayable
+    via the API, and 404-scoped exactly like the job they belong to."""
+    from app import transcripts
+
+    store = client.app.state.store
+    settings = client.app.state.settings
+    ws = client.get("/api/workspaces", headers=AUTH).json()[0]
+    store.insert("task-tr1", source="manual", title="t", project="gumo", kind="task")
+    store.set_fields("task-tr1", workspace_id=ws["id"])
+    # simulate a run writing its activity through the writer
+    w = transcripts.open_writer(settings, "task-tr1", "v1-p1-123", {"kind": "v1", "phase": 1})
+    w.write("status", "Read app/x.py")
+    w.write("delta", "part one ")
+    w.write("delta", "part two")
+    w.close("pr_opened")
+
+    idx = client.get("/api/jobs/task-tr1/transcripts", headers=AUTH).json()["transcripts"]
+    assert [t["key"] for t in idx] == ["v1-p1-123"]
+    assert idx[0]["header"] == {"kind": "v1", "phase": 1}
+    snap = client.get("/api/jobs/task-tr1/session", headers=AUTH).json()
+    assert [t["key"] for t in snap["transcripts"]] == ["v1-p1-123"]
+    ev = client.get("/api/jobs/task-tr1/transcripts/v1-p1-123", headers=AUTH).json()["events"]
+    assert [e["e"] for e in ev] == ["start", "status", "delta", "delta", "end"]
+    assert ev[-1]["d"] == "pr_opened"
+    # unknown and traversal-shaped keys are clean 404s, never file errors
+    assert client.get("/api/jobs/task-tr1/transcripts/none", headers=AUTH).status_code == 404
+    assert client.get("/api/jobs/task-tr1/transcripts/..%2Fbrain.db",
+                      headers=AUTH).status_code == 404
+    # membership scoping matches the job: no workspace -> 404, assigned -> 200
+    client.post("/api/users", headers=AUTH, json={"username": "tmem", "password": "password1"})
+    mem = {"Authorization": "Basic " + base64.b64encode(b"tmem:password1").decode()}
+    assert client.get("/api/jobs/task-tr1/transcripts", headers=mem).status_code == 404
+    assert client.get("/api/jobs/task-tr1/transcripts/v1-p1-123",
+                      headers=mem).status_code == 404
+    client.put(f"/api/workspaces/{ws['id']}/members", headers=AUTH,
+               json={"username": "tmem", "member": True})
+    assert client.get("/api/jobs/task-tr1/transcripts", headers=mem).status_code == 200
+
+
+def test_transcript_writer_cap_and_prune(client):
+    """The writer caps at 2MB with an explicit marker and never buffers; the
+    janitor prunes by mtime."""
+    from app import transcripts
+
+    settings = client.app.state.settings
+    w = transcripts.open_writer(settings, "capjob", "big", {})
+    w._bytes = transcripts.TRANSCRIPT_CAP_BYTES  # simulate a full file
+    w.write("delta", "overflow")
+    w.write("delta", "silently dropped")
+    w.close("ok")
+    ev = transcripts.read_events(settings, "capjob", "big")
+    assert [e["e"] for e in ev] == ["start", "truncated"]
+    assert transcripts.prune(settings, ttl_days=-1) == 1  # everything is "old"
+    assert transcripts.read_events(settings, "capjob", "big") is None
+
+
+def test_change_password_rotates_session(client):
+    """A self password change revokes every OTHER session and the old token,
+    but the caller stays signed in on a freshly rotated cookie — being dumped
+    to the login page made a successful temp-password change look broken."""
     client.post("/api/users", headers=AUTH,
                 json={"username": "dev3", "password": "devpass123"})
     login = client.post("/api/login", json={"username": "dev3", "password": "devpass123"})
     assert login.status_code == 200
+    old_token = client.cookies.get("ctrlloop_session")
     r = client.post("/api/me/password", json={"current": "devpass123", "new": "newpass456"})
     assert r.status_code == 200
-    assert client.get("/api/me").status_code == 401  # old session revoked
+    new_token = client.cookies.get("ctrlloop_session")
+    assert new_token and new_token != old_token  # rotated, not reused
+    me = client.get("/api/me")  # the fresh cookie keeps this browser signed in
+    assert me.status_code == 200 and me.json()["must_change_pw"] is False
+    # the pre-change token (any other device/session) is dead
+    client.cookies.set("ctrlloop_session", old_token)
+    assert client.get("/api/me").status_code == 401
     fresh = {"Authorization": "Basic " + base64.b64encode(b"dev3:newpass456").decode()}
     assert client.get("/api/me", headers=fresh).json()["must_change_pw"] is False

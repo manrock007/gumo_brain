@@ -498,3 +498,45 @@ service rebuilds the merged map into live Settings after every edit.
 - **Slack gate nudges**: at every gate park the workspace's incoming-webhook
   (if set) receives the job, stage, and a dashboard deep link. Best-effort,
   never drives control flow.
+
+## 13. Run transcripts — the replayable activity record
+
+The live session stream (SSE via the stage broker) is ephemeral: subscribe
+late or reload and the activity is gone — the dashboard chat showed only the
+human↔engine messages, never what the engine actually *did*. Transcripts fix
+that: **every stage run and every v1 fix run tees its stream events —
+`status` (one line per tool call) and `delta` (assistant text) — through a
+write-through JSONL writer** under `data_dir/transcripts/<job>/<key>.jsonl`.
+
+- **Write-through, fail-open**: each line is flushed as written (a crash
+  keeps everything up to it); transcript I/O errors disable the writer and
+  never break a run. Hard 2MB per-run cap with an explicit `truncated`
+  marker line.
+- **Keys**: stage runs use `P<stage>-run<stage_runs.id>` and stamp the key on
+  the `stage_runs.transcript` column; v1 runs use `v1-p<phase>-<ts>`.
+  Keys and job ids are validated against a safe-segment pattern — traversal
+  shapes read as absent (404), never as file errors.
+- **API**: `GET /api/jobs/{id}/transcripts` (index: key + header + size, also
+  inlined in the session snapshot) and `GET /api/jobs/{id}/transcripts/{key}`
+  (parsed events). Both scoped through the same 404-membership gate as the
+  job itself.
+- **UI**: lazy-loading "Activity" accordions — per attempt inside each stage
+  card, per run in the v1 detail pane — rendering the same status/delta
+  visuals as the live log.
+- **Retention**: the daily janitor prunes by file mtime after
+  `TRANSCRIPT_TTL_DAYS` (default 30), independent of session persistence.
+  Transcripts are replay history, not resume state: no keep-set.
+
+## 14. First-run setup
+
+`GET /api/setup` (admin-only) returns a checklist whose steps auto-detect
+from live state: business context / product name changed from the code
+defaults, workspace repos changed from the default map (semantic compare
+against the normalized default), GitHub token present, any product memory
+cached, more than one user. The dashboard shows the wizard card to admins
+until `POST /api/setup/dismiss` writes `setup_done` to app_config.
+Deployments that already processed jobs are auto-dismissed at boot, and a
+context reset (`DELETE /api/context`) preserves the flag — upgrades and
+resets never resurrect onboarding. Members are never shown instance
+onboarding; an unassigned member instead gets an inbox hint naming the
+fix ("ask your admin for workspace access").

@@ -14,7 +14,8 @@ Four job kinds:
 | `feature` | dashboard (title or ClickUp URL) | **P0 Intake → P9 Ship, human gate after every stage** |
 | `memory` | dashboard, per project | bootstrap `.gumo/` product memory → draft PR |
 
-The engine's three core mechanics (full spec: **[docs/ENGINE.md](docs/ENGINE.md)**):
+The engine's three core mechanics (full spec: **[docs/ENGINE.md](docs/ENGINE.md)**;
+running an instance — install/backup/upgrade: **[docs/OPERATIONS.md](docs/OPERATIONS.md)**):
 
 - **Staged pipeline with gates.** Features run P0 Intake / P1 PRD / P2 Recon /
   P3 Design / P4 Plan / P5–P6 Build / P7 Test / P8 Review / P9 Ship — one headless run
