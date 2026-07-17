@@ -117,10 +117,16 @@ def list_for_job(settings, job_id: str) -> list[dict]:
     base = _job_dir(settings, job_id)
     if base is None or not base.is_dir():
         return []
+    files = []
+    for f in base.glob("*.jsonl"):
+        try:
+            st = f.stat()  # ONE stat per file: sort key and entry must agree
+        except OSError:
+            continue  # pruned between glob and stat — absent, not an error
+        files.append((st.st_mtime, st.st_size, f))
     out = []
-    for f in sorted(base.glob("*.jsonl"), key=lambda p: p.stat().st_mtime):
-        entry = {"key": f.stem, "size": f.stat().st_size, "mtime": f.stat().st_mtime,
-                 "header": {}}
+    for mtime, size, f in sorted(files, key=lambda t: t[0]):
+        entry = {"key": f.stem, "size": size, "mtime": mtime, "header": {}}
         try:
             with open(f, encoding="utf-8") as fh:
                 first = json.loads(fh.readline() or "{}")
