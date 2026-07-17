@@ -92,6 +92,110 @@ def test_memory_endpoints(client):
     assert r.status_code == 404
 
 
+def test_context_roundtrip(client):
+    r = client.get("/api/context", headers=AUTH)
+    assert r.status_code == 200
+    data = r.json()
+    assert data["context"]["product_name"] == "Gumo"
+    assert "gumo" in data["context"]["repo_map"]
+    assert data["overridden"] == []
+    assert data["defaults"]["canonical_project"] == "gumo"
+
+    # invalid payloads change nothing (atomic, fail-closed)
+    r = client.put("/api/context", headers=AUTH,
+                   json={"repo_map": {"x": {"repo": "not-owner-name"}}})
+    assert r.status_code == 400
+    r = client.put("/api/context", headers=AUTH,
+                   json={"repo_map": {"x": {"repo": "o/r"}}})  # canonical 'gumo' missing
+    assert r.status_code == 400
+    assert client.get("/api/context", headers=AUTH).json()["overridden"] == []
+
+    body = {
+        "product_name": "Acme",
+        "business_context": "Acme builds rockets.",
+        "repo_map": {"api": {"repo": "acme/api", "base": "dev", "test_cmd": "pytest"},
+                     "app": {"repo": "acme/app"}},
+        "canonical_project": "api",
+    }
+    r = client.put("/api/context", headers=AUTH, json=body)
+    assert r.status_code == 200
+    data = r.json()
+    assert data["context"]["product_name"] == "Acme"
+    assert data["context"]["canonical_project"] == "api"
+    assert data["context"]["repo_map"]["app"]["base"] == "main"  # normalized default
+    assert set(data["overridden"]) == {"product_name", "business_context",
+                                       "repo_map", "memory_canonical_project"}
+    # the rest of the app follows the new map immediately
+    slugs = {p["slug"] for p in client.get("/api/projects", headers=AUTH).json()}
+    assert slugs == {"api", "app"}
+    assert client.post("/api/tasks", headers=AUTH,
+                       json={"project": "gumo", "title": "x"}).status_code == 400
+
+    r = client.delete("/api/context", headers=AUTH)
+    assert r.status_code == 200
+    assert r.json()["context"]["product_name"] == "Gumo"
+    assert r.json()["overridden"] == []
+    slugs = {p["slug"] for p in client.get("/api/projects", headers=AUTH).json()}
+    assert "gumo" in slugs
+
+
+def test_context_requires_auth(client):
+    assert client.get("/api/context").status_code == 401
+    assert client.put("/api/context", json={}).status_code == 401
+    assert client.delete("/api/context").status_code == 401
+
+
+def test_context_put_persist_failure_leaves_live_state(client, monkeypatch):
+    """Persist-before-apply: if the DB write fails, the request errors and the
+    LIVE settings are untouched — live and persisted state never diverge."""
+    import sqlite3
+
+    import pytest as _pytest
+
+    store = client.app.state.store
+
+    def boom(values):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(store, "config_set_many", boom)
+    with _pytest.raises(sqlite3.OperationalError):
+        client.put("/api/context", headers=AUTH, json={"product_name": "Acme"})
+    assert client.get("/api/context", headers=AUTH).json()["context"]["product_name"] == "Gumo"
+
+
+def test_dashboard_rebrands_from_context(client):
+    """The rebrand hangs off an exact literal in DASHBOARD_HTML — pin it, and
+    prove the rendered page follows the configured product name."""
+    from app.dashboard import DASHBOARD_HTML
+
+    assert "the Gumo Engine" in DASHBOARD_HTML  # main.dashboard() replaces this
+    assert "the Gumo Engine" in client.get("/", headers=AUTH).text
+    r = client.put("/api/context", headers=AUTH, json={"product_name": "Acme"})
+    assert r.status_code == 200
+    page = client.get("/", headers=AUTH).text
+    assert "the Acme Engine" in page and "the Gumo Engine" not in page
+    client.delete("/api/context", headers=AUTH)
+
+
+def test_context_put_warns_about_unmapped_live_jobs(client):
+    """Removing a slug from the map must not silently doom live jobs — the
+    save response lists them (they will be skipped at next dispatch)."""
+    store = client.app.state.store
+    store.insert("task-live1", source="manual", title="t", project="gumo", kind="task")
+    r = client.put("/api/context", headers=AUTH, json={
+        "repo_map": {"api": {"repo": "acme/api"}}, "canonical_project": "api",
+    })
+    assert r.status_code == 200
+    assert "task-live1" in r.json()["warning"]
+    # partial update: only the sent fields became overrides
+    assert set(r.json()["overridden"]) == {"repo_map", "memory_canonical_project"}
+    # reset also warns while the job is still live and unmapped under defaults?
+    # (project 'gumo' IS in the defaults, so the warning clears)
+    r = client.delete("/api/context", headers=AUTH)
+    assert r.status_code == 200
+    assert r.json()["warning"] == ""
+
+
 def test_feature_stats_404(client):
     r = client.get("/api/features/none/stats", headers=AUTH)
     assert r.status_code == 404
@@ -124,5 +228,8 @@ def test_dashboard_shell_is_balanced():
                 'function routeHash', 'function sendComposer', 'function answer',
                 'function setFilter', 'session/stream', 'chat/stream',
                 # intake forms keep their ids — the submit handlers depend on them
-                'id="task-project"', 'id="feat-project"', 'id="ref"'):
+                'id="task-project"', 'id="feat-project"', 'id="ref"',
+                # the project-context editor (docs/ENGINE.md §10)
+                'id="ctx-body"', 'function saveContext', 'function resetContext',
+                'function loadContext'):
         assert tok in h, tok

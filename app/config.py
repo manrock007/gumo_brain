@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from functools import lru_cache
 
 from pydantic_settings import BaseSettings
@@ -37,6 +38,53 @@ DEFAULT_REPO_MAP = {
         "setup_cmd": None, "test_cmd": None, "allow": [],
     },
 }
+
+DEFAULT_PRODUCT_NAME = "Gumo"
+
+DEFAULT_BUSINESS_CONTEXT = """\
+Gumo is one product built across three main repositories:
+- `gumo` (manrock007/gumoserver) — the Django backend: API, data models, business \
+logic. This is the canonical repo hosting product-scope memory (`.gumo/product/`).
+- `web` (manrock007/gumowebclient) — the web client.
+- `react-native` (manrock007/gumoclient) — the React Native mobile app.
+The clients consume the backend's API; cross-repo features ship server-first, then
+clients. Deeper, versioned product knowledge (what the product is, who it's for, the
+cross-repo API contract) lives in product memory (`.gumo/product/` and `.gumo/memory/`)."""
+
+# Project-context fields an operator may override at runtime (persisted in the
+# app_config table, applied over env/code defaults at startup and via the API).
+RUNTIME_CONTEXT_KEYS = ("product_name", "business_context", "repo_map",
+                        "memory_canonical_project")
+
+
+def validate_repo_map(mapping) -> dict:
+    """Normalize + validate an operator-supplied repo map. Raises ValueError
+    with a human-readable reason; returns the cleaned mapping."""
+    if not isinstance(mapping, dict) or not mapping:
+        raise ValueError("repo_map must be a non-empty object of {slug: target}")
+    cleaned: dict = {}
+    for slug, entry in mapping.items():
+        slug = str(slug).strip()
+        if not slug:
+            raise ValueError("repo_map contains an empty project slug")
+        if not isinstance(entry, dict):
+            raise ValueError(f"repo_map['{slug}'] must be an object")
+        repo = str(entry.get("repo") or "").strip()
+        if not re.fullmatch(r"[\w.-]+/[\w.-]+", repo):
+            raise ValueError(f"repo_map['{slug}'].repo must be 'owner/name', got '{repo}'")
+        allow = entry.get("allow") or []
+        if not isinstance(allow, list) or not all(isinstance(a, str) for a in allow):
+            raise ValueError(f"repo_map['{slug}'].allow must be a list of strings")
+        cleaned[slug] = {
+            "repo": repo,
+            "base": str(entry.get("base") or "main").strip() or "main",
+            "setup_cmd": (str(entry["setup_cmd"]).strip() or None)
+                         if entry.get("setup_cmd") else None,
+            "test_cmd": (str(entry["test_cmd"]).strip() or None)
+                        if entry.get("test_cmd") else None,
+            "allow": allow,
+        }
+    return cleaned
 
 
 class Settings(BaseSettings):
@@ -96,8 +144,15 @@ class Settings(BaseSettings):
     # Dashboard basic auth (user "gumo"); dashboard + trigger disabled if empty
     dashboard_password: str = ""
 
-    # Sentry project slug -> repo config as a JSON string
+    # ---- Project context (docs/ENGINE.md §10) ----
+    # What the engine works ON. Env vars seed the defaults; operator edits via
+    # PUT /api/context persist in the DB and override these at startup.
+    # Project slug -> repo config as a JSON string
     repo_map: str = json.dumps(DEFAULT_REPO_MAP)
+    # Short product name used in prompt identity lines ("the <name> Engine")
+    product_name: str = DEFAULT_PRODUCT_NAME
+    # Free-text description of the product/business injected into every prompt
+    business_context: str = DEFAULT_BUSINESS_CONTEXT
 
     # Also react to plain "issue created" webhooks (very noisy — off by default;
     # alert rules firing `event_alert` webhooks are the intended trigger).
@@ -187,6 +242,58 @@ class Settings(BaseSettings):
     @property
     def clickup_enabled(self) -> bool:
         return bool(self.clickup_token and self.clickup_list_id)
+
+    def stage_runtime_overrides(self, overrides: dict) -> dict:
+        """Validate + normalize project-context overrides WITHOUT applying them.
+        Raises ValueError on any problem; returns the normalized values. Callers
+        that must persist-before-apply (PUT /api/context) stage first, write the
+        DB, then apply_staged — so a failed write never leaves live state ahead
+        of the persisted state."""
+        staged: dict = {}
+        for key in RUNTIME_CONTEXT_KEYS:
+            if overrides.get(key) is None:
+                continue
+            value = overrides[key]
+            if key == "repo_map":
+                mapping = json.loads(value) if isinstance(value, str) else value
+                staged[key] = json.dumps(validate_repo_map(mapping))
+            else:
+                value = str(value).strip()
+                # empty business context is a valid choice (no block in prompts);
+                # an empty name/canonical slug can only be a mistake — skip it
+                if value or key == "business_context":
+                    staged[key] = value
+        # fail closed: a canonical project outside the map would silently kill
+        # product-scope memory for every client-repo run
+        canonical = staged.get("memory_canonical_project", self.memory_canonical_project)
+        repo_map = staged.get("repo_map", self.repo_map)
+        if canonical not in json.loads(repo_map):
+            raise ValueError(
+                f"canonical project '{canonical}' is not a project slug in the repo map"
+            )
+        return staged
+
+    def apply_staged(self, staged: dict):
+        """Apply already-validated overrides to the live settings (cannot fail)."""
+        for key, value in staged.items():
+            setattr(self, key, value)
+
+    def apply_runtime_overrides(self, overrides: dict) -> dict:
+        """Validate and apply in one step — for callers with no persistence to
+        order against (startup, tests). Atomic: a ValueError leaves settings
+        untouched. Returns the normalized values that were applied."""
+        staged = self.stage_runtime_overrides(overrides)
+        self.apply_staged(staged)
+        return staged
+
+    def project_context(self) -> dict:
+        """The effective project context, JSON-decoded (the API/dashboard view)."""
+        return {
+            "product_name": self.product_name,
+            "business_context": self.business_context,
+            "repo_map": json.loads(self.repo_map),
+            "canonical_project": self.memory_canonical_project,
+        }
 
     def target_for_repo(self, repo: str) -> "RepoTarget | None":
         """Reverse lookup for the shepherd: a prs row carries owner/name, not a

@@ -1,4 +1,5 @@
 import asyncio
+import html
 import json
 import logging
 import re
@@ -14,7 +15,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 
 from .chatstream import ChatBroker
-from .config import get_settings
+from .config import RUNTIME_CONTEXT_KEYS, Settings, get_settings
 from .dashboard import DASHBOARD_HTML
 from .db import JobStore
 from .feature_prompts import stage_name
@@ -54,6 +55,16 @@ async def lifespan(app: FastAPI):
     if settings.session_persistence:
         ensure_session_store(settings)
     store = JobStore(settings.db_path)
+    overrides = store.config_all()
+    try:  # operator-saved project context (repos, business context) wins over env/defaults
+        settings.apply_runtime_overrides(overrides)
+    except ValueError as e:
+        # apply is atomic, so nothing was changed; name the actual faulty source —
+        # with no stored overrides the canonical-in-map check is judging the
+        # env/code config itself
+        source = "stored overrides (app_config)" if overrides else "env/code config"
+        log.error("project context invalid in %s: %s — overrides NOT applied; "
+                  "fix via PUT /api/context (or the env) and restart", source, e)
     worker = Worker(settings, store)
     tasks = [
         asyncio.create_task(worker.run_forever()),
@@ -80,7 +91,10 @@ async def health():
 
 @app.get("/", response_class=HTMLResponse, dependencies=[Depends(require_auth)])
 async def dashboard():
-    return DASHBOARD_HTML
+    # brand subtitle follows the configured product name (docs/ENGINE.md §10)
+    return DASHBOARD_HTML.replace(
+        "the Gumo Engine", f"the {html.escape(settings.product_name)} Engine", 1
+    )
 
 
 @app.get("/api/jobs", dependencies=[Depends(require_auth)])
@@ -149,6 +163,93 @@ async def projects():
     """Configured Sentry-project -> repo mappings, for the dashboard's project picker."""
     mapping = json.loads(settings.repo_map)
     return [{"slug": slug, "repo": entry.get("repo", "")} for slug, entry in sorted(mapping.items())]
+
+
+# ---------- project context (docs/ENGINE.md §10) ----------
+# What the engine works ON — repos, canonical project, product name, business
+# context. Env/code defaults (the Gumo repos) apply until an operator saves
+# overrides here; overrides persist in the DB and survive restarts.
+
+
+class ContextBody(BaseModel):
+    product_name: str | None = None
+    business_context: str | None = None
+    repo_map: dict | None = None        # {slug: {repo, base, setup_cmd?, test_cmd?, allow?}}
+    canonical_project: str | None = None  # must be a slug in the (resulting) repo map
+
+
+# env/code defaults with no runtime overrides, captured once — what DELETE
+# restores and what the dashboard shows as "defaults" (env is process-constant)
+_default_settings = Settings()
+
+
+def _live_unmapped_warning(store: JobStore) -> str:
+    """Live jobs whose recorded project slug is no longer in the repo map get
+    skipped at their next dispatch ('no repo mapped') — surface that at save
+    time instead of letting an approved pipeline die silently later."""
+    mapping = json.loads(settings.repo_map)
+    live = [j for j in store.by_status(["received", "queued", "running", "awaiting_input"])
+            if (j.get("project") or "") and j["project"] not in mapping]
+    if not live:
+        return ""
+    listed = ", ".join(f"{j['issue_id']} (project '{j['project']}')" for j in live[:10])
+    more = f" and {len(live) - 10} more" if len(live) > 10 else ""
+    return (f"warning: live jobs reference project slugs that are no longer mapped and "
+            f"will be SKIPPED at their next run: {listed}{more}. Re-add the slug(s) or "
+            f"finish those jobs first.")
+
+
+def _context_payload(warning: str = "") -> dict:
+    return {
+        "context": settings.project_context(),
+        "defaults": _default_settings.project_context(),
+        "overridden": sorted(app.state.store.config_all().keys()),
+        "warning": warning,
+    }
+
+
+@app.get("/api/context", dependencies=[Depends(require_auth)])
+async def get_context():
+    return _context_payload()
+
+
+@app.put("/api/context", dependencies=[Depends(require_auth)])
+async def put_context(body: ContextBody):
+    """Update the project context. Only supplied fields change; values are
+    validated atomically (a bad payload changes nothing), applied to the live
+    engine immediately, and persisted for future restarts. Jobs keep their
+    recorded project slug: if the new map still contains it, they continue
+    under the new mapping; if a slug was REMOVED, those jobs are skipped at
+    their next run — the response carries a warning listing them."""
+    overrides = {
+        "product_name": body.product_name,
+        "business_context": body.business_context,
+        "repo_map": body.repo_map,
+        "memory_canonical_project": body.canonical_project,
+    }
+    try:
+        staged = settings.stage_runtime_overrides(overrides)
+    except (ValueError, TypeError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    store: JobStore = app.state.store
+    # persist BEFORE touching live state, in one transaction: if the write
+    # fails, the request 500s with settings unchanged — live and persisted
+    # state never diverge (apply_staged cannot fail after validation)
+    store.config_set_many({
+        key: json.loads(value) if key == "repo_map" else value  # store one-layer JSON
+        for key, value in staged.items()
+    })
+    settings.apply_staged(staged)
+    return _context_payload(warning=_live_unmapped_warning(store))
+
+
+@app.delete("/api/context", dependencies=[Depends(require_auth)])
+async def reset_context():
+    """Drop every stored override — revert to the env/code defaults."""
+    app.state.store.config_clear()
+    for key in RUNTIME_CONTEXT_KEYS:
+        setattr(settings, key, getattr(_default_settings, key))
+    return _context_payload(warning=_live_unmapped_warning(app.state.store))
 
 
 class SubmitBody(BaseModel):

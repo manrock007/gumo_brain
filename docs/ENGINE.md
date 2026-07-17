@@ -21,8 +21,8 @@ three unsolved problems:
    tokens and multiplies failure. The engine needs **product memory**:
    persistent, versioned, reviewed, warming every run.
 
-**Multi-repo reality (v1 rule).** Gumo is ONE product in three repos. One
-pipeline = one repo. A cross-repo feature is split by the human into ordered
+**Multi-repo reality (v1 rule).** One product usually spans several repos
+(Gumo, the default context: three). One pipeline = one repo. A cross-repo feature is split by the human into ordered
 pipelines (server first, clients after), linked via `related_jobs` and a
 shared parent ClickUp task; a client pipeline's P0–P3 receive the sibling
 server pipeline's PRD + design and target its PR's API contract, not `<base>`.
@@ -164,7 +164,7 @@ two scopes** (per-repo product.md triplication would drift — critic-confirmed)
   `conventions.md`, plus `decisions/` and `changelog/` **directories** (one
   file per entry, `<date>-<slug>.md` — append-only files guarantee merge
   conflicts; per-entry files can't conflict, and "recent N" is trivial).
-- **Product scope** — `.gumo/product/` in the canonical repo (gumoserver):
+- **Product scope** — `.gumo/product/` in the configured canonical repo (§10):
   `product.md`, product-level decisions/changelog, `contract.md` (endpoints/
   models the clients depend on). Client-repo runs get it inlined from the
   canonical repo's base branch (via the brain's canonical workspace —
@@ -234,6 +234,11 @@ guidance > older guidance; superseded guidance is marked.
 
 ## 6. API & dashboard
 
+- `GET /api/context`, `PUT /api/context`, `DELETE /api/context` — the editable
+  project context (§10): repo map, canonical project, product name, business
+  context. GET returns `{context, defaults, overridden}`; PUT validates
+  atomically (400 changes nothing) and applies live; DELETE reverts to the
+  env/code defaults.
 - `POST /api/features` — `{project, clickup? | title+summary, owner?,
   related_to?}`.
 - `POST /api/jobs/{id}/answer` — `{action: proceed|redo|skip, answer}`,
@@ -393,3 +398,39 @@ all-gated).
 - Atomic cross-repo pipelines.
 - ClickUp round-trip integration test against the live workspace (runs at
   deploy time; normalizer is built to its findings).
+
+## 10. Project context — the engine is product-agnostic
+
+Everything the engine knows about WHAT it is working on is **configuration,
+not code** — the same brain serves any software team:
+
+- **Repo map** — project slug → `{repo, base, setup_cmd?, test_cmd?, allow?}`.
+  Any number of repos; drives intake validation, workspace clones, PR bases,
+  test instructions and the shepherd's reverse lookup.
+- **Canonical project** — which slug hosts product-scope memory
+  (`.gumo/product/`). Must be a slug in the repo map (fail-closed on save).
+- **Product name** — the identity used in prompts ("the `<name>` Engine",
+  "the `<name>` platform").
+- **Business context** — operator-maintained free text injected into EVERY
+  run's prompt (all P0–P9 stages, sentry fixes, tasks, memory bootstrap, the
+  PR shepherd), capped at 4k chars. It is the always-present baseline; product
+  memory, when present, is more current and takes precedence — the injected
+  block itself states this, so it holds for custom contexts too.
+
+Precedence: **DB overrides > env vars > code defaults** (the Gumo repos and a
+structural Gumo description ship as the defaults). Operators edit the context
+in the dashboard's "Project context" panel or via `PUT /api/context`; saved
+values persist in the `app_config` table, apply to the live engine immediately
+(next run picks them up) and survive restarts. `DELETE /api/context` reverts
+to defaults. Validation is atomic and fail-closed: a malformed repo map or a
+canonical slug missing from the map is a 400 and nothing changes; persistence
+is one transaction. The `.gumo/` directory names are engine namespace (like
+`.github/`), not product branding — they stay fixed regardless of context.
+
+Edits and running work: jobs keep their recorded project slug. If the new map
+still contains the slug, they continue under the new mapping; if a slug was
+REMOVED, those jobs are skipped at their next dispatch ("no repo mapped") —
+the PUT/DELETE response carries a warning listing affected live jobs, and the
+dashboard surfaces it. A run already in flight when an edit lands resolves its
+context non-transactionally (it may see mixed old/new values in its briefing);
+the next run is consistent.

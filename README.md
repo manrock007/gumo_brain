@@ -86,6 +86,10 @@ All `api/*` and `/` behind basic auth (user `gumo`); `/health` and the webhook a
 - `GET /api/memory` / `GET /api/memory/{project}` — cached product-memory state
 - `POST /api/memory/{project}/bootstrap` — queue a memory bootstrap job
 - `GET /api/jobs`, `GET /api/projects` — job list, project→repo map
+- `GET|PUT|DELETE /api/context` — the **project context** (docs/ENGINE.md §10): repo
+  map, canonical project, product name, business context. Editable at runtime (also via
+  the dashboard's "Project context" panel); overrides persist in the DB and win over
+  env/code defaults, so the engine adapts to any product/team. DELETE reverts to defaults.
 - `POST /webhooks/sentry` — Sentry internal-integration webhook (HMAC verified)
 - `GET /health` — liveness + queue depth
 

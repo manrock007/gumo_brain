@@ -857,6 +857,8 @@ class Engine:
             evidence_note=edited_note,
             test_block=_test_block(target) if stage in (7, 8) else "",
             canonical_project=self.settings.memory_canonical_project,
+            product_name=self.settings.product_name,
+            business_context=self.settings.business_context,
         )
 
     # ---------- gumo-speed conveyor mirror (ClickUp custom fields) ----------
@@ -1060,13 +1062,15 @@ class Engine:
     async def _chat_fast(self, job, stage, message, publish, v1: bool = False):
         job_id = job["issue_id"]
         if v1:
-            system = build_v1_fastlane_system(job, self.store.guidance_for(job_id))
+            system = build_v1_fastlane_system(job, self.store.guidance_for(job_id),
+                                              product_name=self.settings.product_name)
         else:
             names = list(dict.fromkeys([stage_artifact(stage), "P1-prd.md"]))
             system = build_fastlane_system(
                 job=job, stage=stage,
                 inline_artifacts=self.store.artifact_contents(job_id, names),
                 guidance_entries=self.store.guidance_for(job_id),
+                product_name=self.settings.product_name,
             )
         messages = build_fastlane_messages(
             self.store.chat_for(job_id, stage)[:-1],  # exclude the turn being answered
@@ -1127,6 +1131,7 @@ class Engine:
                 prompt = build_v1_chat_prompt(
                     target=target, job=job, message=message,
                     transcript=self.store.chat_for(job_id, stage)[:-1],
+                    product_name=self.settings.product_name,
                 )
             chat_dir = (self.settings.claude_chat_config_dir
                         if self.settings.session_persistence else None)
@@ -1146,6 +1151,7 @@ class Engine:
                 prompt = build_v1_chat_prompt(
                     target=target, job=job, message=message,
                     transcript=self.store.chat_for(job_id, stage)[:-1],
+                    product_name=self.settings.product_name,
                 )
                 async with store_lock:
                     raw = await run_claude_stream(
@@ -1242,6 +1248,7 @@ class Engine:
                     target=target, branch=branch, job=job, stage=stage, message=message,
                     transcript=self.store.chat_for(job_id, stage)[:-1],  # exclude the turn being answered
                     inline_artifacts=inline,
+                    product_name=self.settings.product_name,
                 )
                 # serialize on whichever store this run touches: the dedicated
                 # chat store when persistence is on, else the shared default
@@ -1314,7 +1321,9 @@ class Engine:
         for run in (1, 2):
             run_id = self.store.stage_run_open(job_id, stage=run, attempt=1)
             prompt = build_bootstrap_prompt(target=target, branch=branch, project=project,
-                                            is_canonical=is_canonical, run=run)
+                                            is_canonical=is_canonical, run=run,
+                                            product_name=self.settings.product_name,
+                                            business_context=self.settings.business_context)
             raw = await self._invoke(workspace, prompt,
                                      BASE_ALLOWED_TOOLS + target.allow,
                                      self.settings.claude_timeout_seconds)
