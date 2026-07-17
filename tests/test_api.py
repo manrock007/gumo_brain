@@ -464,6 +464,17 @@ def test_transcript_writer_cap_and_prune(client):
     assert transcripts.read_events(settings, "capjob", "big") is None
 
 
+def test_admin_cannot_reset_own_password(client):
+    """The admin reset arms must_change_pw (it hands out a TEMPORARY
+    credential) — self-reset would loop the forced first-sign-in change
+    forever. Own passwords change via /api/me/password only."""
+    r = client.patch("/api/users/gumo", headers=AUTH, json={"password": "whatever123"})
+    assert r.status_code == 400 and "Account" in r.json()["detail"]
+    # other admin actions on self keep their existing guards
+    assert client.patch("/api/users/gumo", headers=AUTH,
+                        json={"disabled": True}).status_code == 400
+
+
 def test_change_password_rotates_session(client):
     """A self password change revokes every OTHER session and the old token,
     but the caller stays signed in on a freshly rotated cookie — being dumped

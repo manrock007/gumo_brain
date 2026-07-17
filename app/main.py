@@ -270,6 +270,11 @@ async def users_patch(username: str, body: UserPatchBody,
         if body.disabled:
             store.auth_sessions_revoke_user(user["id"])
     if body.password is not None:
+        if user["username"] == admin["username"]:
+            # the admin reset hands out a TEMPORARY credential (arms
+            # must_change_pw) — self-reset loops the forced change forever
+            raise HTTPException(status_code=400,
+                                detail="use the Account panel to change your own password")
         if len(body.password) < 8:
             raise HTTPException(status_code=400, detail="password must be at least 8 characters")
         store.user_set(username, pw_hash=hash_password(body.password), must_change_pw=1,
