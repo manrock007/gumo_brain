@@ -141,6 +141,10 @@ def test_workspace_crud_and_repo_move(client):
     r = client.post("/api/workspaces", headers=AUTH, json={"slug": "123", "name": "Numeric"})
     assert r.status_code == 400 and "already exists" in r.json()["detail"]
 
+    # unknown workspace on PATCH is a 404 (matches the members endpoint), not a 400
+    assert client.patch("/api/workspaces/9999", headers=AUTH,
+                        json={"name": "x"}).status_code == 404
+
     # a second workspace cannot steal an existing slug
     r = client.post("/api/workspaces", headers=AUTH,
                     json={"slug": "app", "name": "App"})

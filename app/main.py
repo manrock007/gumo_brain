@@ -37,7 +37,7 @@ from .fixer import ensure_session_store
 from .memory import MemoryReader
 from .sentry_api import extract_issue_ref, verify_signature
 from .worker import GateConflict, Worker
-from .workspaces import WorkspaceError, WorkspaceService
+from .workspaces import WorkspaceError, WorkspaceNotFound, WorkspaceService
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 log = logging.getLogger("brain")
@@ -329,6 +329,8 @@ async def workspaces_patch(workspace_id: int, body: WorkspacePatchBody):
     try:
         ws = svc.update(workspace_id, repos=body.repos,
                         **body.model_dump(exclude={"slug", "repos"}, exclude_none=True))
+    except WorkspaceNotFound as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except WorkspaceError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return svc.public(ws) | {"warning": _live_unmapped_warning(app.state.store)}

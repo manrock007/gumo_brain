@@ -37,6 +37,10 @@ class WorkspaceError(ValueError):
     """Validation failure — safe to surface as a 400."""
 
 
+class WorkspaceNotFound(WorkspaceError):
+    """Unknown workspace — surfaces as a 404, matching the other endpoints."""
+
+
 class WorkspaceService:
     def __init__(self, store: JobStore, settings: Settings):
         self.store = store
@@ -187,7 +191,7 @@ class WorkspaceService:
                **fields) -> dict:
         ws = self.store.workspace_get(int(workspace_id))
         if ws is None:
-            raise WorkspaceError("unknown workspace")
+            raise WorkspaceNotFound("unknown workspace")
         clean = self._clean_fields(fields)
         if repos is not None:
             mapping = validate_repo_map({r.get("slug"): r for r in repos})
