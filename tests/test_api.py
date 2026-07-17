@@ -180,6 +180,18 @@ def test_workspace_crud_and_repo_move(client):
                            "canonical_project": "acme-api2"})
     assert r.status_code == 200 and "task-w1" in r.json()["warning"]
 
+    # a workspace without its own canonical gets NO product scope — never a
+    # cross-workspace borrow of the instance canonical (finding 1595794)
+    svc = client.app.state.workspaces
+    client.post("/api/workspaces", headers=AUTH, json={"slug": "bare", "name": "Bare"})
+    bare_id = [w["id"] for w in client.get("/api/workspaces", headers=AUTH).json()
+               if w["slug"] == "bare"][0]
+    client.patch(f"/api/workspaces/{bare_id}", headers=AUTH,
+                 json={"repos": [{"slug": "bare-api", "repo": "bare/api"}]})
+    assert svc.canonical_for("bare-api") == ""      # own workspace, no canonical
+    assert svc.canonical_for("gumo") == "gumo"      # own workspace's canonical
+    assert svc.canonical_for("unmapped") == "gumo"  # legacy fallback only when unmapped
+
     # membership enforcement: a member sees only assigned workspaces' jobs
     client.post("/api/users", headers=AUTH,
                 json={"username": "wsdev", "password": "devpass123"})

@@ -136,10 +136,15 @@ class WorkspaceService:
         return (ws or {}).get("product_name") or self.settings.product_name
 
     def canonical_for(self, project_slug: str) -> str:
-        """The canonical repo slug for a project — its workspace's, falling
-        back to the instance default for unmapped slugs."""
+        """The canonical repo slug for a project. Strictly its own workspace's:
+        a workspace without a canonical has NO product scope (memory degrades
+        gracefully) rather than borrowing another workspace's product context
+        via the instance fallback (sentry finding 1595794). The instance value
+        applies only to legacy unmapped slugs, which never reach a run anyway."""
         ws = self.for_project(project_slug)
-        return (ws or {}).get("canonical_project") or self.settings.memory_canonical_project
+        if ws is not None:
+            return ws.get("canonical_project") or ""
+        return self.settings.memory_canonical_project
 
     # ---------- integrations (§12: ClickUp optional, Slack nudges) ----------
 

@@ -518,7 +518,10 @@ async def reset_context():
     1595745/0 — a default-map settings.repo_map would silently skip sentry
     issues for workspace-only projects until the next workspace edit)."""
     app.state.store.config_clear()
-    for key in ("product_name", "business_context"):
+    # memory_canonical_project included: a cleared legacy override must not
+    # linger live until restart (finding 1595794/1). repo_map is deliberately
+    # NOT reset — workspaces own it; the sync below rebuilds the merged map.
+    for key in ("product_name", "business_context", "memory_canonical_project"):
         setattr(settings, key, getattr(_default_settings, key))
     _ws_svc().sync_settings()
     return _context_payload(warning=_live_unmapped_warning(app.state.store))
