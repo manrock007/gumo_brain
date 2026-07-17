@@ -1043,24 +1043,23 @@ function uiMsg(text) {
 }
 
 function openSettings() {
-  document.getElementById('shell').style.display = 'none';
-  document.getElementById('settings-pane').style.display = '';
-  document.getElementById('sp-title').textContent =
-    (ME && ME.must_change_pw) ? 'Set your password' : 'Settings';
-  if (ME && ME.role === 'admin') { loadUsers(); renderWorkspacesAdmin(); }
-}
-function openAccount() {
   // forced = signed in on a temporary password. The screen must SAY so and
   // demand exactly one thing: the banner explains, every other panel hides,
   // and the back button goes with them (closeSettings refuses anyway).
-  // Derived from ME, never from the caller — any entry point (topbar Account
-  // button included) must land in the same state.
+  // Derived from ME and owned HERE — every entry point (Settings/Account
+  // buttons, forced sign-in) goes through this function, so the state can
+  // never depend on which one was clicked.
   const forced = !!(ME && ME.must_change_pw);
-  openSettings();
   document.body.classList.toggle('forced-pw', forced);
   document.getElementById('pw-banner').style.display = forced ? '' : 'none';
+  document.getElementById('shell').style.display = 'none';
+  document.getElementById('settings-pane').style.display = '';
   document.getElementById('sp-title').textContent = forced ? 'Set your password' : 'Settings';
-  if (forced) { document.getElementById('pw-cur').focus(); return; }
+  if (ME && ME.role === 'admin') { loadUsers(); renderWorkspacesAdmin(); }
+}
+function openAccount() {
+  openSettings();
+  if (ME && ME.must_change_pw) { document.getElementById('pw-cur').focus(); return; }
   // the Account panel sits below Users/Workspaces for admins — bring the
   // password form into view. The panels above populate async and shift the
   // layout, so anchor again after they settle.
