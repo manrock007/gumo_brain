@@ -122,6 +122,14 @@ class Worker:
         self._enqueue(issue_id, PRIO_SWEEP if source == "sweep" else PRIO_SENTRY)
         return f"issue {issue_id} queued"
 
+    def _job_context(self, job: dict) -> tuple[str, str]:
+        """(product_name, briefing) for a job's prompts — workspace-aware when
+        the service is injected, instance-wide otherwise (§10/§12)."""
+        if self.workspaces:
+            ws = self.workspaces.for_job(job)
+            return self.workspaces.product_name_for(ws), self.workspaces.briefing(ws)
+        return self.settings.product_name, self.settings.business_context
+
     def _stamp_workspace(self, job_id: str, project: str):
         """Record the owning workspace on the job row (slugs are global)."""
         if self.workspaces and project:
@@ -360,6 +368,7 @@ class Worker:
             # with no turn gets an immediate 'done' and reads "run finished".
             broker.publish(issue_id, "status",
                            "waiting for the repository workspace (another run may be using it)")
+            pname, brief = self._job_context(row)
             async with self.locks.for_repo(target.repo):  # workspace toucher
                 broker.publish(issue_id, "status", "preparing the repository workspace")
                 if phase == 2:
@@ -368,16 +377,14 @@ class Worker:
                         clickup_task_id=task_id,
                         analysis=row.get("analysis") or "(analysis missing)",
                         guidance=row.get("guidance") or "(no guidance recorded)",
-                        product_name=self.settings.product_name,
-                        business_context=self.settings.business_context,
+                        product_name=pname, business_context=brief,
                     )
                     workspace = await prepare_workspace(self.settings, target, branch, keep_branch=True)
                 else:
                     prompt = build_fix_prompt(
                         target=target, branch=branch, issue=issue_info, stacktrace=stacktrace,
                         clickup_task_id=task_id,
-                        product_name=self.settings.product_name,
-                        business_context=self.settings.business_context,
+                        product_name=pname, business_context=brief,
                     )
                     workspace = await prepare_workspace(self.settings, target, branch)
 
@@ -450,6 +457,7 @@ class Worker:
         broker = self.engine.stage_broker
         broker.start(job_id)
         try:
+            pname, brief = self._job_context(row)
             broker.publish(job_id, "status", "preparing the repository workspace")
             if phase == 2:
                 prompt = build_task_implement_prompt(
@@ -457,16 +465,14 @@ class Worker:
                     clickup_task_id=task_id or None,
                     analysis=row.get("analysis") or "(analysis missing)",
                     guidance=row.get("guidance") or "(no guidance recorded)",
-                    product_name=self.settings.product_name,
-                    business_context=self.settings.business_context,
+                    product_name=pname, business_context=brief,
                 )
                 workspace = await prepare_workspace(self.settings, target, branch, keep_branch=True)
             else:
                 prompt = build_task_plan_prompt(
                     target=target, branch=branch, task=task_info, request=request_text,
                     clickup_task_id=task_id or None,
-                    product_name=self.settings.product_name,
-                    business_context=self.settings.business_context,
+                    product_name=pname, business_context=brief,
                 )
                 workspace = await prepare_workspace(self.settings, target, branch)
 
@@ -1217,13 +1223,13 @@ class Worker:
         if target is None or not branch:
             self.store.pr_set(pr["url"], detail=f"no repo target for {pr['repo']}")
             return None
+        spname, sbrief = self._job_context(self.store.get(pr["job_id"]) or {})
         prompt = build_shepherd_prompt(
             target=target, pr_url=pr["url"], branch=branch,
             findings=[{"id": c["id"], "path": c.get("path"),
                        "line": c.get("line") or c.get("original_line"),
                        "body": c.get("body")} for c in findings],
-            product_name=self.settings.product_name,
-            business_context=self.settings.business_context)
+            product_name=spname, business_context=sbrief)
         # a DEDICATED clone + lock, NOT the main repo lock: a fix run can hold a
         # lock for a full claude timeout, and taking the main one would starve
         # pipeline stages / sentry jobs on that repo for the duration. The run

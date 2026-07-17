@@ -77,6 +77,7 @@ async def lifespan(app: FastAPI):
     worker = Worker(settings, store)
     worker.workspaces = workspaces
     worker.engine.workspaces = workspaces
+    worker.engine.memory.canonical_resolver = workspaces.canonical_for
     tasks = [
         asyncio.create_task(worker.run_forever()),
         asyncio.create_task(worker.poll_clickup_forever()),

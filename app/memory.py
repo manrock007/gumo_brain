@@ -96,13 +96,17 @@ class MemoryReader:
     def __init__(self, settings: Settings, locks=None):
         self.settings = settings
         self.locks = locks  # RepoLocks; None for read-only cache use (dashboard)
+        # Phase 2: slug -> canonical slug via its workspace (injected at startup);
+        # None falls back to the instance-wide memory_canonical_project
+        self.canonical_resolver = None
 
     async def product_scope(self, project: str, workspace: str) -> dict[str, str]:
         """Product-scope files, base-pinned. For the canonical repo, read them
         from its own clone; for client repos, read from the canonical
         workspace's origin/<base> (fetched fresh) — under the canonical repo's
         lock, since that workspace belongs to other jobs too."""
-        canonical = self.settings.memory_canonical_project
+        canonical = (self.canonical_resolver(project) if self.canonical_resolver
+                     else self.settings.memory_canonical_project)
         if project == canonical:
             return {f: _read(workspace, f"{PRODUCT_DIR}/{f}") for f in PRODUCT_FILES}
         target = self.settings.repo_for_project(canonical)

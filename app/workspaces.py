@@ -115,6 +115,28 @@ class WorkspaceService:
         allowed = self.store.workspace_ids_for_user(user["id"])
         return [w for w in all_ws if w["id"] in allowed]
 
+    # ---------- prompt briefing (§10/§12 hierarchy) ----------
+
+    def briefing(self, ws: dict | None) -> str:
+        """Business context (instance) + workspace context, stacked for the
+        prompt's business block. Repo-level memory rides in the clone as ever."""
+        parts = [self.settings.business_context.strip()]
+        if ws and (ws.get("workspace_context") or "").strip():
+            parts.append(f"### Workspace: {ws['name']}\n\n{ws['workspace_context'].strip()}")
+        return "\n\n".join(p for p in parts if p)
+
+    def briefing_for_job(self, job: dict) -> str:
+        return self.briefing(self.for_job(job))
+
+    def product_name_for(self, ws: dict | None) -> str:
+        return (ws or {}).get("product_name") or self.settings.product_name
+
+    def canonical_for(self, project_slug: str) -> str:
+        """The canonical repo slug for a project — its workspace's, falling
+        back to the instance default for unmapped slugs."""
+        ws = self.for_project(project_slug)
+        return (ws or {}).get("canonical_project") or self.settings.memory_canonical_project
+
     # ---------- validated writes ----------
 
     def create(self, slug: str, name: str, **fields) -> dict:

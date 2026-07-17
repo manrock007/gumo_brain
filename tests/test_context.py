@@ -138,10 +138,10 @@ def test_business_context_is_capped():
     prompt = build_stage_prompt(
         target=TARGET, branch="b", job=JOB, stage=0,
         memory_context="", artifact_names=[], inline_artifacts={},
-        guidance_entries=[], business_context="x" * 10000,
+        guidance_entries=[], business_context="x" * 20000,
     )
     assert "truncated" in prompt
-    assert "x" * 5000 not in prompt
+    assert "x" * 9000 not in prompt
 
 
 def test_fix_and_task_prompts_carry_context():

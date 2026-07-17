@@ -7,7 +7,7 @@ from Settings."""
 
 from .config import DEFAULT_PRODUCT_NAME, RepoTarget
 
-BUSINESS_CONTEXT_CAP = 4000  # operator-supplied text must not crowd out the work
+BUSINESS_CONTEXT_CAP = 8000  # fits business + workspace layers without crowding the work
 
 
 def business_block(business_context: str) -> str:
