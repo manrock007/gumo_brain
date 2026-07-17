@@ -30,7 +30,7 @@ from .auth import (
     verify_login,
 )
 from .chatstream import ChatBroker
-from .config import ENGINE_NAME, RUNTIME_CONTEXT_KEYS, Settings, get_settings
+from .config import ENGINE_NAME, Settings, get_settings
 from .db import JobStore
 from .feature_prompts import stage_name
 from .fixer import ensure_session_store
@@ -512,10 +512,15 @@ async def put_context(body: ContextBody):
 
 @app.delete("/api/context", dependencies=[Depends(require_admin)])
 async def reset_context():
-    """Drop every stored override — revert to the env/code defaults."""
+    """Drop every stored override — revert the INSTANCE-owned fields to env/code
+    defaults. Repo topology belongs to workspaces (§12): resetting must never
+    clobber the workspace-merged map, and we re-sync it to be safe (finding
+    1595745/0 — a default-map settings.repo_map would silently skip sentry
+    issues for workspace-only projects until the next workspace edit)."""
     app.state.store.config_clear()
-    for key in RUNTIME_CONTEXT_KEYS:
+    for key in ("product_name", "business_context"):
         setattr(settings, key, getattr(_default_settings, key))
+    _ws_svc().sync_settings()
     return _context_payload(warning=_live_unmapped_warning(app.state.store))
 
 

@@ -288,13 +288,18 @@ class Settings(BaseSettings):
                 if value or key == "business_context":
                     staged[key] = value
         # fail closed: a canonical project outside the map would silently kill
-        # product-scope memory for every client-repo run
-        canonical = staged.get("memory_canonical_project", self.memory_canonical_project)
-        repo_map = staged.get("repo_map", self.repo_map)
-        if canonical not in json.loads(repo_map):
-            raise ValueError(
-                f"canonical project '{canonical}' is not a project slug in the repo map"
-            )
+        # product-scope memory for every client-repo run. Checked ONLY when one
+        # of the two involved fields is being staged — workspaces own canonical
+        # validation now (WorkspaceService.update), and the legacy instance
+        # value may legitimately be absent from the workspace-merged map, which
+        # must not block unrelated edits like product_name (finding 1595745)
+        if "repo_map" in staged or "memory_canonical_project" in staged:
+            canonical = staged.get("memory_canonical_project", self.memory_canonical_project)
+            repo_map = staged.get("repo_map", self.repo_map)
+            if canonical not in json.loads(repo_map):
+                raise ValueError(
+                    f"canonical project '{canonical}' is not a project slug in the repo map"
+                )
         return staged
 
     def apply_staged(self, staged: dict):
