@@ -985,7 +985,7 @@ async function loadMe() {
       const ctx = document.querySelector('details.ctx');
       if (ctx) ctx.style.display = 'none';
     }
-    if (ME.must_change_pw) openAccount(true);
+    if (ME.must_change_pw) openAccount();
   } catch (e) { /* transient; refresh() handles persistent 401s */ }
 }
 
@@ -1045,15 +1045,19 @@ function uiMsg(text) {
 function openSettings() {
   document.getElementById('shell').style.display = 'none';
   document.getElementById('settings-pane').style.display = '';
-  document.getElementById('sp-title').textContent = 'Settings';
+  document.getElementById('sp-title').textContent =
+    (ME && ME.must_change_pw) ? 'Set your password' : 'Settings';
   if (ME && ME.role === 'admin') { loadUsers(); renderWorkspacesAdmin(); }
 }
-function openAccount(forced) {
-  openSettings();
+function openAccount() {
   // forced = signed in on a temporary password. The screen must SAY so and
   // demand exactly one thing: the banner explains, every other panel hides,
   // and the back button goes with them (closeSettings refuses anyway).
-  document.body.classList.toggle('forced-pw', !!forced);
+  // Derived from ME, never from the caller — any entry point (topbar Account
+  // button included) must land in the same state.
+  const forced = !!(ME && ME.must_change_pw);
+  openSettings();
+  document.body.classList.toggle('forced-pw', forced);
   document.getElementById('pw-banner').style.display = forced ? '' : 'none';
   document.getElementById('sp-title').textContent = forced ? 'Set your password' : 'Settings';
   if (forced) { document.getElementById('pw-cur').focus(); return; }
