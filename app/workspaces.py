@@ -141,12 +141,16 @@ class WorkspaceService:
 
     def clickup_route(self, project_slug: str) -> tuple[bool, str | None]:
         """(enabled, list_id) for tickets on this project's workspace. Falls
-        back to instance settings for unmapped slugs (legacy behavior)."""
+        back to instance settings for unmapped slugs (legacy behavior).
+        Enabled REQUIRES the workspace's own list id (validated at save;
+        re-checked here so a legacy/hand-edited row can never silently route
+        tickets into the instance-global list — sentry finding 1595595)."""
         ws = self.for_project(project_slug)
         if ws is None:
             return bool(self.settings.clickup_token and self.settings.clickup_list_id), None
-        return bool(self.settings.clickup_token and ws["clickup_enabled"]), \
-            (ws["clickup_list_id"] or None)
+        list_id = (ws["clickup_list_id"] or "").strip()
+        return bool(self.settings.clickup_token and ws["clickup_enabled"] and list_id), \
+            (list_id or None)
 
     async def notify_gate(self, job: dict, text: str):
         """Best-effort Slack nudge at gate park — the dashboard-only nudge
@@ -172,6 +176,9 @@ class WorkspaceService:
         if self.store.workspace_get_by_slug(slug):
             raise WorkspaceError(f"workspace '{slug}' already exists")
         clean = self._clean_fields(fields)
+        if clean.get("clickup_enabled") and not str(clean.get("clickup_list_id") or "").strip():
+            raise WorkspaceError(
+                "ClickUp mirroring needs this workspace's list id — set it or disable mirroring")
         ws = self.store.workspace_create(slug, (name or slug).strip(), **clean)
         self.sync_settings()
         return ws
@@ -199,6 +206,12 @@ class WorkspaceService:
             if clean["canonical_project"] not in own:
                 raise WorkspaceError(
                     f"canonical project '{clean['canonical_project']}' is not a repo slug in this workspace")
+        # co-validation against the MERGED state: enabling ClickUp without a
+        # list id would silently fall back to the instance-global list
+        if clean.get("clickup_enabled", ws["clickup_enabled"]) and \
+                not str(clean.get("clickup_list_id", ws["clickup_list_id"]) or "").strip():
+            raise WorkspaceError(
+                "ClickUp mirroring needs this workspace's list id — set it or disable mirroring")
         if clean:
             self.store.workspace_set(ws["id"], **clean)
         self.sync_settings()

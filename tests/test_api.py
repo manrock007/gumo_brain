@@ -150,6 +150,15 @@ def test_workspace_crud_and_repo_move(client):
                      json={"repos": [{"slug": "gumo", "repo": "acme/api"}]})
     assert r.status_code == 400 and "already used" in r.json()["detail"]
 
+    # enabling ClickUp without the workspace's own list id would silently
+    # route tickets into the instance-global list — refused (finding 1595595)
+    r = client.patch(f"/api/workspaces/{app_id}", headers=AUTH,
+                     json={"clickup_enabled": True})
+    assert r.status_code == 400 and "list id" in r.json()["detail"]
+    r = client.patch(f"/api/workspaces/{app_id}", headers=AUTH,
+                     json={"clickup_enabled": True, "clickup_list_id": "9016000000"})
+    assert r.status_code == 200 and r.json()["clickup_enabled"] is True
+
     # valid repos + canonical
     r = client.patch(f"/api/workspaces/{app_id}", headers=AUTH,
                      json={"repos": [{"slug": "acme-api", "repo": "acme/api"}],
