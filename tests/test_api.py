@@ -134,6 +134,13 @@ def test_workspace_crud_and_repo_move(client):
     assert "gumo" in ws_list[0]["repos"]  # migration wrapped the §10 map
     default_id = ws_list[0]["id"]
 
+    # all-numeric slugs must not be misrouted into id lookups (finding 1595569):
+    # creating '123' twice yields a clean 400, not a 500
+    assert client.post("/api/workspaces", headers=AUTH,
+                       json={"slug": "123", "name": "Numeric"}).status_code == 200
+    r = client.post("/api/workspaces", headers=AUTH, json={"slug": "123", "name": "Numeric"})
+    assert r.status_code == 400 and "already exists" in r.json()["detail"]
+
     # a second workspace cannot steal an existing slug
     r = client.post("/api/workspaces", headers=AUTH,
                     json={"slug": "app", "name": "App"})

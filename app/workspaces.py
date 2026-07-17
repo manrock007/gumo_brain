@@ -169,7 +169,7 @@ class WorkspaceService:
         slug = (slug or "").strip().lower()
         if not SLUG_RE.match(slug):
             raise WorkspaceError("workspace slug: 1-32 chars, a-z 0-9 and dashes")
-        if self.store.workspace_get(slug):
+        if self.store.workspace_get_by_slug(slug):
             raise WorkspaceError(f"workspace '{slug}' already exists")
         clean = self._clean_fields(fields)
         ws = self.store.workspace_create(slug, (name or slug).strip(), **clean)

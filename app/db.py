@@ -392,13 +392,18 @@ class JobStore:
             rows = c.execute("SELECT * FROM workspaces ORDER BY name").fetchall()
             return [dict(r) for r in rows]
 
-    def workspace_get(self, ref) -> dict | None:
-        """By numeric id or slug."""
+    def workspace_get(self, workspace_id: int) -> dict | None:
+        """By numeric id ONLY — slugs may be all-numeric, so id-vs-slug must
+        never be guessed from the value (sentry finding 1595569)."""
         with self._conn() as c:
-            if isinstance(ref, int) or (isinstance(ref, str) and ref.isdigit()):
-                row = c.execute("SELECT * FROM workspaces WHERE id = ?", (int(ref),)).fetchone()
-            else:
-                row = c.execute("SELECT * FROM workspaces WHERE slug = ?", (str(ref),)).fetchone()
+            row = c.execute("SELECT * FROM workspaces WHERE id = ?",
+                            (int(workspace_id),)).fetchone()
+            return dict(row) if row else None
+
+    def workspace_get_by_slug(self, slug: str) -> dict | None:
+        with self._conn() as c:
+            row = c.execute("SELECT * FROM workspaces WHERE slug = ?",
+                            (str(slug),)).fetchone()
             return dict(row) if row else None
 
     def workspace_create(self, slug: str, name: str, **fields) -> dict:
@@ -411,7 +416,7 @@ class JobStore:
                 f"VALUES (?, ?{', ' + marks if marks else ''}, ?, ?)",
                 (slug, name, *fields.values(), now, now),
             )
-        return self.workspace_get(slug)
+        return self.workspace_get_by_slug(slug)
 
     def workspace_set(self, workspace_id: int, **fields):
         cols = ", ".join(f"{k} = ?" for k in fields)
