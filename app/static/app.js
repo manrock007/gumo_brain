@@ -985,11 +985,7 @@ async function loadMe() {
       const ctx = document.querySelector('details.ctx');
       if (ctx) ctx.style.display = 'none';
     }
-    if (ME.must_change_pw) {
-      openAccount();
-      document.getElementById('acct-hint').textContent =
-        'Your password is temporary - set your own before doing anything else.';
-    }
+    if (ME.must_change_pw) openAccount(true);
   } catch (e) { /* transient; refresh() handles persistent 401s */ }
 }
 
@@ -1052,13 +1048,18 @@ function openSettings() {
   document.getElementById('sp-title').textContent = 'Settings';
   if (ME && ME.role === 'admin') { loadUsers(); renderWorkspacesAdmin(); }
 }
-function openAccount() {
+function openAccount(forced) {
   openSettings();
-  document.getElementById('sp-title').textContent = 'Settings';
+  // forced = signed in on a temporary password. The screen must SAY so and
+  // demand exactly one thing: the banner explains, every other panel hides,
+  // and the back button goes with them (closeSettings refuses anyway).
+  document.body.classList.toggle('forced-pw', !!forced);
+  document.getElementById('pw-banner').style.display = forced ? '' : 'none';
+  document.getElementById('sp-title').textContent = forced ? 'Set your password' : 'Settings';
+  if (forced) { document.getElementById('pw-cur').focus(); return; }
   // the Account panel sits below Users/Workspaces for admins — bring the
-  // password form into view, or a forced first sign-in can't find it. The
-  // panels above populate async and shift the layout, so anchor again after
-  // they settle.
+  // password form into view. The panels above populate async and shift the
+  // layout, so anchor again after they settle.
   const showForm = () => {
     document.getElementById('sp-account').scrollIntoView({ block: 'start' });
     document.getElementById('pw-cur').focus();
@@ -1074,6 +1075,9 @@ function goHome() {
   if (typeof closeItem === 'function') closeItem();
 }
 function closeSettings() {
+  // a temporary password blocks everything else — the forced screen can't be
+  // dismissed, only completed (or sign out)
+  if (ME && ME.must_change_pw) return;
   document.getElementById('settings-pane').style.display = 'none';
   document.getElementById('shell').style.display = '';
   if (ME && ME.role === 'admin') loadSetup();  // refresh ticks after settings work
