@@ -25,6 +25,15 @@
 </header>
 <div id="msg"></div>
 
+<!-- first-run wizard (§14): top-level banner so it is visible in every layout
+     mode — the welcome/intake pane is hidden until "+ New work" -->
+<div class="panel setup-card" id="setup-card" style="display:none">
+  <h2>Welcome to CtrlLoop &mdash; set it up for your team</h2>
+  <div class="hint">Work through these once &mdash; the checklist keeps itself up to date. Dismiss it whenever you're ready.</div>
+  <ul class="setup-steps" id="setup-steps"></ul>
+  <button class="tb-btn" onclick="dismissSetup()">Dismiss &mdash; setup is done</button>
+</div>
+
 <div class="shell solo" id="shell">
   <aside class="inbox">
     <div class="inbox-h">
@@ -41,12 +50,6 @@
 
   <section class="detail">
     <div class="welcome" id="welcome">
-      <div class="panel setup-card" id="setup-card" style="display:none">
-        <h2>Welcome to CtrlLoop &mdash; set it up for your team</h2>
-        <div class="hint">Work through these once &mdash; the checklist keeps itself up to date. Dismiss it whenever you're ready.</div>
-        <ul class="setup-steps" id="setup-steps"></ul>
-        <button class="tb-btn" onclick="dismissSetup()">Dismiss &mdash; setup is done</button>
-      </div>
       <div class="section-label">New work</div>
       <div class="intake">
         <div class="panel">

@@ -270,8 +270,8 @@
 .settings-pane .sp-head h2 { margin: 0; font-size: 17px; }
 .settings-pane .sp-msg { margin-left: auto; color: var(--fg-2); font-size: 12.5px; }
 
-/* first-run setup wizard (§14) */
-.setup-card { border-color: var(--accent); }
+/* first-run setup wizard (§14) — top-level banner, visible in every layout */
+.setup-card { border-color: var(--accent); max-width: 860px; margin: 16px auto 0; }
 .setup-steps { list-style: none; margin: 12px 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
 .setup-steps li { display: flex; gap: 10px; align-items: baseline; }
 .setup-steps li.done .s-t { color: var(--muted); text-decoration: line-through; }

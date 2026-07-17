@@ -6,6 +6,12 @@ const STATUS_LABEL = { received: 'Received', queued: 'Queued', running: 'Running
 const LIVE = ['received', 'queued', 'running', 'awaiting_input'];
 const NL = String.fromCharCode(10);
 
+// session-wide state, declared BEFORE anything that can run during initial
+// script evaluation (renderInbox fires from routeHash at load — a later `let`
+// would be a temporal-dead-zone crash that kills the whole script)
+let ME = null;
+let WORKSPACES = [];
+
 function esc(s) { const d = document.createElement('span'); d.textContent = s == null ? '' : String(s); return d.innerHTML; }
 
 // URL matcher built WITHOUT regex-literal escapes: this file ships inside a
@@ -961,8 +967,6 @@ setInterval(() => refreshMemory(false), 60000);
 
 // ---------- auth: who am I, sign-out, expired-session redirect ----------
 
-let ME = null;
-
 async function loadMe() {
   try {
     const r = await fetch('api/me');
@@ -1155,7 +1159,6 @@ loadMe();
 
 // ---------- workspaces (Phase 2): switcher + scoping + admin editor ----------
 
-let WORKSPACES = [];
 let activeWs = parseInt(localStorage.getItem('cl-ws') || '0', 10) || null;
 
 async function loadWorkspaces() {
