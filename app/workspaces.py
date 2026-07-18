@@ -19,7 +19,7 @@ import logging
 import re
 import sqlite3
 
-from . import roles
+from . import analytics, roles
 from .config import DEFAULT_PRODUCT_NAME, Settings, validate_repo_map, validate_stage_role_map
 from .db import JobStore
 
@@ -30,7 +30,8 @@ SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 WORKSPACE_FIELDS = ("name", "product_name", "workspace_context", "canonical_project",
                     "clickup_list_id", "clickup_enabled", "slack_webhook_url",
                     "gate_mode_default", "require_attributed_answers",
-                    "stage_role_map", "gate_sla_hours")
+                    "stage_role_map", "gate_sla_hours",
+                    "analytics_provider", "analytics_config")
 
 WORKSPACE_CONTEXT_CAP = 4000
 
@@ -273,6 +274,29 @@ class WorkspaceService:
                     clean[key] = json.dumps(validate_stage_role_map(mapping))
                 except (ValueError, TypeError) as e:
                     raise WorkspaceError(f"stage_role_map: {e}")
+            elif key == "analytics_provider":
+                # allowed names come from the analytics registry — one list,
+                # so the validator can't drift when the next driver lands
+                value = str(value).strip().lower()
+                if value not in analytics.ANALYTICS_PROVIDERS:
+                    raise WorkspaceError(
+                        "analytics_provider must be one of: "
+                        + ", ".join(f"'{p}'" for p in analytics.ANALYTICS_PROVIDERS))
+                clean[key] = value
+            elif key == "analytics_config":
+                # dict (API body) or JSON string; must be an object. Fail
+                # closed: malformed -> 400, nothing changes. Stored verbatim
+                # (SECRET AT REST) — public() never returns it.
+                if isinstance(value, str) and not value.strip():
+                    clean[key] = "{}"  # explicit clear
+                    continue
+                try:
+                    parsed = json.loads(value) if isinstance(value, str) else value
+                    if not isinstance(parsed, dict):
+                        raise ValueError("must be a JSON object")
+                except (ValueError, TypeError) as e:
+                    raise WorkspaceError(f"analytics_config: {e}")
+                clean[key] = json.dumps(parsed)
             elif key == "gate_sla_hours":
                 # empty string -> NULL = inherit the instance default
                 if isinstance(value, str) and not value.strip():
@@ -298,8 +322,27 @@ class WorkspaceService:
                 clean[key] = value
         return clean
 
+    def analytics_for(self, ws: dict | None):
+        """The workspace's analytics driver (Epic B3) — NullAnalytics when
+        nothing is configured, so callers never branch on 'no analytics'."""
+        return analytics.provider_for(self.settings, ws)
+
+    @staticmethod
+    def _analytics_configured(ws: dict) -> bool:
+        """Configured-ness WITHOUT the secret: does the stored config carry any
+        substantive key? The dashboard shows this boolean, never the config."""
+        if not str(ws.get("analytics_provider") or "").strip():
+            return False
+        try:
+            config = json.loads(ws.get("analytics_config") or "{}")
+        except (ValueError, TypeError):
+            return False
+        return any(str(config.get(k) or "").strip()
+                   for k in ("project_id", "service_account", "secret"))
+
     def public(self, ws: dict) -> dict:
-        """API/dashboard shape, repos + members inlined."""
+        """API/dashboard shape, repos + members inlined. NEVER includes
+        analytics_config — it holds the provider secret."""
         return {
             "id": ws["id"], "slug": ws["slug"], "name": ws["name"],
             "product_name": ws["product_name"],
@@ -312,6 +355,8 @@ class WorkspaceService:
             "require_attributed_answers": ws.get("require_attributed_answers") or "auto",
             "stage_role_map": ws.get("stage_role_map") or "",
             "gate_sla_hours": ws.get("gate_sla_hours"),
+            "analytics_provider": ws.get("analytics_provider") or "",
+            "analytics_configured": self._analytics_configured(ws),
             # the fully-merged 0–9 ownership ladder, so the UI shows effective
             # ownership without duplicating the merge logic client-side
             "stage_roles": {str(i): roles.role_for_stage(self.settings, ws, i)
