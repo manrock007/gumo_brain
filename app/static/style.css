@@ -113,6 +113,18 @@
   .badge.queued, .badge.received { color:var(--info); background:var(--info-weak); }
   .badge.no_fix, .badge.skipped { color:var(--muted); background:var(--surface-3); }
   .badge.overdue { color:var(--err); background:var(--err-weak); }
+  .badge.watching { color:var(--info); background:var(--info-weak); }
+  .badge.done { color:var(--ok); background:var(--ok-weak); }
+  /* outcome verdict chips (Epic B5) */
+  .vchip { display:inline-block; padding:2px 9px; border-radius:999px; font-size:11px; font-weight:650; }
+  .vchip.v-moved { color:var(--ok); background:var(--ok-weak); }
+  .vchip.v-flat { color:var(--muted); background:var(--surface-3); }
+  .vchip.v-regressed { color:var(--err); background:var(--err-weak); }
+  .vchip.v-unmeasured { color:var(--info); background:var(--info-weak); }
+  .vcard .vc-m { font-size:12.5px; color:var(--fg); margin-left:8px; }
+  .vcard .vc-l { margin-top:8px; font-size:12.5px; color:var(--muted); }
+  .vcard .vc-r { margin-top:8px; font-size:11.5px; color:var(--muted); display:flex; flex-wrap:wrap; gap:8px; }
+  .vcard { padding:12px 14px; }
   .badge.kind { background:transparent; color:var(--muted); border:1px solid var(--line-2); font-weight:550; }
   .badge.kind::before { display:none; }
   .chip { display:inline-flex; align-items:center; font-size:10.5px; font-weight:600; padding:1px 8px;

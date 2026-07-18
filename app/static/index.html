@@ -79,6 +79,9 @@
             <div class="hint">&hellip;or describe the feature and a ClickUp ticket is created:</div>
             <input id="feat-title" placeholder="Title">
             <textarea id="feat-summary" placeholder="What should be built? Goal, users, constraints, links&hellip;"></textarea>
+            <input id="feat-metric" placeholder="Success metric — what should move (optional)">
+            <input id="feat-target" placeholder="Target value (optional, e.g. '>= 15%' or 'under 300ms')">
+            <input id="feat-window" placeholder="Measurement window, days (default 14)">
             <input id="feat-founder-dri" placeholder="Founder DRI — ClickUp user id or CtrlLoop username (owns P0/P1/P9 gates)">
             <input id="feat-dev-dri" placeholder="Dev DRI — ClickUp user id or CtrlLoop username (owns P2–P8 gates)">
             <select id="feat-gatemode">
@@ -94,6 +97,10 @@
       <details class="brain">
         <summary>Product brain <span class="hint" style="display:inline">&mdash; per-repo memory freshness</span></summary>
         <div id="brain-body"><div class="empty">loading&hellip;</div></div>
+      </details>
+      <details class="brain" id="outcomes-panel" style="margin-top:14px">
+        <summary>Outcomes <span class="hint" style="display:inline">&mdash; measured verdicts per shipped feature</span></summary>
+        <div id="outcomes-body"><div class="empty">loading&hellip;</div></div>
       </details>
       <details class="brain ctx" style="margin-top:14px">
         <summary>Project context <span class="hint" style="display:inline">&mdash; the repos + business context the engine works on</span></summary>

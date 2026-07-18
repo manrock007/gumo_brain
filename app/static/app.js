@@ -1,9 +1,10 @@
 const STAGE_NAMES = ['Intake', 'PRD', 'Recon', 'Design', 'Plan', 'Build 1', 'Build 2+', 'Test', 'Review', 'Ship'];
-const KIND_LABEL = { sentry: 'sentry', task: 'request', feature: 'feature', memory: 'memory' };
+const KIND_LABEL = { sentry: 'sentry', task: 'request', feature: 'feature', memory: 'memory', watch: 'watch' };
 const STATUS_LABEL = { received: 'Received', queued: 'Queued', running: 'Running',
   awaiting_input: 'Awaiting you', pr_opened: 'PR opened', no_fix: 'No fix',
-  skipped: 'Skipped', error: 'Error', timeout: 'Timeout' };
-const LIVE = ['received', 'queued', 'running', 'awaiting_input'];
+  skipped: 'Skipped', error: 'Error', timeout: 'Timeout',
+  watching: 'Watching', done: 'Done' };
+const LIVE = ['received', 'queued', 'running', 'awaiting_input', 'watching'];
 const NL = String.fromCharCode(10);
 
 // session-wide state, declared BEFORE anything that can run during initial
@@ -360,11 +361,13 @@ function gatePacket(data) {
       ${ownerLine}<div class="answer"><div class="btns">
       <button class="redo" onclick="answer('${id}','redo',this)"${dis}>Re-kick (redo)</button></div>${ovrBox}</div></div>`;
   }
+  const watch = j.kind === 'watch';
   const isAsk = feature && j.gate_kind === 'ask';
   const goLabel = isAsk ? 'Answer' : 'Proceed';
   const head = isAsk ? 'The engine asks — resumes in place'
-    : (feature ? 'Gate — P' + j.stage + ' ' + esc(j.stage_name || '') : 'Needs your input');
-  const btns = feature
+    : (feature ? 'Gate — P' + j.stage + ' ' + esc(j.stage_name || '')
+      : (watch ? 'Iterate gate — outcome verdict' : 'Needs your input'));
+  const btns = (feature || watch)
     ? `<button class="go" onclick="answer('${id}','proceed',this)"${dis}>${goLabel}</button>
        <button class="redo" onclick="answer('${id}','redo',this)"${dis}>Redo</button>
        <button class="no" onclick="answer('${id}','skip',this)"${dis}>Skip</button>`
@@ -372,7 +375,9 @@ function gatePacket(data) {
        <button class="no" onclick="answer('${id}','skip',this)">Skip</button>`;
   const hint = feature
     ? `<div class="hint">Redo re-runs this stage with your notes as corrections &mdash; optionally prefix 'P3 ' to redo an earlier stage.</div>`
-    : '';
+    : (watch
+      ? `<div class="hint">Proceed = log the learning &amp; close &middot; Redo &lt;days&gt; = watch again &middot; Skip = close without a learning.</div>`
+      : '');
   return `<div class="gate"><div class="g-h">${head}</div>
     ${ownerLine}
     <div class="q">${esc(j.question || (j.detail || '(see analysis)').slice(0, 500))}</div>
@@ -385,6 +390,34 @@ function gatePacket(data) {
 // arm/disarm the gate buttons when the admin toggles the override checkbox
 function armOverride(on) {
   for (const b of document.querySelectorAll('#d-thread .gate .btns button')) b.disabled = !on;
+}
+
+function verdictCard(data) {
+  // outcome loop (Epic B5): the measured verdict on watch + feature panes
+  const o = data.outcome;
+  const j = data.job;
+  if (!o && !(j.kind === 'watch' || j.success_metric || j.metric_event)) return '';
+  let inner = '';
+  if (o) {
+    inner = `<span class="vchip v-${esc(o.verdict || 'unmeasured')}">${esc(o.verdict || 'unmeasured')}</span>
+      <span class="vc-m">${esc(o.metric || '(no metric)')}${o.target ? ' &middot; target ' + esc(o.target) : ''}
+      &middot; observed ${o.observed == null ? '&mdash;' : esc(String(o.observed))}
+      ${o.baseline == null ? '' : '&middot; baseline ' + esc(String(o.baseline))}
+      &middot; ${esc(String(o.window_days || '?'))}d window</span>`
+      + (o.learning ? `<div class="vc-l">Learning: ${esc(o.learning)}</div>` : '');
+  } else {
+    const dl = j.watch_deadline ? new Date(j.watch_deadline * 1000).toLocaleDateString() : '';
+    inner = `<span class="vc-m">Metric: ${esc(j.success_metric || j.metric_event || '(none)')}`
+      + (j.metric_target ? ' &middot; target ' + esc(j.metric_target) : '')
+      + (j.metric_window_days ? ' &middot; ' + esc(String(j.metric_window_days)) + 'd window' : '')
+      + (j.kind === 'watch' && dl ? ' &middot; verdict due ' + esc(dl) : '') + '</span>';
+  }
+  const reads = (data.readings || []).filter((r) => r.window_day != null);
+  const readRow = reads.length
+    ? `<div class="vc-r">${reads.slice(-14).map((r) =>
+        `<span title="day ${esc(String(r.window_day))}">d${esc(String(r.window_day))}: ${r.observed == null ? '?' : esc(String(r.observed))}</span>`).join(' ')}</div>`
+    : '';
+  return `<div class="daydiv">&mdash; outcome &mdash;</div><div class="stage"><div class="inner vcard" style="border-top:0">${inner}${readRow}</div></div>`;
 }
 
 function renderDetail(data) {
@@ -422,7 +455,7 @@ function renderDetail(data) {
     ? '<div class="daydiv">&mdash; conversation &mdash;</div>'
       + (convoThread(data) || '<div class="lead">no messages yet &mdash; ask the engine anything about this work</div>')
     : '';
-  document.getElementById('d-thread').innerHTML = pipeline + activity + prSection(data) + convo + gatePacket(data);
+  document.getElementById('d-thread').innerHTML = pipeline + activity + prSection(data) + verdictCard(data) + convo + gatePacket(data);
   restoreThread(st);
   wireTranscripts(j.issue_id);
 
@@ -799,6 +832,41 @@ async function bootstrap(project, btn) {
   if (lastMemData) renderMemory(lastMemData); else btn.disabled = false;
 }
 
+// ---------- outcome ledger (api/outcomes, Epic B5) ----------
+
+async function loadOutcomes() {
+  try {
+    const r = await fetch('api/outcomes');
+    if (!r.ok) return;
+    renderOutcomes(await r.json());
+  } catch (e) { /* keep the previous view */ }
+}
+
+function renderOutcomes(data) {
+  const el = document.getElementById('outcomes-body');
+  if (!el) return;
+  const v = data.verdicts || {};
+  const chips = ['moved', 'flat', 'regressed', 'unmeasured'].map(
+    (k) => `<span class="vchip v-${k}">${esc(k)} ${Number(v[k] || 0)}</span>`).join(' ');
+  const rows = (data.outcomes || []).map((o) => {
+    const when = o.decided_at || o.created_at;
+    return `<tr>
+      <td><a href="#/job/${esc(o.feature_id)}">${esc(o.feature_id || '?')}</a></td>
+      <td>${esc(o.metric || '')}</td>
+      <td>${esc(o.target || '')}</td>
+      <td>${o.observed == null ? '&mdash;' : esc(String(o.observed))}</td>
+      <td><span class="vchip v-${esc(o.verdict || 'unmeasured')}">${esc(o.verdict || 'unmeasured')}</span></td>
+      <td>${esc((o.learning || '').slice(0, 120))}</td>
+      <td>${esc(o.decided_by || '')}${when ? ' &middot; ' + fmtAgo(when) : ''}</td>
+    </tr>`;
+  }).join('');
+  el.innerHTML = `<div class="vchips" style="margin-top:10px">${chips}</div>`
+    + (rows
+      ? `<table><tr><th>feature</th><th>metric</th><th>target</th><th>observed</th>
+         <th>verdict</th><th>learning</th><th>decided</th></tr>${rows}</table>`
+      : '<div class="empty">no measured outcomes yet &mdash; ship a feature with a success metric</div>');
+}
+
 // ---------- project context (api/context) ----------
 
 let ctxData = null;
@@ -980,7 +1048,18 @@ async function submitFeature(ev) {
     dev_dri: document.getElementById('feat-dev-dri').value.trim(),
     gate_mode: document.getElementById('feat-gatemode').value,
     related_to: document.getElementById('feat-related').value.trim(),
+    success_metric: document.getElementById('feat-metric').value.trim(),
+    metric_target: document.getElementById('feat-target').value.trim(),
   };
+  const windowRaw = document.getElementById('feat-window').value.trim();
+  if (windowRaw) {
+    const w = Number(windowRaw);
+    if (!Number.isInteger(w) || w < 1 || w > 365) {
+      msg.textContent = 'Measurement window must be a whole number of days, 1-365.';
+      return false;
+    }
+    body.metric_window_days = w;
+  }
   if (!body.project) { msg.textContent = 'Pick a project first.'; return false; }
   if (!body.clickup && !body.title) { msg.textContent = 'Give a ClickUp URL or a title.'; return false; }
   btn.disabled = true; msg.textContent = 'Creating ticket + starting P0 Intake…';
@@ -995,7 +1074,8 @@ async function submitFeature(ev) {
       : 'Error: ' + esc(data.detail || r.status);
     if (r.ok) {
       for (const id of ['feat-clickup', 'feat-title', 'feat-summary',
-                        'feat-founder-dri', 'feat-dev-dri', 'feat-related'])
+                        'feat-founder-dri', 'feat-dev-dri', 'feat-related',
+                        'feat-metric', 'feat-target', 'feat-window'])
         document.getElementById(id).value = '';
       refresh(true);
     }
@@ -1015,9 +1095,10 @@ document.addEventListener('keydown', (e) => {
 });
 window.addEventListener('hashchange', routeHash);
 
-loadProjects(); refresh(true); refreshMemory(true); loadContext(); routeHash();
+loadProjects(); refresh(true); refreshMemory(true); loadContext(); loadOutcomes(); routeHash();
 setInterval(() => refresh(false), 10000);
 setInterval(() => refreshMemory(false), 60000);
+setInterval(() => loadOutcomes(), 60000);
 
 // ---------- auth: who am I, sign-out, expired-session redirect ----------
 
