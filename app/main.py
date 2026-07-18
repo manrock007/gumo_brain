@@ -3,6 +3,7 @@ import html
 import json
 import logging
 import re
+import secrets
 import sqlite3
 import time
 import uuid
@@ -39,7 +40,7 @@ from .feature_prompts import stage_name
 from .fixer import ensure_session_store
 from .memory import MemoryReader
 from .sentry_api import extract_issue_ref, verify_signature
-from . import audit, autonomy, identity, inboxlib, people, roles, routines
+from . import audit, autonomy, identity, inboxlib, people, rbac, roles, routines
 from .worker import GateConflict, GateForbidden, Worker
 from .workspaces import WorkspaceError, WorkspaceNotFound, WorkspaceService
 from . import transcripts
@@ -55,6 +56,9 @@ SHORT_ID_RE = re.compile(r"^[A-Z][A-Z0-9_-]*-[A-Z0-9]+$")
 CLICKUP_URL_RE = re.compile(r"app\.clickup\.com/t/(?:\d+/)?([A-Za-z0-9_-]+)")
 CLICKUP_ID_RE = re.compile(r"^[A-Za-z0-9_-]{4,}$")
 USERNAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{1,31}$")
+
+# OIDC login state bound to the initiating browser (login-CSRF / fixation guard).
+OIDC_STATE_COOKIE = "ctl_oidc_state"
 
 
 @asynccontextmanager
@@ -312,7 +316,15 @@ async def login_oidc(request: Request):
         return RedirectResponse("login?error=oidc")
     app.state.store.oidc_txn_create(state, nonce, redirect_after="/")
     from urllib.parse import urlencode
-    return RedirectResponse(f"{endpoint}?{urlencode(params)}")
+    resp = RedirectResponse(f"{endpoint}?{urlencode(params)}")
+    # Login-CSRF / session-fixation guard: bind `state` to THIS browser. The
+    # callback must present the same value in this cookie, so an attacker cannot
+    # complete their own login in a victim's browser (the victim never holds the
+    # attacker's state cookie). SameSite=lax still rides the top-level IdP
+    # redirect back to the callback. Short-lived, single txn.
+    resp.set_cookie(OIDC_STATE_COOKIE, state, httponly=True, samesite="lax",
+                    secure=settings.session_cookie_secure, max_age=600, path="/")
+    return resp
 
 
 @app.get("/auth/oidc/callback")
@@ -322,9 +334,19 @@ async def oidc_callback(request: Request, response: Response,
     store: JobStore = app.state.store
     if provider is None or not code or not state:
         return RedirectResponse("../login?error=oidc")
+    # Login-CSRF / session-fixation guard: `state` must match the value bound to
+    # this browser in login_oidc. Absent/mismatched -> fail closed, and never
+    # consume the server-side txn (an attacker probing states cannot burn them).
+    cookie_state = request.cookies.get(OIDC_STATE_COOKIE) or ""
+    if not cookie_state or not secrets.compare_digest(cookie_state, state):
+        resp = RedirectResponse("../login?error=state")
+        resp.delete_cookie(OIDC_STATE_COOKIE, path="/")
+        return resp
     txn = store.oidc_txn_take(state)
     if txn is None:  # unknown / replayed / expired -> fail closed
-        return RedirectResponse("../login?error=state")
+        resp = RedirectResponse("../login?error=state")
+        resp.delete_cookie(OIDC_STATE_COOKIE, path="/")
+        return resp
     try:
         claims = provider.exchange_and_validate(settings, code, txn["nonce"])
         user = jit_provision(store, settings, provider, claims)
@@ -342,6 +364,7 @@ async def oidc_callback(request: Request, response: Response,
     resp.set_cookie(SESSION_COOKIE, token, httponly=True, samesite="lax",
                     secure=settings.session_cookie_secure,
                     max_age=settings.auth_session_ttl_days * 86400, path="/")
+    resp.delete_cookie(OIDC_STATE_COOKIE, path="/")  # single-use state consumed
     return resp
 
 
@@ -396,7 +419,17 @@ async def create_token(body: TokenCreateBody, user: dict = Depends(require_user)
     ttl = body.ttl_days if body.ttl_days is not None else settings.api_token_default_ttl_days
     if ttl is not None and ttl < 0:
         raise HTTPException(status_code=400, detail="ttl_days must be >= 0 (0 = no expiry)")
-    scopes = json.dumps(body.scopes) if body.scopes else ""
+    # Epic E2: `scopes` is reserved but NOT yet enforced — every ctl_ token
+    # inherits the owner's full role. Accepting+echoing a non-empty scopes list
+    # would present a token as least-privilege while granting full power (a
+    # confused-deputy trap). Fail closed: reject until enforcement lands, rather
+    # than mint a token that silently ignores its own restriction.
+    if body.scopes:
+        raise HTTPException(
+            status_code=400,
+            detail="scoped tokens are not yet supported — omit 'scopes' (a token "
+                   "inherits the owner's full role); scope enforcement is reserved")
+    scopes = ""
     token, row = store.api_token_create(user["id"], name=(body.name or "").strip()[:80],
                                         scopes=scopes, ttl_days=ttl or 0)
     audit.record(store, audit.TOKEN_CREATE, actor=audit.dashboard_actor(user),
@@ -539,8 +572,8 @@ async def people_list(user: dict = Depends(require_user)):
     return out
 
 
-@app.post("/api/users", dependencies=[Depends(require_admin)])
-async def users_create(body: UserCreateBody):
+@app.post("/api/users")
+async def users_create(body: UserCreateBody, admin: dict = Depends(require_admin)):
     store: JobStore = app.state.store
     username = body.username.strip()
     if not USERNAME_RE.match(username):
@@ -556,6 +589,10 @@ async def users_create(body: UserCreateBody):
         raise HTTPException(status_code=409, detail=f"user '{username}' already exists")
     user = store.user_create(username, hash_password(body.password), role=role,
                              must_change_pw=True)
+    # Epic E4: creating an account is authority-moving — audit it (actor = the
+    # acting admin), or a new principal appears with no trace in the SIEM export.
+    audit.record(store, audit.USER_CREATE, actor=audit.dashboard_actor(admin),
+                 actor_kind="user", target=username, detail={"role": role})
     return _public_user(user)
 
 
@@ -579,12 +616,21 @@ async def users_patch(username: str, body: UserPatchBody,
             raise HTTPException(status_code=400,
                                 detail="cannot demote the last instance admin")
         store.user_set(username, role=role)
+        # Epic E4: an instance-role change moves authority (privilege grant /
+        # revoke) — audit the before/after with the acting admin.
+        audit.record(store, audit.USER_ROLE, actor=audit.dashboard_actor(admin),
+                     actor_kind="user", target=username,
+                     detail={"from": user.get("role") or "member", "to": role})
     if body.disabled is not None:
         if user["username"] == admin["username"] and body.disabled:
             raise HTTPException(status_code=400, detail="you cannot disable yourself")
         store.user_set(username, disabled=int(body.disabled))
         if body.disabled:
             store.auth_sessions_revoke_user(user["id"])
+        # Epic E4: enable/disable is offboarding/reinstatement — always audited.
+        audit.record(store, audit.USER_DISABLE, actor=audit.dashboard_actor(admin),
+                     actor_kind="user", target=username,
+                     detail={"disabled": bool(body.disabled)})
     if body.password is not None:
         if user["username"] == admin["username"]:
             # the admin reset hands out a TEMPORARY credential (arms
@@ -596,6 +642,11 @@ async def users_patch(username: str, body: UserPatchBody,
         store.user_set(username, pw_hash=hash_password(body.password), must_change_pw=1,
                        failed_attempts=0, locked_until=None)
         store.auth_sessions_revoke_user(user["id"])
+        # Epic E4: a forced credential reset is a security-sensitive mutation
+        # (it hands out a temporary password and kills live sessions) — audit it.
+        audit.record(store, audit.USER_UPDATE, actor=audit.dashboard_actor(admin),
+                     actor_kind="user", target=username,
+                     detail={"action": "password_reset"})
     if body.clickup_user_id is not None:
         # Epic A1: link/clear a ClickUp identity. One ClickUp id maps to at
         # most ONE user (any state) — read-side 409 for a clean message, and
@@ -748,6 +799,14 @@ def _require_project_access(project: str, user: dict):
     ws = _ws_svc().for_project(project)
     if ws is None or not _ws_svc().user_can_access(user, ws["id"]):
         raise HTTPException(status_code=400, detail=f"unknown project '{project}'")
+    # Epic E3 (RBAC v2): membership is visibility, not write authority. A viewer
+    # is read-only; a repo-restricted member may only submit against an
+    # allow-listed repo. Instance/workspace admins pass (can_submit -> True).
+    if not rbac.can_submit(app.state.store, user, ws["id"], project):
+        raise HTTPException(
+            status_code=403,
+            detail="write access required — this workspace role is read-only "
+                   "(viewer) or this repo is not in your allow-list")
 
 
 @app.get("/api/workspaces")
@@ -1857,7 +1916,15 @@ async def answer_job(job_id: str, body: AnswerBody, user: dict = Depends(require
     action = body.action.strip().lower()
     if action not in ("proceed", "redo", "skip"):
         raise HTTPException(status_code=400, detail="action must be 'proceed', 'redo' or 'skip'")
-    _job_scoped(job_id, user)
+    job = _job_scoped(job_id, user)
+    # Epic E3 (RBAC v2): answering a gate is a write. A viewer is read-only, and
+    # a repo-restricted member may not answer gates for a repo outside their
+    # allow-list. Instance/workspace admins pass (can_answer_gate -> True). The
+    # role-EXCLUSIVE DRI gate is enforced separately inside worker.answer_job.
+    if not rbac.can_answer_gate(app.state.store, user, job.get("workspace_id"),
+                                job.get("project") or ""):
+        raise HTTPException(status_code=403,
+                            detail="read-only (viewer) — gate answers require write access")
     worker: Worker = app.state.worker
     try:
         status = await worker.answer_job(job_id, action, body.answer.strip(),

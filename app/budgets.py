@@ -44,13 +44,18 @@ def budget_status(store, settings, workspace: dict | None, now: float | None = N
             "pct": round(pct, 1), "state": state}
 
 
-def should_block(store, settings, workspace: dict | None, forced: bool,
+def should_block(store, settings, workspace: dict | None, override: bool,
                  now: float | None = None) -> tuple[bool, dict]:
     """(blocked, status). A run is blocked only when block is enabled, the
-    workspace is at/over 100%, and the run is NOT forced (the admin override).
-    Fail closed to NOT blocking when budget is inert (0)."""
+    workspace is at/over 100%, and the run does NOT carry an explicit budget
+    override. Fail closed to NOT blocking when budget is inert (0).
+
+    IMPORTANT: `override` must be a DELIBERATE budget-override signal (an admin
+    re-kick), NOT the generic intake `forced` flag — intake stamps forced=1 on
+    every human-submitted job, so keying the exemption off `forced` would make
+    the block inert for the entire feature pipeline (Epic G4)."""
     status = budget_status(store, settings, workspace, now)
-    if forced:
+    if override:
         return False, status
     if not getattr(settings, "budget_block_enabled", True):
         return False, status

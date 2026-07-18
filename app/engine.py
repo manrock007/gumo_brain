@@ -275,14 +275,21 @@ class Engine:
             return
         # Epic G4 (blocker 4): budget block at the feature-stage dispatch, BEFORE
         # a run is opened — so pipeline state (stage/artifacts/gate answer) is
-        # never discarded. A non-forced stage at >=100% parks as 'error' with a
-        # budget reason (re-kickable from the dashboard with override, which sets
-        # forced and audits BUDGET_OVERRIDE below). Budget 0 is inert.
-        forced = bool(job.get("forced"))
-        blocked, bstatus = budgets.should_block(
-            self.store, self.settings,
-            self.store.workspace_get(job["workspace_id"]) if job.get("workspace_id") else None,
-            forced)
+        # never discarded. A stage at >=100% parks as 'error' with a budget
+        # reason (re-kickable from the dashboard: an admin redo with override
+        # sets budget_override, audited BUDGET_OVERRIDE below). Budget 0 is inert.
+        #
+        # The gate keys off `budget_override`, NOT the intake `forced` flag:
+        # feature_intake stamps forced=1 on EVERY feature job, so keying the
+        # exemption off forced would make the block permanently inert for the
+        # whole pipeline (the dominant cost lane). budget_override is a ONE-SHOT
+        # admin signal, consumed here so the next over-budget stage re-parks.
+        override = bool(job.get("budget_override"))
+        ws = self.store.workspace_get(job["workspace_id"]) if job.get("workspace_id") else None
+        blocked, bstatus = budgets.should_block(self.store, self.settings, ws, override)
+        if override:
+            self.store.set_fields(job_id, budget_override=0)
+            job["budget_override"] = 0
         if blocked:
             reason = (f"budget block at P{stage}: ${bstatus['spent']:.2f} of "
                       f"${bstatus['budget']:.2f} ({bstatus['pct']}%) this month — "
@@ -302,7 +309,7 @@ class Engine:
                                  "budget": bstatus["budget"], "pct": bstatus["pct"]})
             log.info("feature %s P%s budget-blocked (%s%%)", job_id, stage, bstatus["pct"])
             return
-        if forced and bstatus["state"] == "block":
+        if override and bstatus["state"] == "block":
             # an explicit over-budget override re-kick — the run proceeds, audited.
             audit.record(self.store, audit.BUDGET_OVERRIDE, actor="engine",
                          actor_kind="system", scope="workspace",

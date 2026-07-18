@@ -860,7 +860,7 @@ class Worker:
         Applies to proceed/redo/skip including ask-gates and redo-from-error;
         gate chat and plain comments are untouched."""
         owner, admin_override = self._owner_guard(job, actor, override)
-        result = await self._answer_feature_inner(job, action, text, via)
+        result = await self._answer_feature_inner(job, action, text, via, override=override)
         if admin_override:
             # recorded only AFTER the transition succeeded — a lost CAS raises
             # GateConflict above and must leave NO override audit row. The ref
@@ -877,7 +877,8 @@ class Worker:
             log.info("admin override: %s %s by %s", job["issue_id"], action, via)
         return result
 
-    async def _answer_feature_inner(self, job: dict, action: str, text: str, via: str) -> str:
+    async def _answer_feature_inner(self, job: dict, action: str, text: str, via: str,
+                                    override: bool = False) -> str:
         job_id = job["issue_id"]
         stage = int(job.get("stage") or 0)
         task_id = job.get("clickup_task_id") or ""
@@ -913,6 +914,12 @@ class Worker:
                                          resume_head="", resume_answer="", ask_count=0,
                                          auto_retries=0):
                 raise GateConflict("already answered")
+            if override:
+                # Epic G4: an explicit admin redo carries a ONE-SHOT budget
+                # override so a budget-blocked stage (parked as 'error') can be
+                # re-kicked and proceed once. engine.run_stage consumes it and
+                # audits BUDGET_OVERRIDE; the next over-budget stage re-parks.
+                self.store.set_fields(job_id, budget_override=1)
             gid = self.store.guidance_add(job_id, target_stage, "redo", text, via,
                                           job.get("parked_head") or "")
             self._register_decision(job, target_stage, f"P{target_stage} redo",
@@ -1896,18 +1903,20 @@ class Worker:
                 break
         log.info("sweep done: %d candidates enqueued (grading decides the rest)", picked)
 
-    def _budget_block(self, job: dict | None, forced: bool) -> bool:
+    def _budget_block(self, job: dict | None, override: bool) -> bool:
         """Epic G4: park a job when its workspace is at/over 100% of budget and
-        the run is not forced. Returns True when it parked the job (caller
+        the run carries no override. Returns True when it parked the job (caller
         returns without dispatching). Fail-closed to NOT blocking when budget is
-        inert (0). Never blocks a forced run (the admin override affordance)."""
+        inert (0). In the sentry lane `override` is the deliberate manual /
+        live-webhook trigger (mirrors the daily-cap exemption) — NOT the generic
+        intake `forced` flag the feature pipeline stamps on every job."""
         if job is None:
             return False
         ws = None
         ws_id = job.get("workspace_id")
         if ws_id is not None:
             ws = self.store.workspace_get(ws_id)
-        blocked, status = budgets.should_block(self.store, self.settings, ws, forced)
+        blocked, status = budgets.should_block(self.store, self.settings, ws, override)
         if not blocked:
             return False
         reason = (f"budget block: ${status['spent']:.2f} of ${status['budget']:.2f} "

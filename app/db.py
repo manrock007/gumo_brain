@@ -524,6 +524,12 @@ MIGRATIONS = {  # table -> columns added after that table first shipped (in-plac
         # and capped at write (worker._process_sentry). Pre-upgrade sentry rows
         # keep culprit='' — clusters only accumulate from upgrade forward.
         "culprit": "TEXT DEFAULT ''",
+        # Epic G4: a ONE-SHOT budget override. Distinct from `forced` (which
+        # intake stamps on every human-submitted job to skip cooldown/grading):
+        # this is set only by an explicit admin re-kick and lets a single
+        # over-budget stage proceed, then is consumed (cleared) by the engine so
+        # the next over-budget stage re-parks. Default 0 = enforce the budget.
+        "budget_override": "INTEGER NOT NULL DEFAULT 0",
     },
     "users": {
         "clickup_user_id": "TEXT NOT NULL DEFAULT ''",  # Epic A1: ClickUp id ↔ CtrlLoop identity

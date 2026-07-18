@@ -63,17 +63,16 @@ def test_instance_fallback_budget():
     assert st["state"] == "block"
 
 
-def test_should_block_respects_forced_and_flag():
+def test_should_block_respects_override_and_flag():
     s = Settings(budget_block_enabled=True)
     store = _FakeStore(spent=200)
-    blocked, _ = budgets.should_block(store, s, _ws(100), forced=False)
+    blocked, _ = budgets.should_block(store, s, _ws(100), override=False)
     assert blocked is True
-    # forced (override) never blocks
-    blocked, _ = budgets.should_block(store, s, _ws(100), forced=False)
-    assert budgets.should_block(store, s, _ws(100), forced=True)[0] is False
+    # an explicit budget override never blocks
+    assert budgets.should_block(store, s, _ws(100), override=True)[0] is False
     # block disabled -> warn-only, never blocks
     s2 = Settings(budget_block_enabled=False)
-    assert budgets.should_block(store, s2, _ws(100), forced=False)[0] is False
+    assert budgets.should_block(store, s2, _ws(100), override=False)[0] is False
 
 
 def test_feature_stage_budget_block_preserves_state(worker):
