@@ -37,7 +37,7 @@ from .feature_prompts import stage_name
 from .fixer import ensure_session_store
 from .memory import MemoryReader
 from .sentry_api import extract_issue_ref, verify_signature
-from . import autonomy, people, roles
+from . import autonomy, people, roles, routines
 from .worker import GateConflict, GateForbidden, Worker
 from .workspaces import WorkspaceError, WorkspaceNotFound, WorkspaceService
 from . import transcripts
@@ -100,12 +100,15 @@ async def lifespan(app: FastAPI):
     worker.workspaces = workspaces
     worker.engine.workspaces = workspaces
     worker.engine.memory.canonical_resolver = workspaces.canonical_for
+    # Epic I1: sweep/reaper/janitor now ride the routine scheduler (builtin
+    # rows, settings-derived cadence, EVERY-boot settle bump). The shepherd
+    # and the other control-flow-adjacent loops stay native.
+    routines.ensure_seeds(store, settings)
+    scheduler = routines.RoutineScheduler(settings, store, worker, workspaces)
     tasks = [
         asyncio.create_task(worker.run_forever()),
         asyncio.create_task(worker.poll_clickup_forever()),
-        asyncio.create_task(worker.sweep_forever()),
-        asyncio.create_task(worker.reap_forever()),
-        asyncio.create_task(worker.prune_sessions_forever()),
+        asyncio.create_task(scheduler.run_forever()),
         asyncio.create_task(worker.shepherd_forever()),
         asyncio.create_task(worker.sla_forever()),
         asyncio.create_task(worker.watch_forever()),
@@ -114,6 +117,7 @@ async def lifespan(app: FastAPI):
     ]
     app.state.store = store
     app.state.worker = worker
+    app.state.scheduler = scheduler
     yield
     for t in tasks:
         t.cancel()
@@ -1137,6 +1141,112 @@ async def autonomy_recompute():
     res = await asyncio.to_thread(
         autonomy.compute, app.state.store, settings)
     return res
+
+
+# ---------- proactive routines (Epic I1, docs/ENGINE.md §17) ----------
+
+
+class RoutinePutBody(BaseModel):
+    enabled: bool | None = None
+    schedule: str | None = None
+    config: dict | None = None
+
+
+def _routine_public(store: JobStore, r: dict, runs: int = 20) -> dict:
+    try:
+        config = json.loads(r.get("config") or "{}")
+        if not isinstance(config, dict):
+            config = {}
+    except (ValueError, TypeError):
+        config = {}
+    return {k: r.get(k) for k in ("id", "workspace_id", "kind", "name",
+                                  "schedule", "enabled", "last_run_at",
+                                  "last_status", "last_result")} | {
+        "enabled": bool(r.get("enabled")),
+        "config": config,
+        "builtin": r.get("workspace_id") is None,
+        "runs": store.routine_runs_recent(r["id"], runs),
+    }
+
+
+@app.get("/api/routines")
+async def routines_list(user: dict = Depends(require_user)):
+    """Membership-scoped routine table + run history (last 20 per routine).
+    Instance (builtin) rows are admin-only."""
+    store: JobStore = app.state.store
+    svc = _ws_svc()
+    out = []
+    for r in store.routines_all():
+        if r.get("workspace_id") is None:
+            if user.get("role") != "admin":
+                continue
+        elif not svc.user_can_access(user, r["workspace_id"]):
+            continue
+        out.append(_routine_public(store, r))
+    return {"routines": out, "enabled": settings.routines_enabled}
+
+
+@app.put("/api/routines/{routine_id}")
+async def routine_put(routine_id: int, body: RoutinePutBody,
+                      admin: dict = Depends(require_admin)):
+    """Edit a routine (admin). Schedules validate fail-closed (400, nothing
+    changes); the reaper row is non-disableable and its schedule is locked;
+    every change is audited in admin_events."""
+    store: JobStore = app.state.store
+    row = store.routine_get(routine_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="unknown routine")
+    if row["kind"] == "reaper":
+        if body.enabled is False:
+            raise HTTPException(status_code=400,
+                                detail="the reaper is a safety loop and cannot "
+                                       "be disabled")
+        if body.schedule is not None:
+            raise HTTPException(status_code=400,
+                                detail="the reaper's schedule is fixed")
+    fields: dict = {}
+    if body.schedule is not None:
+        spec = body.schedule.strip()
+        if spec:
+            try:
+                routines.parse_schedule(spec)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+        elif row.get("workspace_id") is not None:
+            raise HTTPException(status_code=400,
+                                detail="workspace routines need an explicit "
+                                       "schedule ('' is builtin-only)")
+        fields["schedule"] = spec
+    if body.enabled is not None:
+        fields["enabled"] = int(body.enabled)
+    if body.config is not None:
+        if not isinstance(body.config, dict):
+            raise HTTPException(status_code=400, detail="config must be an object")
+        fields["config"] = json.dumps(body.config)
+    if fields:
+        store.routine_set(routine_id, **fields)
+        diff = {k: (row.get(k), fields[k]) for k in fields}
+        store.admin_event_add(
+            "routine_config", target=str(routine_id),
+            detail=json.dumps({"kind": row["kind"], "changed": diff},
+                              default=str)[:1000],
+            actor=f"dashboard:{admin['username']}")
+    return _routine_public(store, store.routine_get(routine_id))
+
+
+@app.post("/api/routines/{routine_id}/run", dependencies=[Depends(require_admin)])
+async def routine_run_now(routine_id: int):
+    """Arm an immediate fire THROUGH the scheduler task (never inline in the
+    HTTP request — a sweep does paginated Sentry HTTP). Returns immediately."""
+    store: JobStore = app.state.store
+    if store.routine_get(routine_id) is None:
+        raise HTTPException(status_code=404, detail="unknown routine")
+    accepted = app.state.scheduler.request_run(routine_id)
+    if not accepted:
+        raise HTTPException(status_code=400,
+                            detail="routine is disabled or its kind is not "
+                                   "registered on this build")
+    return {"requested": True, "routine_id": routine_id}
 
 
 class TriggerBody(BaseModel):

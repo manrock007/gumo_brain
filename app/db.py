@@ -1609,6 +1609,121 @@ class JobStore:
                     "ORDER BY id", (since, int(workspace_id))).fetchall()
             return [dict(r) for r in rows]
 
+    # ---------- routines (Epic I1: the routine engine) ----------
+
+    def routine_upsert_seed(self, kind: str, workspace_id: int | None,
+                            schedule: str, name: str = "",
+                            enabled: bool = True) -> bool:
+        """Seed a routine row — INSERT OR IGNORE on the (kind, workspace)
+        unique index, so seeding NEVER overwrites operator edits. Returns True
+        when the row is new. Distinct from the boot-time last_run_at bump
+        (routine_boot_bump), which runs at EVERY boot."""
+        now = time.time()
+        with self._conn() as c:
+            cur = c.execute(
+                """INSERT OR IGNORE INTO routines
+                     (workspace_id, kind, name, schedule, enabled, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (workspace_id, kind, name or kind, schedule, int(enabled), now, now))
+            return cur.rowcount == 1
+
+    def routines_all(self) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM routines ORDER BY workspace_id IS NOT NULL, "
+                "workspace_id, kind").fetchall()
+            return [dict(r) for r in rows]
+
+    def routine_get(self, routine_id: int) -> dict | None:
+        with self._conn() as c:
+            row = c.execute("SELECT * FROM routines WHERE id = ?",
+                            (int(routine_id),)).fetchone()
+            return dict(row) if row else None
+
+    def routine_set(self, routine_id: int, **fields):
+        if not fields:
+            return
+        cols = ", ".join(f"{k} = ?" for k in fields)
+        with self._conn() as c:
+            c.execute(f"UPDATE routines SET {cols}, updated_at = ? WHERE id = ?",
+                      (*fields.values(), time.time(), int(routine_id)))
+
+    def routine_claim(self, routine_id: int, prev_last_run: float | None,
+                      now: float, ignore_disabled: bool = False) -> bool:
+        """Single-flight claim CAS: exactly one caller wins each due firing —
+        correct today and load-bearing under Epic F2 multi-worker.
+        ignore_disabled=True is the reaper's non-disableable escape."""
+        enabled_clause = "" if ignore_disabled else " AND enabled = 1"
+        with self._conn() as c:
+            cur = c.execute(
+                f"""UPDATE routines SET last_run_at = ?, updated_at = ?
+                    WHERE id = ? AND (last_run_at IS ? OR last_run_at = ?)
+                    {enabled_clause}""",
+                (now, now, int(routine_id), prev_last_run, prev_last_run))
+            return cur.rowcount == 1
+
+    def routine_boot_bump(self, kinds: tuple, now: float | None = None):
+        """Boot-time settle bump for builtin (instance-scoped) rows: stamp
+        last_run_at=now so sweep/janitor fire one full interval after boot
+        instead of ~immediately off a stale pre-restart stamp. Runs at EVERY
+        boot — deliberately NOT part of the INSERT OR IGNORE seeding."""
+        if not kinds:
+            return
+        marks = ",".join("?" for _ in kinds)
+        with self._conn() as c:
+            c.execute(
+                f"UPDATE routines SET last_run_at = ?, updated_at = ? "
+                f"WHERE workspace_id IS NULL AND kind IN ({marks})",
+                (now or time.time(), time.time(), *kinds))
+
+    def routine_run_open(self, routine_id: int, kind: str,
+                         workspace_id: int | None) -> int:
+        with self._conn() as c:
+            cur = c.execute(
+                "INSERT INTO routine_runs (routine_id, kind, workspace_id, started_at) "
+                "VALUES (?, ?, ?, ?)",
+                (int(routine_id), kind, workspace_id, time.time()))
+            return cur.lastrowid
+
+    def routine_run_close(self, run_id: int, status: str, detail: str = "",
+                          items_emitted: int = 0):
+        with self._conn() as c:
+            c.execute(
+                "UPDATE routine_runs SET ended_at = ?, status = ?, detail = ?, "
+                "items_emitted = ? WHERE id = ? AND ended_at IS NULL",
+                (time.time(), status, (detail or "")[:1000],
+                 int(items_emitted), int(run_id)))
+
+    def routine_runs_recent(self, routine_id: int, limit: int = 20) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM routine_runs WHERE routine_id = ? "
+                "ORDER BY id DESC LIMIT ?", (int(routine_id), int(limit))).fetchall()
+            return [dict(r) for r in rows]
+
+    def routine_last_success(self, routine_id: int) -> float | None:
+        """When the routine last completed usefully (ok OR quiet) — the digest
+        `since` anchor (Epic I2, floored at now-24h by the caller)."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT MAX(started_at) AS t FROM routine_runs "
+                "WHERE routine_id = ? AND status IN ('ok', 'quiet')",
+                (int(routine_id),)).fetchone()
+            return row["t"] if row and row["t"] else None
+
+    def routine_runs_prune(self, ttl_days: float, keep_latest: int = 20) -> int:
+        """Janitor retention: drop run-history rows older than the TTL, always
+        keeping the newest `keep_latest` per routine."""
+        cutoff = time.time() - float(ttl_days) * 86400
+        with self._conn() as c:
+            cur = c.execute(
+                """DELETE FROM routine_runs WHERE started_at < ? AND id NOT IN (
+                     SELECT id FROM routine_runs r2
+                     WHERE r2.routine_id = routine_runs.routine_id
+                     ORDER BY r2.id DESC LIMIT ?)""",
+                (cutoff, int(keep_latest)))
+            return cur.rowcount
+
     # ---------- spend (Epic I0/I4; the substrate Epic G4 extends) ----------
 
     def costs_since(self, since: float) -> dict:

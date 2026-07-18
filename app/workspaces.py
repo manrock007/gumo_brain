@@ -217,6 +217,10 @@ class WorkspaceService:
         ws = self.store.workspace_create(slug, (name or slug).strip(), **clean)
         if "slack_channels" in clean:
             self._init_slack_cursors(clean["slack_channels"])
+        # Epic I1: every workspace gets its proactive-routine rows at birth.
+        # Lazy import — routines must stay importable without this module.
+        from . import routines
+        routines.ensure_seeds_for_workspace(self.store, self.settings, ws["id"])
         self.sync_settings()
         return ws
 

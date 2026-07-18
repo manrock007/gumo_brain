@@ -1805,19 +1805,12 @@ class Worker:
                 log.exception("autonomy recompute failed")
             await asyncio.sleep(self.settings.autonomy_recompute_hours * 3600)
 
-    async def sweep_forever(self):
-        if not self.settings.sweep_enabled:
-            return
-        if not self.settings.sentry_enabled:
-            log.info("sweep disabled: Sentry not configured")
-            return
-        await asyncio.sleep(300)  # let the stack settle after deploy
-        while True:
-            try:
-                await self._sweep_once()
-            except Exception:
-                log.exception("sweep iteration failed")
-            await asyncio.sleep(self.settings.sweep_interval_hours * 3600)
+    # Epic I1: the sweep/reaper/janitor `while True` wrappers moved into the
+    # routine scheduler (app/routines.py — builtin rows, settings-derived
+    # cadence, boot settle bump). The `_once` bodies below are unchanged. The
+    # shepherd, SLA, watch, autonomy and ClickUp-poll loops deliberately stay
+    # native worker loops (control-flow-adjacent / tight cadence — and the
+    # shepherd invokes Claude, which a routine never may).
 
     async def _sweep_once(self):
         known = self.store.known_issue_ids()
@@ -1834,22 +1827,17 @@ class Worker:
                 break
         log.info("sweep done: %d candidates enqueued (grading decides the rest)", picked)
 
-    async def prune_sessions_forever(self):
-        """Daily janitor for session transcripts (docs/CONVERSATIONS.md §4):
-        prune by file mtime with a keep-set — never by job terminal status alone,
-        which misses abandoned gates and unattributed v1 traffic. Run transcripts
-        (§13) ride the same schedule — they have no keep-set (replay history, not
-        resume state) so age alone decides, even with session persistence off."""
-        while True:
-            await asyncio.sleep(86400)
-            try:
-                pruned = transcripts.prune(self.settings, self.settings.transcript_ttl_days)
-                if pruned:
-                    log.info("transcript janitor pruned %d run transcripts", pruned)
-                if self.settings.session_persistence:
-                    self._prune_sessions()
-            except Exception:
-                log.exception("session janitor failed")
+    def _janitor_once(self):
+        """Daily janitor body (now driven by the routine scheduler): prune run
+        transcripts by mtime (no keep-set — replay history, not resume state)
+        and, with session persistence on, prune CLI session transcripts with
+        the keep-set. Inbox-notice expiry + routine-run retention ride the
+        janitor routine handler (app/routines.py)."""
+        pruned = transcripts.prune(self.settings, self.settings.transcript_ttl_days)
+        if pruned:
+            log.info("transcript janitor pruned %d run transcripts", pruned)
+        if self.settings.session_persistence:
+            self._prune_sessions()
 
     def _prune_sessions(self):
         keep: set[str] = set()
@@ -2185,18 +2173,11 @@ class Worker:
                                       detail=f"escalation exhausted at {h}h "
                                              f"of {sla}h SLA")
 
-    async def reap_forever(self):
+    def reap_horizon(self) -> float:
         """A 'running' row older than any plausible live run means the process
-        died mid-run (the subprocess dies with us) — surface it instead of
-        letting the job hang forever."""
-        # memory bootstraps hold 'running' across TWO full-length runs; size for the worst
-        horizon = 2 * self.settings.claude_timeout_seconds + self.settings.reaper_grace_seconds
-        while True:
-            try:
-                await self._reap_once(horizon)
-            except Exception:
-                log.exception("reaper iteration failed")
-            await asyncio.sleep(300)
+        died mid-run. Memory bootstraps hold 'running' across TWO full-length
+        runs — size for the worst."""
+        return 2 * self.settings.claude_timeout_seconds + self.settings.reaper_grace_seconds
 
     async def _reap_once(self, horizon: float):
         for job in self.store.stale_running(horizon):

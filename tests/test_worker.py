@@ -363,17 +363,8 @@ class TestRoleExclusiveGates:
                                              actor=jane)) == "queued"
 
 
-class TestSentryLaneGate:
-    def test_sweep_exits_when_sentry_unconfigured(self, worker):
-        """sweep_forever must return immediately (not sleep/loop) on an
-        instance without a configured Sentry integration."""
-        worker.settings.sweep_enabled = True
-        assert not worker.settings.sentry_enabled
-        asyncio.run(worker.sweep_forever())  # returns immediately or the test hangs
-
-    def test_sweep_exits_when_disabled(self, worker):
-        worker.settings.sweep_enabled = False
-        asyncio.run(worker.sweep_forever())
+# NOTE (Epic I1): the sweep/reaper/janitor `while True` wrappers moved into
+# the routine scheduler — their enable gating is covered in tests/test_routines.py.
 
 
 class TestV1BranchPersistence:

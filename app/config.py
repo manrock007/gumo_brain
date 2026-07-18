@@ -269,6 +269,42 @@ class Settings(BaseSettings):
     autonomy_auto_level: int = 0
     autonomy_recompute_hours: int = 24  # nightly scorer cadence
 
+    # ---- Proactive routines (Epic I, docs/ENGINE.md §17) ----
+    # Master flag for the PER-WORKSPACE Epic I routines (standup, memory
+    # upkeep, risk scan, proposal scan, planning) ONLY — the builtin
+    # sweep/reaper/janitor rows keep firing when it is off ('off' must never
+    # mean 'less safe'). Env-only like autonomy_enabled: restart to flip.
+    routines_enabled: bool = True
+    routine_tick_seconds: int = 60
+    routine_tz: str = "UTC"           # schedule evaluation timezone (zoneinfo)
+    # Seed defaults ONLY — after the first seed the routine ROW is
+    # authoritative (edit via PUT /api/routines/{id}); builtin loops derive
+    # their cadence from the live settings instead (schedule='').
+    standup_schedule: str = "daily@09:00;days=mon,tue,wed,thu,fri"
+    memory_upkeep_schedule: str = "daily@07:00"
+    risk_scan_schedule: str = "every:3600"
+    proposal_scan_schedule: str = "every:86400"
+    planning_schedule: str = "weekly@mon 09:00"
+    # Memory upkeep (I3): 0 = inert (opt-in spend — a fresh install queues
+    # nothing). Bounded one refresh per repo per cooldown window.
+    memory_staleness_threshold: int = 0
+    memory_upkeep_cooldown_days: int = 7
+    # Risk surfacing (I4): sentry spike alerts off until a threshold is set
+    # (absolute 24h event count — no historical snapshot store in v1).
+    risk_sentry_spike_events: int = 0
+    risk_redo_threshold: int = 3
+    # Instance fallback for the per-workspace budget column; 0 = no budget
+    # (spend pacing alerts + digest budget section stay inert).
+    budget_monthly_usd: float = 0
+    # Proposal lane (I5) windows/thresholds.
+    proposal_window_days: int = 30
+    proposal_friction_min: int = 3
+    proposal_sentry_cluster_min: int = 3
+    # Inbox notice aging (risk alerts, notes, digests, packs expire visibly)
+    # and routine run-history retention (newest N per routine always kept).
+    inbox_notice_ttl_days: int = 30
+    routine_run_ttl_days: int = 90
+
     # ---- Auth (docs/ENGINE.md §11) ----
     # First-boot admin bootstrap: when the users table is empty, an admin
     # account is created from these. Back-compat: if unset but the legacy
