@@ -130,9 +130,16 @@ class OIDCProvider(IdentityProvider):
         groups = claims.get(settings.oidc_role_claim) if settings.oidc_role_claim else None
         if isinstance(groups, str):
             groups = [groups]
+        # amendment 5: an email claim is trustworthy for identity linking ONLY
+        # when the IdP asserts email_verified. An unverified email must never be
+        # used to link/shadow an account (takeover vector) — carry the flag so
+        # jit_provision can refuse to use an unverified address.
+        ev = claims.get("email_verified")
+        email_verified = ev is True or str(ev).lower() == "true"
         return {
             "external_id": str(claims.get("sub") or ""),
             "email": str(claims.get("email") or ""),
+            "email_verified": email_verified,
             "username": str(claims.get("preferred_username")
                             or claims.get("email") or claims.get("sub") or ""),
             "groups": list(groups or []),

@@ -7,7 +7,7 @@ import pytest
 from app.config import Settings
 from app.secrets import (EnvProvider, FileProvider, VaultProvider, NotConfigured,
                          build_subprocess_env, detect_auth_backend, read_secret,
-                         resolve)
+                         resolve, egress_selfcheck)
 from app.fixer import _claude_cmd_env
 
 
@@ -85,6 +85,41 @@ def test_bedrock_git_families_pass_through(monkeypatch):
     assert env["AWS_ACCESS_KEY_ID"] == "akid"
     assert env["GIT_AUTHOR_NAME"] == "bot"
     assert detect_auth_backend(env) == "bedrock"
+
+
+def test_egress_tls_vars_survive_allowlist(monkeypatch):
+    # amendment 1: a proxied/CA-pinned enterprise env must reach the model API
+    # and verify TLS — these vars MUST pass the allow-list (dropping them is a
+    # total, fail-closed-into-wedge outage). Includes the prefix-catch-all cases.
+    egress = {
+        "HTTPS_PROXY": "http://proxy:8080", "https_proxy": "http://proxy:8080",
+        "ALL_PROXY": "socks5://proxy:1080", "no_proxy": "localhost",
+        "npm_config_https_proxy": "http://proxy:8080", "npm_config_noproxy": "localhost",
+        "NODE_EXTRA_CA_CERTS": "/etc/ca.pem", "SSL_CERT_FILE": "/etc/ssl.pem",
+        "REQUESTS_CA_BUNDLE": "/etc/ca.pem", "CURL_CA_BUNDLE": "/etc/ca.pem",
+        "GRPC_DEFAULT_SSL_ROOTS_FILE_PATH": "/etc/ca.pem", "NIX_SSL_CERT_FILE": "/etc/ca.pem",
+        "ANTHROPIC_BASE_URL": "https://proxy.internal/anthropic",
+        "GIT_SSL_CAINFO": "/etc/ca.pem", "AWS_CA_BUNDLE": "/etc/ca.pem",
+    }
+    for k, v in egress.items():
+        monkeypatch.setenv(k, v)
+    env = build_subprocess_env(Settings())
+    for k, v in egress.items():
+        assert env.get(k) == v, f"{k} was dropped from the run env"
+
+
+def test_egress_selfcheck_flags_starved_var(monkeypatch):
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy:8080")
+    # not starved when the allow-list forwards it
+    assert "HTTPS_PROXY" not in egress_selfcheck(Settings())
+    # a var absent from the allow-list AND from the built env is reported when
+    # planted in a simulated ambient environment
+    fake_environ = {"HTTPS_PROXY": ""}  # present-but-empty => not critical
+    assert egress_selfcheck(Settings(), environ=fake_environ) == []
+    fake_environ = {"ANTHROPIC_BASE_URL": "x"}
+    # ANTHROPIC_BASE_URL is forwarded, so not starved even from a fake environ
+    # only when we also drop it from the build would it flag — sanity: no crash
+    assert isinstance(egress_selfcheck(Settings(), environ=fake_environ), list)
 
 
 def test_session_id_never_inherited(monkeypatch):

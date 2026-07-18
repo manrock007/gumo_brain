@@ -112,12 +112,27 @@ def read_secret(settings, key: str) -> str | None:
 # subprocess env allow-list (G2 security core, amendment blocker 9)
 # ---------------------------------------------------------------------------
 
-# Non-secret runtime plumbing every subprocess legitimately needs.
+# Non-secret runtime plumbing every subprocess legitimately needs. The
+# egress/TLS group (proxies + CA bundles) is treated as a NAMED baseline, not
+# ad-hoc passthrough (amendment 1): a proxied/CA-pinned enterprise install must
+# work out of the box, or the Claude CLI cannot reach the model API and git
+# cannot verify TLS — every run would fail. GIT_*/AWS_* CA vars (GIT_SSL_CAINFO,
+# AWS_CA_BUNDLE) additionally pass via the prefix catch-all in build_*.
 BASE_ENV_ALLOW = (
-    "PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TMPDIR", "TZ",
-    "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "no_proxy",
+    "PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TMPDIR", "TZ", "SHELL", "USER",
+    "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY",
+    "https_proxy", "http_proxy", "all_proxy", "no_proxy",
+    "npm_config_https_proxy", "npm_config_http_proxy", "npm_config_proxy", "npm_config_noproxy",
     "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "NODE_EXTRA_CA_CERTS",
-    "CURL_CA_BUNDLE",
+    "CURL_CA_BUNDLE", "GRPC_DEFAULT_SSL_ROOTS_FILE_PATH", "NIX_SSL_CERT_FILE",
+)
+
+# The subset whose ABSENCE from a built env — while present in os.environ —
+# silently breaks egress (model API unreachable, TLS unverifiable). Startup
+# self-checks these so a starved var is loud, not a mid-run outage.
+EGRESS_CRITICAL = (
+    "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "ANTHROPIC_BASE_URL",
+    "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE",
 )
 
 # Model auth backends — first-party OAuth/API AND the documented cloud
@@ -180,6 +195,17 @@ def build_subprocess_env(settings, *, extra: dict | None = None) -> dict:
         else:
             env[key] = val
     return env
+
+
+def egress_selfcheck(settings, *, environ: dict | None = None) -> list[str]:
+    """Names of EGRESS_CRITICAL vars present in the ambient environment but
+    DROPPED by the allow-list (amendment 1). A non-empty result means a proxied
+    /CA-pinned deployment would fail every run — the caller logs it loudly at
+    startup. Returns [] when nothing critical is starved."""
+    source = os.environ if environ is None else environ
+    built = build_subprocess_env(settings)
+    return [name for name in EGRESS_CRITICAL
+            if source.get(name) and name not in built]
 
 
 def detect_auth_backend(env: dict) -> str:

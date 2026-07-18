@@ -176,6 +176,15 @@ def jit_provision(store: JobStore, settings: Settings, provider, claims: dict) -
             raise SSOConflict(
                 f"an existing local account '{clash['username']}' matches this SSO "
                 f"identity — an admin must link it (never auto-adopted)")
+    # amendment 5: an UNVERIFIED email is never trusted for identity — it must
+    # not be PERSISTED on the new row (a stored unverified address could later
+    # be used as a linking key or to shadow an account). The clash check above
+    # stays deliberately strict (any collision fails closed to SSOConflict);
+    # only storage of the untrusted value is refused.
+    if email and not claims.get("email_verified"):
+        log.warning("jit-provision: SSO email for sub=%s is unverified — not stored",
+                    external_id[:8])
+        email = ""
     # unique the username against any non-local collision
     final_username = username
     if store.user_get(final_username) is not None:

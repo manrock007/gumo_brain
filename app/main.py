@@ -96,9 +96,19 @@ async def lifespan(app: FastAPI):
                     "integration is DISABLED.")
     # Epic G2: a loud, non-secret line naming the detected model-auth backend
     # so a starved/misconfigured env is visible at boot, not silent mid-run.
-    from .secrets import build_subprocess_env, detect_auth_backend
+    from .secrets import build_subprocess_env, detect_auth_backend, egress_selfcheck
     backend = detect_auth_backend(build_subprocess_env(settings))
     log.info("model auth backend detected: %s", backend)
+    # Epic G2 (amendment 1): loudly warn if a proxy/CA var the deployment relies
+    # on is present in the environment but dropped by the subprocess allow-list —
+    # otherwise every run would silently fail to reach the model API / verify TLS.
+    starved = egress_selfcheck(settings)
+    if starved:
+        log.warning(
+            "EGRESS: %s present in the environment but DROPPED from the run "
+            "allow-list — proxied/TLS-pinned runs will fail. Add them via "
+            "SUBPROCESS_ENV_ALLOWLIST. See OPERATIONS.md 'secrets provider'.",
+            ", ".join(starved))
     # Epic G5: the Anthropic policy line — personal Max OAuth creds must not
     # route OTHER users' requests. Warn loudly (not fatal — break-glass) when a
     # Max token is in use on an instance with more than one enabled user.
