@@ -310,6 +310,46 @@ class Settings(BaseSettings):
     inbox_notice_ttl_days: int = 30
     routine_run_ttl_days: int = 90
 
+    # ---- Secrets provider & subprocess env allow-list (Epic G2) ----
+    # Where sensitive config is read from: 'env' (default — the process
+    # environment, what Settings already does), 'file' (SECRETS_DIR/<name>
+    # files, Docker/K8s secrets), or 'vault' (scaffold — falls back to env).
+    # Unknown values fail closed to 'env'.
+    secrets_provider: str = "env"
+    secrets_dir: str = ""
+    # Extra environment variable NAMES (comma list) to pass THROUGH to Claude/
+    # git subprocesses on top of the built-in allow-list. Neutral empty: a run
+    # only ever sees plumbing + model-auth + VCS vars + these. The hard-deny
+    # secret set (dashboard/OIDC/Sentry/app-key/…) can never be re-added here.
+    subprocess_env_allowlist: str = ""
+
+    # ---- GitHub App (Epic G1) — per-repo short-lived installation tokens ----
+    # Additive to the PAT (github_token): when both are configured the app mints
+    # a fresh installation token per repo per run; a repo the app cannot reach
+    # falls back to the PAT. On ANY app error the run falls back to the PAT
+    # (fail-open to the working path) — the app is never a hard replacement.
+    github_app_id: str = ""
+    # SECRET — the app's RSA private key. Supports the '@/path' convention for a
+    # mounted PEM file (resolved via secrets.read_secret). Never logged, never
+    # placed in any subprocess env.
+    github_app_private_key: str = ""
+    # Installation-token TTL cache slack: refresh a minted token this many
+    # seconds before its stated expiry.
+    github_app_token_refresh_slack_seconds: int = 300
+
+    @property
+    def github_app_enabled(self) -> bool:
+        return bool(self.github_app_id and self.github_app_private_key)
+
+    @property
+    def using_max_oauth_token(self) -> bool:
+        """Epic G5 policy signal: personal Max OAuth creds are in use with no
+        API key set. Anthropic policy forbids routing OTHER users' requests
+        through personal Max credentials — a >1-user instance must flip to
+        ANTHROPIC_API_KEY (see the startup warning in main.py)."""
+        return bool(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+                    and not os.environ.get("ANTHROPIC_API_KEY"))
+
     # ---- Auth (docs/ENGINE.md §11) ----
     # First-boot admin bootstrap: when the users table is empty, an admin
     # account is created from these. Back-compat: if unset but the legacy

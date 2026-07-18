@@ -9,6 +9,7 @@ import re
 from pathlib import Path
 
 from .config import ENGINE_DIR, LEGACY_ENGINE_DIRS, RepoTarget, Settings
+from .secrets import build_subprocess_env
 
 log = logging.getLogger("brain.fixer")
 
@@ -247,9 +248,15 @@ async def prepare_feature_workspace(settings: Settings, target: RepoTarget,
 def _claude_cmd_env(settings: Settings, prompt: str, allowed_tools: list[str],
                     resume_session: str | None, disallowed_tools: list[str] | None,
                     session_id: str | None, fork_session: bool,
-                    config_dir: str | None, output_format: str = "json"):
+                    config_dir: str | None, output_format: str = "json",
+                    git_token: str | None = None):
     """Shared command/env assembly for the raw and streaming runners — one
-    place owns the flag order and the env hygiene."""
+    place owns the flag order and the env hygiene.
+
+    G2: the env is ALLOW-LISTED (secrets.build_subprocess_env), not an ambient
+    os.environ.copy(), so operator secrets never reach the model's shell. The
+    run's GH_TOKEN is the run-specific `git_token` (G1: a minted per-repo
+    installation token) when provided, else the PAT fallback."""
     # prompt is positional, directly after -p; option flags follow it
     cmd = [
         settings.claude_binary,
@@ -270,16 +277,20 @@ def _claude_cmd_env(settings: Settings, prompt: str, allowed_tools: list[str],
     if settings.claude_model:
         cmd += ["--model", settings.claude_model]
 
-    env = os.environ.copy()
-    env["GH_TOKEN"] = settings.github_token
-    env["CLICKUP_TOKEN"] = settings.clickup_token  # used by the brain-ticket CLI
-    # never inherit an ambient session identity from the service's own env
-    env.pop("CLAUDE_CODE_SESSION_ID", None)
+    # G2: explicit allow-listed env — NOT os.environ.copy(). Run-specific vars
+    # (the git token, the ClickUp token used by brain-ticket, the config dir)
+    # are layered on top; CLAUDE_CODE_SESSION_ID is never inherited (absent from
+    # the allow-list by construction).
+    extra: dict[str, str | None] = {
+        "GH_TOKEN": git_token if git_token else settings.github_token,
+        "CLICKUP_TOKEN": settings.clickup_token,
+    }
     if config_dir:
-        env["CLAUDE_CONFIG_DIR"] = config_dir
+        extra["CLAUDE_CONFIG_DIR"] = config_dir
     elif settings.session_persistence:
         # sessions on the data volume so resume survives restarts
-        env["CLAUDE_CONFIG_DIR"] = settings.claude_config_dir
+        extra["CLAUDE_CONFIG_DIR"] = settings.claude_config_dir
+    env = build_subprocess_env(settings, extra=extra)
     return cmd, env
 
 
@@ -289,7 +300,8 @@ async def run_claude_raw(settings: Settings, workspace: str, prompt: str,
                          disallowed_tools: list[str] | None = None,
                          session_id: str | None = None,
                          fork_session: bool = False,
-                         config_dir: str | None = None) -> RawRunResult:
+                         config_dir: str | None = None,
+                         git_token: str | None = None) -> RawRunResult:
     """Low-level headless run. Returns the CLI's result text verbatim plus the
     telemetry envelope (session/cost/turns/duration) — callers own the parsing.
 
@@ -304,7 +316,8 @@ async def run_claude_raw(settings: Settings, workspace: str, prompt: str,
       chats use their own so concurrent invocations never race the session
       store's state files)."""
     cmd, env = _claude_cmd_env(settings, prompt, allowed_tools, resume_session,
-                               disallowed_tools, session_id, fork_session, config_dir)
+                               disallowed_tools, session_id, fork_session, config_dir,
+                               git_token=git_token)
 
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -380,7 +393,8 @@ async def run_claude_stream(settings: Settings, workspace: str, prompt: str,
                             fork_session: bool = False,
                             config_dir: str | None = None,
                             on_event=None,
-                            interrupt_event=None) -> RawRunResult:
+                            interrupt_event=None,
+                            git_token: str | None = None) -> RawRunResult:
     """run_claude_raw with live progress (docs/CONVERSATIONS.md §5): the CLI
     runs in stream-json mode and each event is surfaced through on_event as it
     happens — ("status", "Read app/x.py") per tool call, ("delta", text) per
@@ -396,7 +410,8 @@ async def run_claude_stream(settings: Settings, workspace: str, prompt: str,
     on_event = on_event or (lambda event, data: None)
     cmd, env = _claude_cmd_env(settings, prompt, allowed_tools, resume_session,
                                disallowed_tools, session_id, fork_session,
-                               config_dir, output_format="stream-json")
+                               config_dir, output_format="stream-json",
+                               git_token=git_token)
 
     proc = await asyncio.create_subprocess_exec(
         *cmd,
