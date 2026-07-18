@@ -462,6 +462,83 @@ detected backend and warns loudly when a Max token is used on an instance with
 >1 enabled user. Stage runs, sessions, and the fast lane all resolve the same
 auth (fast lane prefers `CHAT_API_KEY` → `ANTHROPIC_API_KEY`).
 
+## 20. Execution substrate (Epic F)
+
+The substrate is Postgres/multi-worker/sandbox-capable, but **SQLite is the
+zero-config default and nothing here is required**. An existing single-process
+SQLite instance keeps working byte-for-byte with no new config.
+
+### 20.1 Database driver (F1) — SQLite default, Postgres opt-in
+
+- `DATABASE_URL` **empty** (default) → SQLite at `DATA_DIR/brain.db`, exactly as
+  before. JobStore runs the schema + additive migrations in-process.
+- `DATABASE_URL=postgresql://user:pass@host/db` → the Postgres driver. Alembic
+  owns the schema; install the extra deps first:
+  `pip install -r requirements.txt -r requirements-postgres.txt`.
+- Postgres-only knobs (ignored on SQLite): `DB_POOL_SIZE` (5),
+  `DB_POOL_MAX_OVERFLOW` (5), `DB_STATEMENT_TIMEOUT_MS` (0 = none).
+- **Adopting Postgres from an existing SQLite instance** (no data loss):
+  1. create an empty Postgres database;
+  2. `alembic upgrade head` (materializes the exact baseline schema — the
+     baseline is *generated from* the identical SQLite schema by
+     `scripts/gen_pg_baseline.py`);
+  3. `python scripts/sqlite_to_pg.py --sqlite DATA_DIR/brain.db --pg "$DATABASE_URL"`;
+  4. set `DATABASE_URL` and restart.
+- **Every future additive column** added to `app/db.py` MIGRATIONS **must get a
+  matching Alembic revision.** The static guard
+  `tests/test_dbdriver.py::test_every_migrations_column_in_alembic_baseline`
+  fails CI if a baseline column is missing; the full type-parity guard runs when
+  `TEST_DATABASE_URL` is set.
+- **Limitation:** memory retrieval (FTS5) is SQLite-only. On Postgres
+  `fts_enabled=False` and `mem_search()` returns `[]` — retrieval is a read
+  enhancement, no control flow depends on it (a native tsvector index is future
+  work).
+
+### 20.2 Multi-worker queue (F2) — Postgres only
+
+- SQLite keeps the single-process in-memory priority queue; `WORKERS` stays 1.
+  **`WORKERS>1` requires Postgres.**
+- On Postgres the worker claims jobs from the DB with `FOR UPDATE SKIP LOCKED`
+  (poll interval `JOB_POLL_INTERVAL_SECONDS`, default 2s); per-repo
+  serialization uses Postgres advisory locks, lifting the single-process
+  constraint. `WORKER_ID` (default `hostname:pid`) scopes boot crash recovery to
+  a worker's own interrupted runs — cross-worker zombies are left to the reaper.
+- **Topology constraint:** the shared CLI config dir (`~/.claude` when
+  `SESSION_PERSISTENCE` is off) is serialized cross-process by a Postgres
+  advisory lock on ONE host. For **multi-host** workers, give each worker its own
+  `CLAUDE_CONFIG_DIR` (per-host config dir) or run with
+  `SESSION_PERSISTENCE=false` — do not share one config dir across hosts.
+
+### 20.3 Sandboxed runs (F3) — FLAG, off by default
+
+- `RUNNER_BACKEND=local` (default) runs Claude as today's direct subprocess.
+- `RUNNER_BACKEND=container` runs each Claude invocation in a disposable
+  container (`RUNNER_CONTAINER_IMAGE`) with the clone bind-mounted, ONLY the G2
+  allow-listed env (via a 0600 `--env-file`, unlinked after), `--rm`, and an
+  operator-provided `RUNNER_CONTAINER_NETWORK` egress allowlist. An empty network
+  config **fails closed** (the runner refuses to start rather than granting full
+  egress). The image must carry `claude` + `git` + `gh`.
+- **Bind-mount caveat (docker-in-docker):** `-v {cwd}:{cwd}` is resolved by the
+  docker daemon against the HOST filesystem. If the app itself is containerized,
+  mount the workspaces dir at an identical host path (or run the daemon with that
+  path visible), or the container sees an empty tree. Flag-off by default, so
+  this never affects the default deployment.
+
+### 20.4 Observability (F4)
+
+- `GET /metrics` — Prometheus text exposition (queue depth, jobs by
+  status/kind, runs today, stage-run cost, gate latency, autonomy levels, budget
+  spend, watch jobs, build info). Auth: `METRICS_TOKEN` **empty** (default) →
+  requires instance-admin auth; set a token → `Authorization: Bearer <token>`
+  for Prometheus. Never unauthenticated-open (workspace names/costs are
+  sensitive). Cached with a small TTL so a scrape can't hammer the DB.
+- `GET /health/ready` — 200 `{ready, checks:{db, worker, scheduler}}` or 503 when
+  a hard dependency (DB) is down. Never inlines credentials or upstream error
+  bodies. `GET /health` stays the unauthenticated liveness probe.
+- `LOG_FORMAT=text` (default, byte-for-byte today's format) or `json` for
+  structured logs carrying `request_id` (from/into the `X-Request-ID` header)
+  and `job_id` (set around each job's processing).
+
 ## Appendix — Example configuration: the original Gumo instance
 
 The values that used to ship as code defaults, now purely this one customer's

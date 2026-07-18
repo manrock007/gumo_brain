@@ -36,6 +36,7 @@ from .auth import (
 from .chatstream import ChatBroker
 from .config import ENGINE_NAME, Settings, get_settings, validate_repo_map
 from .db import JobStore
+from . import db as db_mod
 from .feature_prompts import stage_name
 from .fixer import ensure_session_store
 from .memory import MemoryReader
@@ -66,7 +67,12 @@ async def lifespan(app: FastAPI):
     Path(settings.data_dir).mkdir(parents=True, exist_ok=True)
     if settings.session_persistence:
         ensure_session_store(settings)
-    store = JobStore(settings.db_path)
+    # Epic F1: an empty database_url keeps the SQLite zero-config default
+    # (db_path); a postgresql:// DSN opts into Postgres with the pool settings.
+    store = JobStore(settings.database_url or settings.db_path,
+                     pool_size=settings.db_pool_size,
+                     pool_max_overflow=settings.db_pool_max_overflow,
+                     statement_timeout_ms=settings.db_statement_timeout_ms)
     overrides = store.config_all()
     try:  # operator-saved project context (repos, business context) wins over env/defaults
         settings.apply_runtime_overrides(overrides)
@@ -665,7 +671,7 @@ async def users_patch(username: str, body: UserPatchBody,
                     detail=f"ClickUp id already linked to '{other['username']}'")
         try:
             store.user_set(username, clickup_user_id=cu_id)
-        except sqlite3.IntegrityError:
+        except db_mod.IntegrityError:
             raise HTTPException(status_code=409,
                                 detail="ClickUp id already linked to another user")
         # the mapping decides WHOSE ClickUp comments answer role-owned gates

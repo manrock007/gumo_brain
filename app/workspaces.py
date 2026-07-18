@@ -19,7 +19,7 @@ import logging
 import re
 import sqlite3
 
-from . import analytics, roles
+from . import analytics, db as db_mod, roles
 from .config import DEFAULT_PRODUCT_NAME, Settings, validate_repo_map, validate_stage_role_map
 from .db import JobStore
 
@@ -244,7 +244,7 @@ class WorkspaceService:
             try:
                 self.store.workspace_repos_replace(
                     ws["id"], [{"slug": s, **e} for s, e in mapping.items()])
-            except sqlite3.IntegrityError:
+            except db_mod.IntegrityError:
                 raise WorkspaceError(
                     "a project slug is already used by another workspace — slugs are global")
         elif "canonical_project" in clean and clean["canonical_project"]:

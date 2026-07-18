@@ -500,6 +500,39 @@ class Settings(BaseSettings):
     # Storage
     data_dir: str = "/data"
 
+    # Epic F1: execution substrate — the DB driver seam. EMPTY database_url =
+    # today's behavior EXACTLY (SQLite at db_path, the zero-config default). A
+    # `postgresql://…` value opts into the Postgres driver (Alembic owns the
+    # schema; psycopg required — see requirements-postgres.txt). The pool/timeout
+    # knobs are Postgres-only (ignored on SQLite).
+    database_url: str = ""
+    db_pool_size: int = 5
+    db_pool_max_overflow: int = 5
+    db_statement_timeout_ms: int = 0  # 0 = no statement timeout (PG-only)
+
+    @property
+    def db_backend(self) -> str:
+        return "postgres" if (self.database_url or "").strip().startswith("postgres") else "sqlite"
+
+    # Epic F2: multi-worker DB-claim queue (Postgres only; SQLite stays the
+    # single-process in-memory-queue path). worker_id defaults to hostname:pid
+    # at startup when empty. workers>1 REQUIRES Postgres (see OPERATIONS.md).
+    worker_id: str = ""
+    job_poll_interval_seconds: int = 2
+
+    @property
+    def multi_worker(self) -> bool:
+        """The DB-claim loop + advisory locks engage only on Postgres. SQLite
+        keeps the single-consumer asyncio queue no matter what."""
+        return self.db_backend == "postgres"
+
+    def resolved_worker_id(self) -> str:
+        wid = (self.worker_id or "").strip()
+        if wid:
+            return wid
+        import socket
+        return f"{socket.gethostname()}:{os.getpid()}"
+
     @property
     def db_path(self) -> str:
         return f"{self.data_dir}/brain.db"

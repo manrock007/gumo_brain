@@ -1,0 +1,8 @@
+# Epic F1: EXTRA dependencies required ONLY for Postgres deployments.
+# The zero-config default is SQLite and needs NONE of these — a SQLite install
+# that never sets DATABASE_URL never imports psycopg or alembic. Install these
+# on top of requirements.txt when running against Postgres:
+#   pip install -r requirements.txt -r requirements-postgres.txt
+psycopg[binary]>=3.1
+psycopg_pool>=3.2
+alembic>=1.13

@@ -6,6 +6,16 @@ import sqlite3
 import time
 from contextlib import contextmanager
 
+from .dbdriver import DBDriver, SqliteDriver, PostgresDriver
+
+# Epic F1: driver-normalized exception aliases. Call sites catch
+# ``db.IntegrityError`` / ``db.OperationalError`` instead of ``sqlite3.*`` so
+# the same handler works under either backend. Defaults are the SQLite types
+# (the zero-config path + every test); a Postgres JobStore rebinds them to the
+# psycopg types in __init__.
+IntegrityError: type = sqlite3.IntegrityError
+OperationalError: type = sqlite3.OperationalError
+
 # owner/name + number out of a GitHub PR url (kept escape-simple on purpose)
 PR_URL_PARTS_RE = re.compile(r"github\.com/([\w.-]+/[\w.-]+)/pull/(\d+)")
 
@@ -599,8 +609,34 @@ _FTS_TERM_RE = re.compile(r"[^0-9A-Za-z_]+")
 
 
 class JobStore:
-    def __init__(self, path: str):
-        self._path = path
+    def __init__(self, dsn: str, *, driver: DBDriver | None = None,
+                 pool_size: int = 5, pool_max_overflow: int = 5,
+                 statement_timeout_ms: int = 0):
+        """Back-compat: a plain filesystem path (what conftest and every test
+        pass) selects SqliteDriver; a ``postgresql://`` DSN selects
+        PostgresDriver; an explicit ``driver=`` wins over both. On Postgres the
+        DDL/bootstrap block below is skipped — Alembic owns the schema."""
+        self._path = dsn  # retained for back-compat / diagnostics
+        if driver is not None:
+            self._driver = driver
+        elif isinstance(dsn, str) and dsn.startswith(("postgres://", "postgresql://")):
+            self._driver = PostgresDriver(
+                dsn, pool_size=pool_size, max_overflow=pool_max_overflow,
+                statement_timeout_ms=statement_timeout_ms)
+        else:
+            self._driver = SqliteDriver(dsn)
+        # module-level driver-normalized exception aliases (see top of module)
+        global IntegrityError, OperationalError
+        IntegrityError = self._driver.IntegrityError
+        OperationalError = self._driver.OperationalError
+        # fts_enabled is set for BOTH backends: under owns_schema=True the whole
+        # DDL block (the only place SQLite assigns it) is skipped, so Postgres
+        # must default it False here or mem_search / _fts_upsert AttributeError.
+        # Postgres FTS (tsvector) is out of scope for F1 — retrieval degrades to
+        # absent exactly like a SQLite build without FTS5 (documented).
+        self.fts_enabled = False
+        if self._driver.owns_schema:
+            return  # Alembic owns schema + the one-shot data steps on Postgres
         with self._conn() as c:
             c.executescript(SCHEMA)
             for table, columns in MIGRATIONS.items():
@@ -648,7 +684,7 @@ class JobStore:
                     workspace_id UNINDEXED, scope UNINDEXED, job_id UNINDEXED,
                     path UNINDEXED, title, body, tokenize='porter unicode61')""")
                 self.fts_enabled = True
-            except sqlite3.OperationalError:
+            except self._driver.OperationalError:
                 self.fts_enabled = False
             # Epic E4: one-time copy of legacy admin_events into the unified
             # audit_log, gated on a DURABLE app_config marker (never on table
@@ -677,15 +713,31 @@ class JobStore:
                     "INSERT INTO app_config (key, value, updated_at) VALUES "
                     "('audit_legacy_copied', '1', ?)", (time.time(),))
 
-    @contextmanager
     def _conn(self):
-        conn = sqlite3.connect(self._path)
-        conn.row_factory = sqlite3.Row
-        try:
-            yield conn
-            conn.commit()
-        finally:
-            conn.close()
+        """Delegate to the active driver's connection context (Epic F1). The
+        SqliteDriver path is byte-for-byte the historical sqlite3.connect +
+        Row factory with commit-on-exit / close-in-finally."""
+        return self._driver.connect()
+
+    def _insert_returning(self, c, sql: str, params, pk: str = "id"):
+        """Execute an INSERT and return its new primary-key value.
+
+        On SQLite this is ``cur.lastrowid``; on Postgres the driver's cursor
+        has no lastrowid, so we append ``RETURNING <pk>`` and read it back. Only
+        the ~7 real lastrowid sites call this — a blanket RETURNING rewrite
+        would break every insert into a table whose PK is not named ``id``.
+
+        Returns None when 0 rows were inserted (an ON CONFLICT DO NOTHING that
+        deduped): callers that dedupe already branch on ``cur.rowcount == 0``
+        first, and on SQLite lastrowid is only trusted when rowcount != 0."""
+        if self._driver.backend == "postgres":
+            cur = c.execute(sql + f" RETURNING {pk}", params)
+            if not cur.rowcount:
+                return cur, None
+            row = cur.fetchone()
+            return cur, (row[pk] if row is not None else None)
+        cur = c.execute(sql, params)
+        return cur, (cur.lastrowid if cur.rowcount else None)
 
     # ---------- jobs ----------
 
@@ -892,7 +944,8 @@ class JobStore:
     def workspace_member_set(self, workspace_id: int, user_id: int, member: bool):
         with self._conn() as c:
             if member:
-                c.execute("INSERT OR IGNORE INTO workspace_members (workspace_id, user_id) VALUES (?, ?)",
+                c.execute("INSERT INTO workspace_members (workspace_id, user_id) VALUES (?, ?) "
+                          "ON CONFLICT(workspace_id, user_id) DO NOTHING",
                           (workspace_id, user_id))
             else:
                 c.execute("DELETE FROM workspace_members WHERE workspace_id = ? AND user_id = ?",
@@ -941,12 +994,12 @@ class JobStore:
         cols = ", ".join(fields)
         marks = ", ".join("?" for _ in fields)
         with self._conn() as c:
-            cur = c.execute(
+            _, ws_id = self._insert_returning(
+                c,
                 f"INSERT INTO workspaces (slug, name{', ' + cols if cols else ''}, created_at, updated_at) "
                 f"VALUES (?, ?{', ' + marks if marks else ''}, ?, ?)",
                 (slug, name, *fields.values(), now, now),
             )
-            ws_id = cur.lastrowid
             for r in repos:
                 c.execute(
                     "INSERT INTO workspace_repos (workspace_id, slug, repo, base, setup_cmd, test_cmd, allow) "
@@ -956,7 +1009,8 @@ class JobStore:
                 )
             c.execute("UPDATE jobs SET workspace_id = ? WHERE workspace_id IS NULL", (ws_id,))
             for uid in user_ids:
-                c.execute("INSERT OR IGNORE INTO workspace_members (workspace_id, user_id) VALUES (?, ?)",
+                c.execute("INSERT INTO workspace_members (workspace_id, user_id) VALUES (?, ?) "
+                          "ON CONFLICT(workspace_id, user_id) DO NOTHING",
                           (ws_id, uid))
         return self.workspace_get(ws_id)
 
@@ -1170,14 +1224,15 @@ class JobStore:
         now = time.time()
         expires_at = (now + ttl_days * 86400) if ttl_days and ttl_days > 0 else None
         with self._conn() as c:
-            cur = c.execute(
+            _, _new_id = self._insert_returning(
+                c,
                 "INSERT INTO api_tokens (user_id, name, token_hash, prefix_hint, scopes, "
                 "created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (int(user_id), name or "", token_hash, prefix_hint, scopes or "", now, expires_at),
             )
             row = c.execute("SELECT id, user_id, name, prefix_hint, scopes, created_at, "
                             "last_used_at, expires_at, revoked_at FROM api_tokens WHERE id = ?",
-                            (cur.lastrowid,)).fetchone()
+                            (_new_id,)).fetchone()
         return token, dict(row)
 
     def api_token_verify(self, token: str) -> dict | None:
@@ -1318,11 +1373,11 @@ class JobStore:
         """INSERT-only; returns the new row id (Epic D2: the decision
         registry's auto-registration ref 'g<id>')."""
         with self._conn() as c:
-            cur = c.execute(
+            _, gid = self._insert_returning(
+                c,
                 "INSERT INTO guidance_log (job_id, stage, action, text, via, artifact_sha, at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (job_id, stage, action, text, via, artifact_sha, time.time()),
             )
-            gid = cur.lastrowid
             # Epic D4: human decisions are retrievable context. gate_events /
             # admin_events are deliberately NEVER indexed (refusals and
             # escalations must never reach model context as human decisions).
@@ -1450,7 +1505,7 @@ class JobStore:
                         ORDER BY bm25(mem_fts) LIMIT ?""",
                     params).fetchall()
                 return [dict(r) for r in rows]
-        except sqlite3.OperationalError:
+        except self._driver.OperationalError:
             return []
 
     # ---------- decision registry (Epic D2, docs/ENGINE.md §16) ----------
@@ -1477,19 +1532,24 @@ class JobStore:
             links = json.dumps([str(l) for l in links])
         now = time.time()
         with self._conn() as c:
-            cur = c.execute(
-                """INSERT OR IGNORE INTO decisions
+            # ON CONFLICT on the partial UNIQUE (source, ref) index — the WHERE
+            # matches the index predicate so a ref='' row (not in the index)
+            # never conflicts, exactly like the old INSERT OR IGNORE. Portable
+            # to Postgres, where OR IGNORE is invalid.
+            cur, did = self._insert_returning(
+                c,
+                """INSERT INTO decisions
                      (source, status, scope, job_id, workspace_id, project, stage,
                       title, text, decided_by, origin_author, links, ref,
                       created_at, updated_at, updated_by)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(source, ref) WHERE ref != '' DO NOTHING""",
                 (source, status, scope, job_id, workspace_id, project, stage,
                  (title or "")[:200], text, decided_by, origin_author,
                  links or "[]", (ref or "").strip(), now, now, decided_by),
             )
             if cur.rowcount == 0:
                 return None  # deduped by (source, ref)
-            did = cur.lastrowid
             if status == "active":
                 self._fts_upsert(c, "decision", f"d{did}", project=project,
                                  workspace_id=workspace_id, scope=scope,
@@ -1738,8 +1798,9 @@ class JobStore:
         watermark (channel re-added) is never moved."""
         with self._conn() as c:
             c.execute(
-                "INSERT OR IGNORE INTO slack_cursors (channel, last_ts, updated_at) "
-                "VALUES (?, ?, ?)", (channel, str(ts), time.time()))
+                "INSERT INTO slack_cursors (channel, last_ts, updated_at) "
+                "VALUES (?, ?, ?) ON CONFLICT(channel) DO NOTHING",
+                (channel, str(ts), time.time()))
 
     # ---------- gate events (Epic A: audit substrate + idempotence store) ----------
     # NOT guidance_log: guidance renders into stage prompts, and refusals /
@@ -1756,8 +1817,9 @@ class JobStore:
             raise ValueError("gate_event_add requires a non-empty ref")
         with self._conn() as c:
             cur = c.execute(
-                """INSERT OR IGNORE INTO gate_events (job_id, stage, kind, ref, detail, actor, at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                """INSERT INTO gate_events (job_id, stage, kind, ref, detail, actor, at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(job_id, kind, ref) DO NOTHING""",
                 (job_id, stage, kind, ref, detail, actor, time.time()),
             )
             return cur.rowcount == 1
@@ -1817,10 +1879,11 @@ class JobStore:
         now = time.time()
         with self._conn() as c:
             cur = c.execute(
-                """INSERT OR IGNORE INTO inbox_items
+                """INSERT INTO inbox_items
                      (workspace_id, kind, source, dedupe_key, source_sig, title,
                       body, refs, status, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)
+                   ON CONFLICT(kind, dedupe_key) DO NOTHING""",
                 (workspace_id, kind, source, dedupe_key, source_sig,
                  (title or "")[:300], body or "", refs or "{}", now, now),
             )
@@ -1990,10 +2053,14 @@ class JobStore:
         (routine_boot_bump), which runs at EVERY boot."""
         now = time.time()
         with self._conn() as c:
+            # conflict target = the expression UNIQUE index
+            # idx_routines_scope on (kind, COALESCE(workspace_id, -1)); the same
+            # expression is valid as a Postgres partial/expression conflict target.
             cur = c.execute(
-                """INSERT OR IGNORE INTO routines
+                """INSERT INTO routines
                      (workspace_id, kind, name, schedule, enabled, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(kind, COALESCE(workspace_id, -1)) DO NOTHING""",
                 (workspace_id, kind, name or kind, schedule, int(enabled), now, now))
             return cur.rowcount == 1
 
@@ -2049,11 +2116,12 @@ class JobStore:
     def routine_run_open(self, routine_id: int, kind: str,
                          workspace_id: int | None) -> int:
         with self._conn() as c:
-            cur = c.execute(
+            _, run_id = self._insert_returning(
+                c,
                 "INSERT INTO routine_runs (routine_id, kind, workspace_id, started_at) "
                 "VALUES (?, ?, ?, ?)",
                 (int(routine_id), kind, workspace_id, time.time()))
-            return cur.lastrowid
+            return run_id
 
     def routine_run_close(self, run_id: int, status: str, detail: str = "",
                           items_emitted: int = 0):
@@ -2383,7 +2451,8 @@ class JobStore:
         """Spawn a watch job in ONE transaction: the row is born kind='watch'
         AND status='watching' — never insert()+set_status, whose intermediate
         'received' state would be re-enqueued at boot and dispatched into a
-        Claude run. Raises sqlite3.IntegrityError if the row already exists
+        Claude run. Raises db.IntegrityError (the driver-normalized type) if
+        the row already exists
         (callers check store.get first; a race fails loudly, not twice)."""
         now = time.time()
         cols = ", ".join(fields)
@@ -2513,11 +2582,12 @@ class JobStore:
                        queued_at: float | None = None) -> int:
         now = time.time()
         with self._conn() as c:
-            cur = c.execute(
+            _, run_id = self._insert_returning(
+                c,
                 "INSERT INTO stage_runs (job_id, stage, attempt, queued_at, started_at) VALUES (?, ?, ?, ?, ?)",
                 (job_id, stage, attempt, queued_at or now, now),
             )
-            return cur.lastrowid
+            return run_id
 
     def stage_run_close(self, run_id: int, result_status: str,
                         cost_usd: float | None = None, num_turns: int | None = None,
@@ -2736,8 +2806,10 @@ class JobStore:
     def autonomy_pin_set(self, workspace_id: int, stage: int, pin: str, set_by: str):
         with self._conn() as c:
             c.execute(
-                "INSERT OR REPLACE INTO autonomy_pins (workspace_id, stage, pin, set_by, set_at) "
-                "VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO autonomy_pins (workspace_id, stage, pin, set_by, set_at) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(workspace_id, stage) DO UPDATE SET "
+                "pin=excluded.pin, set_by=excluded.set_by, set_at=excluded.set_at",
                 (workspace_id, stage, pin, set_by, time.time()))
 
     def autonomy_pin_clear(self, workspace_id: int, stage: int):
@@ -2795,14 +2867,15 @@ class JobStore:
                  duration_ms: float | None = None, session_id: str = "",
                  degraded: bool = False, lane: str = "", author: str = "") -> int:
         with self._conn() as c:
-            cur = c.execute(
+            _, chat_id = self._insert_returning(
+                c,
                 """INSERT INTO gate_chat (job_id, stage, attempt, role, text,
                      cost_usd, num_turns, duration_ms, session_id, degraded, lane, author, at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (job_id, stage, attempt, role, text, cost_usd, num_turns,
                  duration_ms, session_id, int(degraded), lane, author, time.time()),
             )
-            return cur.lastrowid
+            return chat_id
 
     def chat_last(self, job_id: str, stage: int, attempt: int | None = None) -> dict | None:
         """Latest turn for a stage — scoped to one ATTEMPT when given, so a
