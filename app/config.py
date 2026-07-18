@@ -310,6 +310,13 @@ class Settings(BaseSettings):
     inbox_notice_ttl_days: int = 30
     routine_run_ttl_days: int = 90
 
+    # ---- Audit log (Epic E4) ----
+    # Max rows per /api/audit/export page (cursor-paged JSONL for SIEM).
+    audit_export_page_size: int = 500
+    # 0 = keep forever (the SIEM is the archive); >0 lets the daily janitor
+    # prune audit_log rows older than N days.
+    audit_retention_days: int = 0
+
     # ---- Scoped API tokens (Epic E2) ----
     # Default expiry (days) for a token created without an explicit ttl.
     # 0 = no expiry (neutral).

@@ -220,6 +220,9 @@ async def login(body: LoginBody, request: Request, response: Response):
         secure=settings.session_cookie_secure,
         max_age=settings.auth_session_ttl_days * 86400, path="/",
     )
+    audit.record(store, audit.LOGIN, actor=audit.dashboard_actor(user),
+                 actor_kind="user", target=user["username"],
+                 channel="dashboard", detail={"method": "password"})
     return _public_user(user)
 
 
@@ -331,6 +334,45 @@ async def admin_revoke_user_token(username: str, token_id: int,
                  actor_kind="user", target=str(token_id),
                  detail={"username": username})
     return {"ok": True}
+
+
+def _audit_scope_for(user: dict, store: JobStore):
+    """Instance admin sees ALL rows (workspace_ids=None); a non-admin
+    (workspace-admin export) is scoped to their workspace memberships."""
+    if (user.get("role") or "") in ("admin", "instance_admin"):
+        return None
+    return sorted(store.workspace_ids_for_user(user["id"]))
+
+
+@app.get("/api/audit")
+async def audit_view(limit: int = 100, user: dict = Depends(require_user)):
+    """Paged audit viewer (Epic E4). Instance admin sees all; a workspace admin
+    sees their workspaces' rows. Members without a workspace-admin scope still
+    see only their memberships' rows (read-only)."""
+    store: JobStore = app.state.store
+    ws_ids = _audit_scope_for(user, store)
+    return {"events": store.audit_recent(min(int(limit), 1000), workspace_ids=ws_ids)}
+
+
+@app.get("/api/audit/export", dependencies=[Depends(require_admin)])
+async def audit_export(request: Request, after: int = 0, limit: int = 0):
+    """JSONL cursor-paged export for SIEM (Epic E4). One JSON object per line;
+    the next cursor is in the X-Next-Cursor header (and re-fetch with ?after=).
+    Instance-admin only; a workspace admin's export is membership-scoped."""
+    store: JobStore = app.state.store
+    user = current_user(request)
+    ws_ids = _audit_scope_for(user, store)
+    page_size = settings.audit_export_page_size
+    n = page_size if limit <= 0 else min(int(limit), page_size)
+    rows = store.audit_page(after_id=int(after), limit=n, workspace_ids=ws_ids)
+    next_cursor = rows[-1]["id"] if rows else int(after)
+
+    def _lines():
+        for r in rows:
+            yield json.dumps(r, default=str) + "\n"
+
+    return StreamingResponse(_lines(), media_type="application/x-ndjson",
+                             headers={"X-Next-Cursor": str(next_cursor)})
 
 
 def _decode_profile(row: dict) -> dict:

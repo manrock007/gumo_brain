@@ -20,7 +20,7 @@ import time
 import uuid
 from pathlib import Path
 
-from . import analytics, autonomy, outcome, people, roles
+from . import analytics, audit, autonomy, outcome, people, roles
 from .clickup import ClickUp
 from .config import ENGINE_NAME, Settings
 from .db import JobStore
@@ -727,16 +727,40 @@ class Worker:
         if job is None:
             raise KeyError(job_id)
         kind = job.get("kind") or "sentry"
+        stage_at_answer = job.get("stage")
         if kind == "feature":
-            return await self._answer_feature(job, action, text, via,
-                                              actor=actor, override=override)
-        if kind == "watch":
+            status = await self._answer_feature(job, action, text, via,
+                                                actor=actor, override=override)
+        elif kind == "watch":
             # BEFORE the v1 redo-refusal: the Iterate gate supports /redo <days>
-            return await self._answer_watch(job, action, text, via,
-                                            actor=actor, override=override)
-        if action == "redo":
-            raise ValueError(f"redo is only valid for feature pipelines, not kind '{kind}'")
-        return await self._answer_v1(job, action, text, via)
+            status = await self._answer_watch(job, action, text, via,
+                                              actor=actor, override=override)
+        else:
+            if action == "redo":
+                raise ValueError(f"redo is only valid for feature pipelines, not kind '{kind}'")
+            status = await self._answer_v1(job, action, text, via)
+        # Epic E4: audit the gate decision AFTER the answer won its CAS (any
+        # loser raised GateConflict/GateForbidden above and never reaches here).
+        # answer_job is the single choke point BOTH channels funnel through
+        # (dashboard + the ClickUp poller at worker.py:1501), so this one hook
+        # covers both. Channel derived from `via`; the acting principal too.
+        self._audit_gate_decision(job, action, via, actor, status, stage_at_answer)
+        return status
+
+    def _audit_gate_decision(self, job, action, via, actor, status, stage):
+        try:
+            channel = "clickup" if via.startswith("clickup") else "dashboard"
+            actor_str = via if actor is None else (
+                f"dashboard:{actor['username']}" if channel == "dashboard"
+                else f"clickup:{actor['username']}")
+            audit.record(
+                self.store, audit.GATE_DECISION, actor=actor_str, actor_kind="user",
+                scope="job", workspace_id=job.get("workspace_id"),
+                job_id=job.get("issue_id") or "", channel=channel,
+                target=f"P{stage}" if stage is not None else "",
+                detail={"stage": stage, "verdict": action, "state": status})
+        except Exception:  # audit must never break a won gate transition
+            log.debug("gate-decision audit failed", exc_info=True)
 
     async def _answer_v1(self, job: dict, action: str, text: str, via: str) -> str:
         job_id = job["issue_id"]
@@ -834,6 +858,11 @@ class Worker:
                 job["issue_id"], "admin_override", ref=uuid.uuid4().hex,
                 stage=int(job.get("stage") or 0), actor=via,
                 detail=f"{action} on a {owner.role} gate owned by {owner.display}")
+            audit.record(self.store, audit.GATE_OVERRIDE, actor=via, actor_kind="user",
+                         scope="job", workspace_id=job.get("workspace_id"),
+                         job_id=job["issue_id"],
+                         channel="clickup" if via.startswith("clickup") else "dashboard",
+                         detail={"verdict": action, "role": owner.role})
             log.info("admin override: %s %s by %s", job["issue_id"], action, via)
         return result
 
@@ -1235,6 +1264,11 @@ class Worker:
                 stage=None, actor=via,
                 detail=f"{action} on the {owner.role}-owned Iterate gate "
                        f"owned by {owner.display}")
+            audit.record(self.store, audit.GATE_OVERRIDE, actor=via, actor_kind="user",
+                         scope="job", workspace_id=job.get("workspace_id"),
+                         job_id=job["issue_id"],
+                         channel="clickup" if via.startswith("clickup") else "dashboard",
+                         detail={"verdict": action, "role": owner.role})
             log.info("admin override: %s %s by %s", job["issue_id"], action, via)
         return result
 
@@ -1860,6 +1894,9 @@ class Worker:
         pruned = transcripts.prune(self.settings, self.settings.transcript_ttl_days)
         if pruned:
             log.info("transcript janitor pruned %d run transcripts", pruned)
+        # Epic E4: prune audit_log only when a retention window is set (0 = keep
+        # forever; the SIEM export is the archive).
+        self.store.audit_prune(self.settings.audit_retention_days)
         if self.settings.session_persistence:
             self._prune_sessions()
 
