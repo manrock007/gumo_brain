@@ -167,6 +167,13 @@ gates the authed user owns + unassigned gates (plus feature error/timeout
 parks, which are answerable), membership-scoped, sorted overdue-first then
 oldest-gate-first, with `counts.mine` as the badge number.
 
+**Auto-advance resolution (Epic C, §15).** A clean `STAGE_DONE` resolves its
+gate through one order — **workspace pin > per-job `gate_mode='light'` >
+computed autonomy level (opt-in) > default full gating** — and the safety
+guards apply unconditionally on top under every mode. See §15 for the trust
+ladder; light mode's own contract (auto-advance only at P2/P4–P8, boilerplate
+question, all guards) is unchanged.
+
 **Gate-park ordering (crash-safe).** The DB transition to `awaiting_input`
 (with the current comment marker) commits BEFORE the gate comment is posted;
 the poller ignores engine-authored comments (fixed prefix). On restart, parked
@@ -557,7 +564,9 @@ all-gated).
 
 ## 9. Deliberate deferrals
 
-- Auto-advance gate tiering (P5→P6, P7→P8 candidates) — after week-one data.
+- ~~Auto-advance gate tiering (P5→P6, P7→P8 candidates) — after week-one
+  data.~~ Shipped as graduated autonomy (§15): earned per-cell levels with
+  workspace pins, computed from exactly that week-one data, continuously.
 - Per-job worktrees + bounded concurrency — after latency data.
 - Scheduled memory-refresh job kind — freshness metric first.
 - Unmerged-PR memory salvage (abandoned-approach ADRs).
@@ -719,3 +728,108 @@ context reset (`DELETE /api/context`) preserves the flag — upgrades and
 resets never resurrect onboarding. Members are never shown instance
 onboarding; an unassigned member instead gets an inbox hint naming the
 fix ("ask your admin for workspace access").
+
+## 15. Graduated autonomy — the trust ladder (Epic C)
+
+Trust is **earned from the receipts, per (workspace, repo, stage) cell**,
+never asserted. A nightly scorer (`autonomy_forever`, cadence
+`AUTONOMY_RECOMPUTE_HOURS`, plus the admin-only
+`POST /api/autonomy/recompute`) reads the rolling `AUTONOMY_WINDOW_DAYS`
+window of `stage_runs` and derives a level 0–3 per cell, persisted in
+`autonomy_scores` **with the exact inputs the formula saw** (`inputs` JSON —
+the transparency requirement).
+
+**The formula** (`app/autonomy.py`, weights/thresholds are module constants):
+
+```
+score = 0.40 · clean_rate          runs closing 'done' / counted runs
+      + 0.30 · (1 − redo_rate)     human redos TARGETING this stage / answered gates
+      + 0.15 · latency_factor      clamp01(1 − median(gate answer wait) / 2·SLA)
+      + 0.15 · rounds_factor       code stages: clamp01(1 − avg shepherd rounds / cap)
+
+level:  ≥ 0.90 → 3   ≥ 0.75 → 2   ≥ 0.55 → 1   else 0
+```
+
+with the fail-closed edges spelled out: open runs (`result_status=''`),
+`interrupted` and `skipped_single_group` are excluded from every
+denominator; latency uses only runs with BOTH `gate_posted_at` AND
+`gate_answered_at` and an empty sample is neutral (factor 1.0); zero
+answered gates means `redo_rate = 0` (full credit on that term); doc stages
+take a neutral rounds factor. Overrides: a sample under `AUTONOMY_MIN_RUNS`
+stays level 0; **level 3 additionally requires a clean streak ≥ the same
+minimum AND at least one human-answered gate in the window** — a cell that
+only ever auto-advances can never hold full trust on autopilot (only
+STAGE_FAIL/guard parks, a human redo, or clawback would otherwise demote
+it). A cell whose runs age out of the window decays to level 0 on the next
+pass. Redo attribution reads `guidance_log` (which records the TARGET
+stage), never `stage_runs.gate_action` — a `/redo P2` answered at the P4
+gate penalizes P2, not the innocent parked stage.
+
+**Resolution order at a clean STAGE_DONE** (`autonomy.resolve_gate`, one
+function, locked):
+
+1. **Workspace pin** (`autonomy_pins`, per stage): `always_gate` |
+   `always_auto` — pins always win in both directions and never expire.
+   Admin-set (`PUT /api/workspaces/{id}/autonomy/pins`), audited.
+2. **Per-job `gate_mode='light'`** — unchanged, including its
+   P2/P4–P8-only restriction. Light mode's "P0/P1/P3/P9 always park"
+   promise is now "…unless a workspace `always_auto` pin or a
+   level ≥ `AUTONOMY_AUTO_LEVEL` cell fires for that stage (P9 excepted —
+   always terminal-gated)".
+3. **Computed level ≥ `AUTONOMY_AUTO_LEVEL`** — **opt-in, default OFF**
+   (`0` = computed levels never auto-advance; values outside 1..3 disable
+   the rule rather than clamping — never toward permissiveness).
+4. Default **full gating**.
+
+**Invariants.** The safety guards are unconditional at every level and
+under every pin: a conflicted mid-run human edit, `mirror_ok=0`, the first
+clean run after an explicit `/redo` of the stage, P5 without a captured PR,
+and any non-boilerplate question all force a park; STAGE_FAIL / STAGE_ASK /
+unparsed always park. "Level 3 = full auto-advance" means "auto-advance any
+clean, guard-passing STAGE_DONE" — never "skip the guards". **P9 never
+auto-advances**: its proceed is the terminal transition owned by the worker;
+`always_auto` pins on stage 9 are refused at the API and ignored by the
+resolver. A job with no stamped `workspace_id` skips pin and level
+resolution entirely (fail closed) — only the workspace-independent light
+mode path can still fire for it. `AUTONOMY_ENABLED=false` restores pure
+legacy behavior (light mode only, pins ignored); it is env-only and read
+once — flipping it needs a restart.
+
+**Clawback** (`POST /api/workspaces/{id}/autonomy/clawback`, workspace
+members may pull the brake — it only reduces autonomy): drops the cell(s)
+to level 0 and stamps `clawback_at`; the scorer counts only runs started
+AFTER the stamp, so trust re-earns from zero. The stamp is never cleared —
+the dashboard shows the "clawed back" flag only while the cell sits at
+level 0. A workspace-wide clawback (project omitted) derives its slug list
+inside the DB transaction from every project that ever held a score row
+UNION the current repo set, so slugs since removed or moved keep their
+stale cells clawable. A recompute pass that started before a clawback
+landed can never resurrect the cell (conditional upsert; theoretical under
+today's single-process SQLite, load-bearing under Epic F2 Postgres).
+
+**Audit substrate.** Every mutation — `pin_set` / `pin_clear` / `clawback`
+/ `level_change` / each `auto_advance` — is an INSERT-only
+`autonomy_events` row with the acting principal (`dashboard:<username>` or
+`engine`). Epic E4 folds/exports these; nothing here waits for it.
+Auto-advances also carry their resolution reason into the guidance entry
+and the ClickUp gate comment ("auto-advanced (pin: always_auto)" /
+"…(autonomy level 3, 14 clean runs)").
+
+**Surface.** `GET /api/autonomy` — per accessible workspace the stage×repo
+matrix (level, score, sample, decoded inputs), the pin map, and the last 50
+events; `GET /api/jobs` feature rows carry `autonomy_level`/`autonomy_pin`
+for their current stage; the session snapshot carries a per-stage
+`autonomy` block powering the trust dial on the stage cards. Dashboard:
+the "Autonomy" panel (matrix + pins + clawback + event log), a trust chip
+on the feature header, and per-stage L0–L3 dials.
+
+**Recorded edges** (deliberate): a feature re-intake may change
+`jobs.project` while keeping old `stage_runs` — historical runs then join
+to the NEW project slug (acceptable: same repo lineage in practice). A repo
+slug moved to another workspace leaves in-flight jobs resolving pins/levels
+against their STAMPED `workspace_id` — the stamp is the record; the new
+workspace's pins apply to newly-intaken jobs. The auto-advance transition
+itself stays `set_fields`/`set_status` (no CAS) inside the serial worker
+while `status='running'` — correct today because `answer_job` requires
+`awaiting_input`; re-verify under Epic F2 with multiple workers (BUILD-PLAN:
+"All CAS transitions re-verified under Postgres semantics").

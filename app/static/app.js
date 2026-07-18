@@ -76,11 +76,15 @@ function row(j) {
   // inbox items (Epic A4) carry ownership + SLA state
   const overdue = j.overdue ? '<span class="badge overdue">overdue</span>' : '';
   const owner = j.gate_owner ? ` &middot; ${esc(j.gate_owner.display)}${j.gate_owner.is_you ? ' (you)' : ''}` : '';
+  // trust chip (Epic C3) — jobs-list rows carry autonomy_level/autonomy_pin;
+  // inbox items don't (guarded), and an unpinned L0 renders nothing
+  const trust = j.kind === 'feature' && (j.autonomy_pin || Number(j.autonomy_level) > 0)
+    ? ` <span class="aut-chip aut-l${Number(j.autonomy_level) || 0}" title="${j.autonomy_pin ? 'pinned ' + esc(PIN_LABEL[j.autonomy_pin] || j.autonomy_pin) : 'autonomy level for the current stage'}">${j.autonomy_pin ? PIN_GLYPH[j.autonomy_pin] || '' : 'L' + Number(j.autonomy_level)}</span>` : '';
   return `<div class="row${j.issue_id === sel ? ' sel' : ''}" data-status="${esc(j.status)}" onclick="openItem('${esc(j.issue_id)}')">
     <span class="rail"></span>
     <div class="body">
       <div class="t">${esc(j.title || j.issue_id)}</div>
-      <div class="m"><span class="badge ${esc(j.status)}">${esc(STATUS_LABEL[j.status] || j.status)}</span>${overdue}${esc(j.project)}${stageTxt}${owner}</div>
+      <div class="m"><span class="badge ${esc(j.status)}">${esc(STATUS_LABEL[j.status] || j.status)}</span>${overdue}${esc(j.project)}${stageTxt}${trust}${owner}</div>
       ${j.kind === 'feature' ? rowMini(j) : ''}
     </div>
     <span class="when">${fmtAgo(j.updated_at)}</span>
@@ -273,11 +277,19 @@ function stageCards(data) {
   }
   const stages = Object.keys(by).map(Number).sort((a, b) => a - b);
   const cur = Number(j.stage) || 0;
+  const aut = data.autonomy && data.autonomy.enabled ? data.autonomy : null;
   let h = '';
   for (const stg of stages) {
     const s = by[stg];
     const isLive = stg === cur && (j.status === 'running' || data.live);
     const a = arts[stg];
+    // per-stage trust dial (Epic C3): pin glyph when pinned, else L0–L3
+    let dial = '';
+    if (aut) {
+      const pin = aut.pins && aut.pins[String(stg)];
+      if (pin) dial = `<span class="aut-chip aut-pinned" title="pinned ${PIN_LABEL[pin]}">${PIN_GLYPH[pin]}</span>`;
+      else if (stg < 9) dial = autLevelChip((aut.levels && aut.levels[String(stg)]) || null);
+    }
     const meta = isLive
       ? `running &middot; ${fmtMMSS(s.dur)} &middot; $${s.cost.toFixed(2)}`
       : `${s.n > 1 ? s.n + '&times; &middot; ' : ''}${fmtMMSS(s.dur)} &middot; $${s.cost.toFixed(2)}${s.status ? ' &middot; ' + esc(s.status) : ''}`;
@@ -285,7 +297,7 @@ function stageCards(data) {
       ? `<div class="inner" id="live-slot"></div>`
       : `<div class="inner">${a ? `<div class="art">${esc(a.content || '(empty)')}${a.truncated ? '… (truncated)' : ''}</div>` : '<div class="lead" style="margin-top:8px">no artifact for this stage</div>'}${transcriptAccordions(data, stg)}</div>`;
     h += `<details class="stage${isLive ? ' live' : ''}" data-key="st-${stg}"${isLive ? ' open' : ''}>
-      <summary><span class="sx">P${stg}</span><span class="snm">${esc(STAGE_NAMES[stg] || '')}</span>
+      <summary><span class="sx">P${stg}</span><span class="snm">${esc(STAGE_NAMES[stg] || '')}</span>${dial}
       ${!isLive && s.status === 'done' ? '<span class="tick">&#10003;</span>' : ''}<span class="sm">${meta}</span></summary>
       ${inner}</details>`;
   }
@@ -429,7 +441,19 @@ function renderDetail(data) {
   if (j.pr_url) links += `<a href="${esc(j.pr_url)}" target="_blank">PR</a>`;
   let sub;
   if (feature) {
-    sub = `P${j.stage} ${esc(j.stage_name || '')} &middot; ${esc(j.project)} &middot; ${esc(j.gate_mode)} gates`
+    // trust chip (Epic C3): the current stage's pin or earned level
+    const aut = data.autonomy;
+    let trust = '';
+    if (aut && aut.enabled) {
+      const pin = aut.pins && aut.pins[String(j.stage)];
+      if (pin) trust = ' &middot; pinned: ' + (PIN_LABEL[pin] || pin);
+      else {
+        const lv = aut.levels && aut.levels[String(j.stage)];
+        trust = ' &middot; trust L' + (lv ? lv.level : 0)
+          + (lv && lv.clawed_back ? ' (clawed back)' : '');
+      }
+    }
+    sub = `P${j.stage} ${esc(j.stage_name || '')} &middot; ${esc(j.project)} &middot; ${esc(j.gate_mode)} gates${trust}`
       + `<span style="margin-left:auto"><details class="sub" style="margin:0" data-key="d-stats"><summary>stats</summary></details></span>`;
   } else {
     const score = j.score != null ? ` &middot; score ${esc(String(j.score))}` : '';
@@ -867,6 +891,131 @@ function renderOutcomes(data) {
       : '<div class="empty">no measured outcomes yet &mdash; ship a feature with a success metric</div>');
 }
 
+// ---------- autonomy (api/autonomy, Epic C) ----------
+
+let autonomyData = null;
+let lastAutonomy = '';
+
+async function loadAutonomy() {
+  try {
+    const r = await fetch('api/autonomy');
+    if (!r.ok) return;
+    const data = await r.json();
+    const sig = JSON.stringify(data);
+    if (sig === lastAutonomy) return;
+    lastAutonomy = sig; autonomyData = data;
+    renderAutonomy();
+  } catch (e) { /* keep the previous view */ }
+}
+
+const PIN_GLYPH = { always_gate: '&#128274;', always_auto: '&#9889;' };
+const PIN_LABEL = { always_gate: 'always gate', always_auto: 'always auto' };
+
+function autLevelChip(cell) {
+  if (!cell) return '<span class="aut-chip aut-l0" title="no track record yet">L0</span>';
+  const inp = cell.inputs || {};
+  const tip = 'score ' + Number(cell.score || 0).toFixed(2) + ' · ' + (cell.sample_runs || 0) + ' runs'
+    + (inp.clean_streak != null ? ' · streak ' + inp.clean_streak : '')
+    + (inp.clean_rate != null ? ' · clean ' + Math.round(inp.clean_rate * 100) + '%' : '')
+    + (inp.redo_rate != null ? ' · redo ' + Math.round(inp.redo_rate * 100) + '%' : '')
+    + (cell.clawed_back ? ' · CLAWED BACK — re-earning from zero' : '');
+  return `<span class="aut-chip aut-l${Number(cell.level) || 0}${cell.clawed_back ? ' aut-clawed' : ''}" title="${attr(tip)}">L${Number(cell.level) || 0}</span>`;
+}
+
+function renderAutonomy() {
+  const el = document.getElementById('autonomy-body');
+  if (!el || !autonomyData) return;
+  const d = autonomyData;
+  if (!d.enabled) {
+    el.innerHTML = '<div class="empty">autonomy is disabled on this instance (AUTONOMY_ENABLED=false)</div>';
+    return;
+  }
+  const isAdmin = ME && ME.role === 'admin';
+  const optin = d.auto_level
+    ? 'Computed levels auto-advance at L' + d.auto_level + '+ (AUTONOMY_AUTO_LEVEL).'
+    : 'Computed levels are advisory for now &mdash; AUTONOMY_AUTO_LEVEL=0; set 1&ndash;3 to let earned trust auto-advance.';
+  let h = `<div class="hint" style="margin-top:10px">Trust is earned per repo &times; stage from the receipts (clean rate, redos targeting the stage, gate latency, review rounds). L0 = always gate &middot; L3 = full auto-advance. ${optin} Pins always win in both directions; the safety guards (mid-run edit, mirror down, redo-first-run, missing PR, real questions) always apply, and P9 always parks.</div>`;
+  for (const ws of d.workspaces || []) {
+    const cells = {};
+    const projects = new Set(ws.repos || []);
+    for (const c of ws.cells || []) { cells[c.project + '|' + c.stage] = c; projects.add(c.project); }
+    const plist = Array.from(projects).sort();
+    let head = '<tr><th>repo</th>';
+    for (let s = 0; s <= 9; s++) {
+      const pin = (ws.pins && ws.pins[String(s)]) ? ws.pins[String(s)].pin : '';
+      const glyph = pin ? `<span class="aut-pin-g" title="pinned ${PIN_LABEL[pin]} by ${attr((ws.pins[String(s)] || {}).set_by || '')}">${PIN_GLYPH[pin]}</span>` : '';
+      const pinCtl = isAdmin
+        ? `<select class="aut-pin" onchange="pinStage(${ws.id},${s},this.value,this)" title="Pin P${s} — always wins over the computed level">`
+          + `<option value=""${pin ? '' : ' selected'}>&mdash;</option>`
+          + `<option value="always_gate"${pin === 'always_gate' ? ' selected' : ''}>gate</option>`
+          + (s === 9 ? '' : `<option value="always_auto"${pin === 'always_auto' ? ' selected' : ''}>auto</option>`)
+          + '</select>'
+        : '';
+      const clawAll = s === 9 ? '' : `<button class="aut-claw" onclick="clawback(${ws.id},${s},null,this)" title="Claw back P${s} for every repo — levels drop to 0, audited">&#8595;0</button>`;
+      head += `<th><span class="aut-st">P${s}</span>${glyph}<div class="aut-ctl">${pinCtl}${clawAll}</div></th>`;
+    }
+    head += '</tr>';
+    let rows = '';
+    for (const p of plist) {
+      let tds = '';
+      for (let s = 0; s <= 9; s++) {
+        if (s === 9) {
+          tds += '<td><span class="aut-chip aut-term" title="P9 always parks — its approval is the terminal transition">&#9646;</span></td>';
+          continue;
+        }
+        const c = cells[p + '|' + s];
+        const claw = c && c.level > 0
+          ? `<button class="aut-claw" onclick="clawback(${ws.id},${s},'${esc(p)}',this)" title="Claw back ${attr(p)} P${s} to L0 (re-earns from fresh runs)">&#8595;</button>` : '';
+        tds += `<td>${autLevelChip(c)}${claw}</td>`;
+      }
+      rows += `<tr><td class="aut-repo">${esc(p)}</td>${tds}</tr>`;
+    }
+    const events = (ws.events || []).map((e) =>
+      `<li><span class="aut-ev-k">${esc(e.kind)}</span> ${esc(e.detail || '')}`
+      + `${e.actor ? ' &middot; ' + esc(e.actor) : ''} &middot; ${fmtAgo(e.at)}</li>`).join('');
+    h += `<div class="aut-ws">${(d.workspaces || []).length > 1 ? `<h3>${esc(ws.name)}</h3>` : ''}
+      <div class="aut-matrix"><table>${head}${rows || '<tr><td class="empty" colspan="11">no repos yet</td></tr>'}</table></div>
+      ${events ? `<ol class="aut-log" id="autonomy-log">${events}</ol>` : ''}</div>`;
+  }
+  el.innerHTML = h;
+}
+
+async function pinStage(wsId, stage, pin, ctl) {
+  const msg = document.getElementById('msg');
+  ctl.disabled = true;
+  try {
+    const r = await fetch('api/workspaces/' + wsId + '/autonomy/pins', {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ stage: stage, pin: pin || null }),
+    });
+    const data = await r.json();
+    if (r.ok) {
+      msg.textContent = pin ? 'P' + stage + ' pinned ' + (PIN_LABEL[pin] || pin) + '.'
+                            : 'P' + stage + ' pin cleared.';
+      lastAutonomy = ''; loadAutonomy();
+    } else msg.textContent = 'Error: ' + (data.detail || r.status);
+  } catch (e) { msg.textContent = 'Error: ' + e; }
+  ctl.disabled = false;
+}
+
+async function clawback(wsId, stage, project, btn) {
+  const what = project ? "'" + project + "' P" + stage
+                       : 'P' + stage + ' for EVERY repo in this workspace';
+  if (!confirm('Claw back ' + what + '? The level drops to 0 and must be re-earned from fresh runs (audited).')) return;
+  const msg = document.getElementById('msg');
+  btn.disabled = true;
+  try {
+    const r = await fetch('api/workspaces/' + wsId + '/autonomy/clawback', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ stage: stage, project: project }),
+    });
+    const data = await r.json();
+    if (r.ok) { msg.textContent = 'Clawed back ' + data.clawed + ' cell(s).'; lastAutonomy = ''; loadAutonomy(); }
+    else msg.textContent = 'Error: ' + (data.detail || r.status);
+  } catch (e) { msg.textContent = 'Error: ' + e; }
+  btn.disabled = false;
+}
+
 // ---------- project context (api/context) ----------
 
 let ctxData = null;
@@ -1095,10 +1244,11 @@ document.addEventListener('keydown', (e) => {
 });
 window.addEventListener('hashchange', routeHash);
 
-loadProjects(); refresh(true); refreshMemory(true); loadContext(); loadOutcomes(); routeHash();
+loadProjects(); refresh(true); refreshMemory(true); loadContext(); loadOutcomes(); loadAutonomy(); routeHash();
 setInterval(() => refresh(false), 10000);
 setInterval(() => refreshMemory(false), 60000);
 setInterval(() => loadOutcomes(), 60000);
+setInterval(() => loadAutonomy(), 60000);
 
 // ---------- auth: who am I, sign-out, expired-session redirect ----------
 

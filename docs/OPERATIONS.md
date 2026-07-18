@@ -236,6 +236,34 @@ Operational notes:
   else is refused with the reason) while keeping the ORIGINAL pre-ship
   baseline.
 
+## 9. Graduated autonomy (Epic C: trust ladder, pins, clawback)
+
+| Env var | Default | Meaning |
+| --- | --- | --- |
+| `AUTONOMY_ENABLED` | `true` | master switch: nightly scoring + the Autonomy surface + workspace pins. `false` = legacy behavior (only per-feature `gate_mode=light` auto-advances; pins ignored). Env-only and read once — **flipping it requires a restart**. |
+| `AUTONOMY_WINDOW_DAYS` | `30` | rolling `stage_runs` window the scorer reads; runs that age out decay the cell back to level 0. |
+| `AUTONOMY_MIN_RUNS` | `5` | cells with fewer counted runs stay level 0; level 3 also needs a clean streak of at least this many runs plus one human-answered gate in the window. |
+| `AUTONOMY_AUTO_LEVEL` | `0` | computed level required to auto-advance a gate. **`0` (default) = computed levels never auto-advance** — scoring, the matrix and pins still work. Set `1`–`3` to opt in (`3` = only full trust); any other value disables the rule (never clamped). |
+| `AUTONOMY_RECOMPUTE_HOURS` | `24` | nightly scorer cadence (`POST /api/autonomy/recompute`, admin, runs it on demand). |
+
+Notes:
+
+- **Fresh instances gate everything until a track record exists**; upgraded
+  instances too — computed-level auto-advance is off until you set
+  `AUTONOMY_AUTO_LEVEL`, so deploying this feature changes no gating
+  behavior by itself. Pins in Settings → Autonomy override the computed
+  level in both directions and are explicit admin actions.
+- The safety guards (mid-run human edit, mirror down, first run after a
+  `/redo`, P5 without a PR, non-boilerplate questions) always apply — under
+  every pin and at every level — and P9 always parks (terminal gate).
+- Clawback (per cell or per stage across the workspace, dashboard →
+  Autonomy) is available to workspace members, drops levels to 0, and makes
+  the cell re-earn from runs after the clawback only. Every pin change,
+  clawback, level change and auto-advance lands in the `autonomy_events`
+  audit table.
+- These settings are env-only (not dashboard-editable context overrides);
+  changes apply at the next restart.
+
 ## Appendix — Example configuration: the original Gumo instance
 
 The values that used to ship as code defaults, now purely this one customer's

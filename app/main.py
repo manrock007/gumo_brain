@@ -454,12 +454,22 @@ async def workspaces_member(workspace_id: int, body: MemberBody):
 
 @app.get("/api/jobs")
 async def jobs(user: dict = Depends(require_user)):
-    rows = app.state.store.recent()
+    store: JobStore = app.state.store
+    rows = store.recent()
     svc = _ws_svc()
     rows = [r for r in rows if svc.user_can_access(user, r.get("workspace_id"))]
+    # autonomy annotation (Epic C3): two prefetches, never an N+1
+    scores = {(s["workspace_id"], s["project"], s["stage"]): s
+              for s in store.autonomy_scores_all()}
+    pins = {(p["workspace_id"], p["stage"]): p["pin"]
+            for p in store.autonomy_pins_all()}
     for r in rows:
         if r.get("kind") == "feature":
-            r["stage_name"] = stage_name(int(r.get("stage") or 0))
+            stage = int(r.get("stage") or 0)
+            r["stage_name"] = stage_name(stage)
+            cell = scores.get((r.get("workspace_id"), r.get("project") or "", stage))
+            r["autonomy_level"] = int(cell["level"]) if cell else 0
+            r["autonomy_pin"] = pins.get((r.get("workspace_id"), stage), "")
     return rows
 
 
@@ -527,6 +537,117 @@ async def outcomes_ledger(user: dict = Depends(require_user)):
         v = r.get("verdict") or "unmeasured"
         verdicts[v] = verdicts.get(v, 0) + 1
     return {"outcomes": rows, "verdicts": verdicts}
+
+
+# ---------- graduated autonomy (Epic C, docs/ENGINE.md §15) ----------
+
+
+class AutonomyPinBody(BaseModel):
+    stage: int
+    pin: str | None = None  # 'always_gate' | 'always_auto' | null = clear
+
+
+class AutonomyClawbackBody(BaseModel):
+    stage: int
+    project: str | None = None  # null = every repo in the workspace
+
+
+def _pin_map(store: JobStore, workspace_id: int) -> dict:
+    return {str(s): {"pin": p["pin"], "set_by": p["set_by"], "set_at": p["set_at"]}
+            for s, p in store.autonomy_pins_for(workspace_id).items()}
+
+
+@app.get("/api/autonomy")
+async def autonomy_state(user: dict = Depends(require_user)):
+    """The trust-ladder surface: per accessible workspace the stage×repo score
+    matrix (inputs JSON-decoded for the UI), the pin map, and the last 50
+    autonomy events. Membership-scoped like /api/workspaces."""
+    store: JobStore = app.state.store
+    svc = _ws_svc()
+    out = {"enabled": settings.autonomy_enabled,
+           "auto_level": autonomy.effective_auto_level(settings),
+           "workspaces": []}
+    for ws in svc.user_workspaces(user):
+        cells = []
+        for r in store.autonomy_scores_for(ws["id"]):
+            try:
+                inputs = json.loads(r.get("inputs") or "{}")
+            except (ValueError, TypeError):
+                inputs = {}
+            cells.append({
+                "project": r["project"], "stage": r["stage"], "level": r["level"],
+                "score": r["score"], "sample_runs": r["sample_runs"],
+                # display semantics (ENGINE.md §15): the flag shows only while
+                # the cell sits at 0 — clawback_at itself is never cleared
+                "clawed_back": bool(r.get("clawback_at")) and r["level"] == 0,
+                "computed_at": r["computed_at"], "inputs": inputs,
+            })
+        out["workspaces"].append({
+            "id": ws["id"], "slug": ws["slug"], "name": ws["name"],
+            "repos": [r["slug"] for r in store.workspace_repos_for(ws["id"])],
+            "pins": _pin_map(store, ws["id"]),
+            "cells": cells,
+            "events": store.autonomy_events_recent([ws["id"]], 50),
+        })
+    return out
+
+
+@app.put("/api/workspaces/{workspace_id}/autonomy/pins")
+async def autonomy_pin_put(workspace_id: int, body: AutonomyPinBody,
+                           admin: dict = Depends(require_admin)):
+    """Set or clear a per-workspace per-stage pin (admin — pins are config
+    mutations, matching workspace PATCH). Pins always win over computed
+    levels and never expire; every change is audited."""
+    store: JobStore = app.state.store
+    if store.workspace_get(workspace_id) is None:
+        raise HTTPException(status_code=404, detail="unknown workspace")
+    if not 0 <= body.stage <= 9:
+        raise HTTPException(status_code=400, detail="stage must be 0–9")
+    pin = (body.pin or "").strip() or None
+    actor = f"dashboard:{admin['username']}"
+    if pin is None:
+        if body.stage in store.autonomy_pins_for(workspace_id):
+            store.autonomy_pin_clear(workspace_id, body.stage)
+            store.autonomy_event_add("pin_clear", workspace_id=workspace_id,
+                                     stage=body.stage,
+                                     detail=f"P{body.stage} pin cleared", actor=actor)
+    else:
+        if pin not in ("always_gate", "always_auto"):
+            raise HTTPException(status_code=400,
+                                detail="pin must be 'always_gate', 'always_auto' or null")
+        if pin == "always_auto" and body.stage == 9:
+            raise HTTPException(status_code=400,
+                                detail="P9 never auto-advances — its proceed is the "
+                                       "terminal transition")
+        store.autonomy_pin_set(workspace_id, body.stage, pin, actor)
+        store.autonomy_event_add("pin_set", workspace_id=workspace_id, stage=body.stage,
+                                 detail=f"P{body.stage} pinned {pin}", actor=actor)
+    return {"workspace_id": workspace_id, "pins": _pin_map(store, workspace_id)}
+
+
+@app.post("/api/workspaces/{workspace_id}/autonomy/clawback")
+async def autonomy_clawback_post(workspace_id: int, body: AutonomyClawbackBody,
+                                 user: dict = Depends(require_user)):
+    """One-click brake. Members of the workspace may pull it (clawback only
+    REDUCES autonomy); admins anywhere. 404 on no access — membership-style,
+    no existence leaks. project=null claws back every slug that ever held a
+    cell here plus the current repo set (stale/moved slugs included)."""
+    store: JobStore = app.state.store
+    ws = store.workspace_get(workspace_id)
+    if ws is None or not _ws_svc().user_can_access(user, workspace_id):
+        raise HTTPException(status_code=404, detail="unknown workspace")
+    if not 0 <= body.stage <= 9:
+        raise HTTPException(status_code=400, detail="stage must be 0–9")
+    project = (body.project or "").strip() or None
+    if project is not None:
+        own = {r["slug"] for r in store.workspace_repos_for(workspace_id)}
+        if project not in own:
+            raise HTTPException(status_code=400,
+                                detail=f"project '{project}' is not a repo slug in "
+                                       "this workspace")
+    clawed = autonomy.clawback(store, settings, workspace_id, body.stage, project,
+                               actor=f"dashboard:{user['username']}")
+    return {"clawed": clawed}
 
 
 @app.post("/api/autonomy/recompute", dependencies=[Depends(require_admin)])
@@ -1037,6 +1158,26 @@ async def session_snapshot(job_id: str, user: dict = Depends(require_user)):
                   "truncated": len(bodies.get(n) or "") > SESSION_ARTIFACT_MAX}
                  for n in names]
     live = job["status"] == "running" or worker.engine.stage_broker.active(job_id)
+    # graduated autonomy (Epic C3): the per-stage trust dial for this job's
+    # workspace+project — pins + earned levels across stages 0–9
+    autonomy_block = None
+    if feature:
+        ws_id = job.get("workspace_id")
+        levels = {}
+        pins = {}
+        if ws_id is not None:
+            pins = {str(s): p["pin"]
+                    for s, p in store.autonomy_pins_for(int(ws_id)).items()}
+            for r in store.autonomy_scores_for(int(ws_id)):
+                if r["project"] == (job.get("project") or ""):
+                    levels[str(r["stage"])] = {
+                        "level": r["level"], "score": r["score"],
+                        "sample_runs": r["sample_runs"],
+                        "clawed_back": bool(r.get("clawback_at")) and r["level"] == 0,
+                    }
+        autonomy_block = {"enabled": settings.autonomy_enabled,
+                         "auto_level": autonomy.effective_auto_level(settings),
+                         "pins": pins, "levels": levels}
     # gate ownership (Epic A3): computed server-side with the acting user so
     # the UI can disable the answer buttons for non-owners (server enforces)
     g_owner = roles.gate_owner(store, settings, _ws_svc().for_job(job), job)
@@ -1072,6 +1213,8 @@ async def session_snapshot(job_id: str, user: dict = Depends(require_user)):
         # built from — bodies are fetched per run on expand
         "transcripts": transcripts.list_for_job(settings, job_id),
         "guidance": store.guidance_for(job_id),
+        # graduated autonomy (Epic C3): pins + per-stage levels (features only)
+        "autonomy": autonomy_block,
         # Epic A: gate ownership + the refusal/override/escalation timeline
         "gate_owner": gate_owner,
         "gate_events": store.gate_events_for(job_id),

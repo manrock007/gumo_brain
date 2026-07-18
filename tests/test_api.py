@@ -302,6 +302,8 @@ def test_dashboard_shell_is_balanced():
                 'id="dpane"', 'id="d-thread"', 'id="d-title"', 'id="c-in"',
                 'id="brain-body"', 'id="task-project"', 'id="feat-project"', 'id="ref"',
                 'id="ctx-body"',
+                # autonomy surface (Epic C3)
+                'id="autonomy-panel"', 'id="autonomy-body"',
                 # auth chrome (docs/ENGINE.md §11)
                 'id="me-chip"', 'id="settings-pane"', 'id="sp-users"', 'id="users-list"',
                 'src="static/app.js"', 'href="static/style.css"'):
@@ -312,7 +314,10 @@ def test_dashboard_shell_is_balanced():
                 'function saveContext', 'function resetContext', 'function loadContext',
                 # auth (docs/ENGINE.md §11)
                 'function loadMe', 'function signOut', 'function createUser',
-                'function changePassword'):
+                'function changePassword',
+                # autonomy surface (Epic C3)
+                'function loadAutonomy', 'function renderAutonomy',
+                'function pinStage', 'function clawback'):
         assert tok in js, tok
 
 
@@ -676,6 +681,114 @@ def test_outcomes_endpoint_shape_and_auth(client):
     assert {o["feature_id"] for o in data["outcomes"]} == {"feat-o1", "feat-o2"}
     assert data["verdicts"] == {"moved": 1, "flat": 0, "regressed": 0,
                                 "unmeasured": 1}
+
+
+def test_autonomy_surface_and_pins_api(client):
+    """Epic C3: GET /api/autonomy is membership-scoped; pins are admin-only
+    config mutations with fail-closed validation (stage-9 always_auto refused);
+    every pin change is audited."""
+    assert client.get("/api/autonomy").status_code == 401
+    data = client.get("/api/autonomy", headers=AUTH).json()
+    assert data["enabled"] is True and data["auto_level"] == 0  # opt-in default OFF
+    ws = data["workspaces"][0]
+    assert ws["slug"] == "default" and "web" in ws["repos"]
+    assert ws["pins"] == {} and ws["cells"] == [] and ws["events"] == []
+    ws_id = ws["id"]
+
+    client.post("/api/users", headers=AUTH,
+                json={"username": "amem", "password": "password1"})
+    member = {"Authorization": "Basic " + base64.b64encode(b"amem:password1").decode()}
+    assert client.put(f"/api/workspaces/{ws_id}/autonomy/pins", headers=member,
+                      json={"stage": 7, "pin": "always_gate"}).status_code == 403
+    assert client.put(f"/api/workspaces/{ws_id}/autonomy/pins", headers=AUTH,
+                      json={"stage": 12, "pin": "always_gate"}).status_code == 400
+    assert client.put(f"/api/workspaces/{ws_id}/autonomy/pins", headers=AUTH,
+                      json={"stage": 9, "pin": "always_auto"}).status_code == 400
+    assert client.put(f"/api/workspaces/{ws_id}/autonomy/pins", headers=AUTH,
+                      json={"stage": 7, "pin": "sometimes"}).status_code == 400
+    assert client.put("/api/workspaces/9999/autonomy/pins", headers=AUTH,
+                      json={"stage": 7, "pin": "always_gate"}).status_code == 404
+
+    r = client.put(f"/api/workspaces/{ws_id}/autonomy/pins", headers=AUTH,
+                   json={"stage": 7, "pin": "always_gate"})
+    assert r.status_code == 200
+    assert r.json()["pins"]["7"]["pin"] == "always_gate"
+    assert r.json()["pins"]["7"]["set_by"] == "dashboard:gumo"
+    # always_gate IS valid on P9 (extra belt over the terminal gate)
+    assert client.put(f"/api/workspaces/{ws_id}/autonomy/pins", headers=AUTH,
+                      json={"stage": 9, "pin": "always_gate"}).status_code == 200
+    r = client.put(f"/api/workspaces/{ws_id}/autonomy/pins", headers=AUTH,
+                   json={"stage": 7, "pin": None})
+    assert r.status_code == 200 and "7" not in r.json()["pins"]
+    events = client.get("/api/autonomy", headers=AUTH).json()["workspaces"][0]["events"]
+    assert [e["kind"] for e in events] == ["pin_clear", "pin_set", "pin_set"]
+    assert all(e["actor"] == "dashboard:gumo" for e in events)
+    # an unassigned member sees an empty surface (no existence leak)
+    assert client.get("/api/autonomy", headers=member).json()["workspaces"] == []
+
+
+def test_autonomy_clawback_membership_and_validation(client):
+    """Epic C3: clawback is member-allowed (it only reduces autonomy) but
+    membership-gated with a 404, and validates stage/project fail-closed."""
+    import time as _time
+
+    store = client.app.state.store
+    ws_id = client.get("/api/workspaces", headers=AUTH).json()[0]["id"]
+    store.autonomy_score_upsert(ws_id, "web", 5, 3, 0.95, "{}", 9, _time.time())
+    client.post("/api/users", headers=AUTH,
+                json={"username": "cmem", "password": "password1"})
+    member = {"Authorization": "Basic " + base64.b64encode(b"cmem:password1").decode()}
+    assert client.post(f"/api/workspaces/{ws_id}/autonomy/clawback", headers=member,
+                       json={"stage": 5, "project": "web"}).status_code == 404
+    client.put(f"/api/workspaces/{ws_id}/members", headers=AUTH,
+               json={"username": "cmem", "member": True})
+    assert client.post(f"/api/workspaces/{ws_id}/autonomy/clawback", headers=member,
+                       json={"stage": 11}).status_code == 400
+    assert client.post(f"/api/workspaces/{ws_id}/autonomy/clawback", headers=member,
+                       json={"stage": 5, "project": "nope"}).status_code == 400
+    r = client.post(f"/api/workspaces/{ws_id}/autonomy/clawback", headers=member,
+                    json={"stage": 5, "project": "web"})
+    assert r.status_code == 200 and r.json()["clawed"] == 1
+    row = store.autonomy_score_get(ws_id, "web", 5)
+    assert row["level"] == 0 and row["clawback_at"] is not None
+    ev = store.autonomy_events_recent([ws_id])
+    assert ev[0]["kind"] == "clawback" and ev[0]["actor"] == "dashboard:cmem"
+
+
+def test_autonomy_recompute_and_job_annotations(client):
+    """Epic C3: recompute is admin-only; /api/jobs feature rows carry
+    autonomy_level + autonomy_pin; the session snapshot carries the
+    per-stage autonomy block."""
+    import time as _time
+
+    store = client.app.state.store
+    ws_id = client.get("/api/workspaces", headers=AUTH).json()[0]["id"]
+    client.post("/api/users", headers=AUTH,
+                json={"username": "rmem", "password": "password1"})
+    member = {"Authorization": "Basic " + base64.b64encode(b"rmem:password1").decode()}
+    assert client.post("/api/autonomy/recompute", headers=member).status_code == 403
+    r = client.post("/api/autonomy/recompute", headers=AUTH)
+    assert r.status_code == 200 and set(r.json()) == {"cells", "changed"}
+
+    store.feature_intake("feat-aut1", title="F", project="web", stage=5)
+    store.set_fields("feat-aut1", workspace_id=ws_id)
+    store.autonomy_score_upsert(ws_id, "web", 5, 2, 0.8, "{}", 6, _time.time())
+    store.autonomy_pin_set(ws_id, 5, "always_gate", "dashboard:gumo")
+    jobs = client.get("/api/jobs", headers=AUTH).json()
+    row = next(j for j in jobs if j["issue_id"] == "feat-aut1")
+    assert row["autonomy_level"] == 2
+    assert row["autonomy_pin"] == "always_gate"
+    snap = client.get("/api/jobs/feat-aut1/session", headers=AUTH).json()
+    aut = snap["autonomy"]
+    assert aut["enabled"] is True and aut["auto_level"] == 0
+    assert aut["pins"]["5"] == "always_gate"
+    assert aut["levels"]["5"] == {"level": 2, "score": 0.8, "sample_runs": 6,
+                                  "clawed_back": False}
+    # non-feature snapshots carry no autonomy block
+    store.insert("task-aut1", source="manual", title="t", project="web", kind="task")
+    store.set_fields("task-aut1", workspace_id=ws_id)
+    assert client.get("/api/jobs/task-aut1/session",
+                      headers=AUTH).json()["autonomy"] is None
 
 
 def test_workspace_analytics_fields(client):

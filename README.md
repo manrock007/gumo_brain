@@ -100,6 +100,16 @@ rename/infra checklist.
 - `GET /api/outcomes` — the **outcome ledger**: measured verdicts
   (moved / flat / regressed / unmeasured) per shipped feature + the
   distribution, membership-scoped
+- `GET /api/autonomy` — the **trust ladder** (docs/ENGINE.md §15): per-workspace
+  stage×repo autonomy matrix (earned levels 0–3 with the formula's inputs),
+  pins, and the audited event log
+- `PUT /api/workspaces/{id}/autonomy/pins` — admin: `{stage, pin:
+  always_gate|always_auto|null}`; pins always beat computed levels
+  (`always_auto` on P9 is refused — the terminal gate never auto-advances)
+- `POST /api/workspaces/{id}/autonomy/clawback` — member: `{stage, project?}`
+  drops the level(s) to 0 for re-earning (project omitted = every repo,
+  stale slugs included)
+- `POST /api/autonomy/recompute` — admin: run the nightly scorer now
 - `GET /api/memory` / `GET /api/memory/{project}` — cached product-memory state
 - `POST /api/memory/{project}/bootstrap` — queue a memory bootstrap job
 - `GET /api/jobs`, `GET /api/projects` — job list, project→repo map

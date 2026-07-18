@@ -346,3 +346,36 @@ body.forced-pw #setup-card { display: none !important; }
 .ws-card .ws-members { display: flex; gap: 10px; flex-wrap: wrap; font-size: 12.5px; margin-top: 4px; }
 .ws-card .save { background: linear-gradient(135deg, var(--accent), var(--accent-2)); border: 0; color: #fff;
   padding: 8px 16px; border-radius: var(--r-sm); font: inherit; font-weight: 650; cursor: pointer; margin-top: 10px; }
+
+/* ---------- graduated autonomy (Epic C) ---------- */
+.aut-chip { display: inline-block; padding: 1px 7px; border-radius: 99px; font: 650 10.5px/1.6 var(--mono);
+  border: 1px solid var(--line-2); background: var(--surface-3); color: var(--muted); vertical-align: middle; }
+.aut-l1 { border-color: var(--info); color: var(--info); background: var(--info-weak); }
+.aut-l2 { border-color: var(--warn); color: var(--warn); background: var(--warn-weak); }
+.aut-l3 { border-color: var(--ok); color: var(--ok); background: var(--ok-weak); }
+.aut-clawed { border-style: dashed; }
+.aut-pinned, .aut-term { background: var(--surface-3); color: var(--fg-2); }
+.aut-matrix { overflow-x: auto; margin-top: 10px; }
+.aut-matrix table { border-collapse: collapse; font-size: 12px; min-width: 720px; }
+.aut-matrix th, .aut-matrix td { text-align: center; padding: 5px 7px; border-bottom: 1px solid var(--line);
+  white-space: nowrap; }
+.aut-matrix th { color: var(--muted); font-weight: 600; font-size: 10.5px; }
+.aut-matrix th:first-child, .aut-matrix td:first-child { position: sticky; left: 0; background: var(--surface);
+  text-align: left; z-index: 1; }
+.aut-repo { font-family: var(--mono); font-size: 11.5px; }
+.aut-st { display: inline-block; }
+.aut-pin-g { margin-left: 3px; }
+.aut-ctl { display: flex; gap: 3px; justify-content: center; margin-top: 3px; }
+.aut-pin { padding: 1px 3px; border: 1px solid var(--line-2); border-radius: var(--r-sm);
+  background: var(--surface-3); color: var(--fg); font: inherit; font-size: 10px; }
+.aut-claw { padding: 1px 6px; border: 1px solid var(--line-2); border-radius: var(--r-sm);
+  background: var(--surface-3); color: var(--err); cursor: pointer; font: inherit; font-size: 10.5px;
+  margin-left: 3px; }
+.aut-claw:hover { border-color: var(--err); background: var(--err-weak); }
+.aut-ws h3 { margin: 14px 0 4px; font-size: 13px; }
+.aut-log { margin: 10px 0 4px; padding-left: 18px; font-size: 12px; color: var(--fg-2);
+  max-height: 180px; overflow-y: auto; }
+.aut-log li { margin: 2px 0; }
+.aut-ev-k { font: 650 10.5px/1.6 var(--mono); color: var(--muted); text-transform: uppercase;
+  letter-spacing: .04em; margin-right: 4px; }
+.stage summary .aut-chip { margin-right: 8px; }
