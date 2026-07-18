@@ -333,6 +333,49 @@ async def run_claude_raw(settings: Settings, workspace: str, prompt: str,
                          fork_session: bool = False,
                          config_dir: str | None = None,
                          git_token: str | None = None) -> RawRunResult:
+    """Public entrypoint (Epic H3 seam). Resolves the AgentRuntime driver and
+    dispatches the raw run through it — CLIRuntime (default) delegates back to
+    ``_run_claude_raw_impl`` below (the real CLI body). This name stays the one
+    engine.py/worker.py import and tests patch, so patching it still intercepts
+    every run; the runtime seam is reached only INSIDE this shim (single hop —
+    the CLIRuntime calls the private ``_impl``, never this public name)."""
+    from .runtime import runtime_for
+    return await runtime_for(settings).run(
+        settings, workspace, prompt, allowed_tools, timeout,
+        resume_session=resume_session, disallowed_tools=disallowed_tools,
+        session_id=session_id, fork_session=fork_session, config_dir=config_dir,
+        git_token=git_token)
+
+
+async def run_claude_stream(settings: Settings, workspace: str, prompt: str,
+                            allowed_tools: list[str], timeout: int,
+                            resume_session: str | None = None,
+                            disallowed_tools: list[str] | None = None,
+                            session_id: str | None = None,
+                            fork_session: bool = False,
+                            config_dir: str | None = None,
+                            on_event=None,
+                            interrupt_event=None,
+                            git_token: str | None = None) -> RawRunResult:
+    """Public streaming entrypoint (Epic H3 seam) — dispatches through the
+    resolved AgentRuntime; CLIRuntime delegates to ``_run_claude_stream_impl``.
+    Same shim discipline as run_claude_raw (single hop; patchable name kept)."""
+    from .runtime import runtime_for
+    return await runtime_for(settings).run_stream(
+        settings, workspace, prompt, allowed_tools, timeout,
+        resume_session=resume_session, disallowed_tools=disallowed_tools,
+        session_id=session_id, fork_session=fork_session, config_dir=config_dir,
+        on_event=on_event, interrupt_event=interrupt_event, git_token=git_token)
+
+
+async def _run_claude_raw_impl(settings: Settings, workspace: str, prompt: str,
+                               allowed_tools: list[str], timeout: int,
+                               resume_session: str | None = None,
+                               disallowed_tools: list[str] | None = None,
+                               session_id: str | None = None,
+                               fork_session: bool = False,
+                               config_dir: str | None = None,
+                               git_token: str | None = None) -> RawRunResult:
     """Low-level headless run. Returns the CLI's result text verbatim plus the
     telemetry envelope (session/cost/turns/duration) — callers own the parsing.
 
@@ -410,16 +453,16 @@ def _tool_status(name: str, tool_input: dict) -> str:
     return name
 
 
-async def run_claude_stream(settings: Settings, workspace: str, prompt: str,
-                            allowed_tools: list[str], timeout: int,
-                            resume_session: str | None = None,
-                            disallowed_tools: list[str] | None = None,
-                            session_id: str | None = None,
-                            fork_session: bool = False,
-                            config_dir: str | None = None,
-                            on_event=None,
-                            interrupt_event=None,
-                            git_token: str | None = None) -> RawRunResult:
+async def _run_claude_stream_impl(settings: Settings, workspace: str, prompt: str,
+                                  allowed_tools: list[str], timeout: int,
+                                  resume_session: str | None = None,
+                                  disallowed_tools: list[str] | None = None,
+                                  session_id: str | None = None,
+                                  fork_session: bool = False,
+                                  config_dir: str | None = None,
+                                  on_event=None,
+                                  interrupt_event=None,
+                                  git_token: str | None = None) -> RawRunResult:
     """run_claude_raw with live progress (docs/CONVERSATIONS.md §5): the CLI
     runs in stream-json mode and each event is surfaced through on_event as it
     happens — ("status", "Read app/x.py") per tool call, ("delta", text) per

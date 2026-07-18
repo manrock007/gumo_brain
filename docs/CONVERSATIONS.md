@@ -187,3 +187,36 @@ Git as truth; artifact mirrors and human-wins sync; fail-closed parsing; the
 three verbs; ClickUp phone-answering; single-writer CAS gates; per-stage
 telemetry. Chat is an additive layer: the human's Proceed/Redo/Skip remains
 the only thing that moves the pipeline.
+
+## 7. Agent-runtime seam (H3)
+
+The CLI invocation itself sits behind a seam (`app/runtime.py`, `AgentRuntime`),
+so WHICH agent implementation runs a prompt is swappable without touching the
+engine/worker call sites.
+
+- **Interface** — `run` / `run_stream` (both return the shared `RawRunResult`),
+  covering the four capabilities BUILD-PLAN H3 names: **resume**
+  (`resume_session`), **fork** (`fork_session`), **stream** (`on_event`),
+  **interrupt** (`interrupt_event`) — plus `session_transcript_exists` as the
+  resume-availability query.
+- **Current driver: `CLIRuntime` (default).** It IS today's behavior: the
+  `claude -p` subprocess with the full envelope-parsing / session-lost / reaper
+  / interrupt contract that lives in `fixer._run_claude_raw_impl` /
+  `_run_claude_stream_impl` (unchanged). The public `fixer.run_claude_raw` /
+  `run_claude_stream` are thin shims that dispatch through `runtime_for(...)`;
+  CLIRuntime delegates back to the private `_impl` bodies (single hop — no
+  recursion). Every existing importer and test-patch of the public shim names
+  keeps intercepting runs.
+- **Stub: `AgentSDKRuntime` (migration target).** Documented, not wired: it
+  would drive in-process Agent-SDK session objects instead of subprocesses
+  (`resume` → SDK session resume, `interrupt` → SDK cancel; the G2 subprocess
+  env allow-list becomes the SDK tool sandbox). `run`/`run_stream` raise
+  `NotConfigured` — a run cannot proceed without a real runtime, so a mis-set
+  `AGENT_RUNTIME` fails loud, never fakes success. Default is `cli`, so this
+  path is never hit on a zero-config install.
+- **Config**: `AGENT_RUNTIME` — `cli` (default) or `agent-sdk`. Empty/unknown →
+  `cli` (fail closed to the working driver).
+- **Orthogonal to F3 (sandboxed runs).** H3 picks the agent PROTOCOL (CLI
+  subprocess vs SDK); F3's runner picks the ISOLATION (local exec vs disposable
+  container) and wraps the subprocess spawn INSIDE the CLI body. They compose
+  (container-of-CLI); they do not merge.
