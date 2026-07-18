@@ -258,6 +258,20 @@ class Settings(BaseSettings):
     analytics_provider: str = ""
     analytics_config: str = "{}"
 
+    # ---- Abstraction seams (Epic H) ----
+    # Issue-tracker driver (H1). 'clickup' (default) is today's behavior
+    # byte-for-byte; 'jira' is an inert scaffold (dashboard-only). Empty or
+    # unknown → clickup (fail closed to the working driver — there is no null
+    # tracker steady state).
+    tracker_provider: str = "clickup"
+    # VCS driver (H2). 'github' (default) = today's behavior; 'gitlab' is an
+    # inert scaffold (PAT-only, PR ops no-op). Empty or unknown → github.
+    vcs_provider: str = "github"
+    # Agent-runtime driver (H3). 'cli' (default) = today's `claude -p`
+    # subprocess; 'agent-sdk' is a scaffold that raises on run. Empty or
+    # unknown → cli.
+    agent_runtime: str = "cli"
+
     # ---- Graduated autonomy (Epic C, docs/ENGINE.md §15) ----
     # Master switch for the trust ladder: nightly scoring, the autonomy
     # surface, and workspace pins. False = legacy behavior — only the per-job

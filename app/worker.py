@@ -21,7 +21,8 @@ import uuid
 from pathlib import Path
 
 from . import analytics, audit, autonomy, budgets, logconfig, outcome, people, rbac, roles
-from .clickup import ClickUp
+from .clickup import ClickUp  # noqa: F401 — re-exported for tests/back-compat
+from .tracker import tracker_for
 from .config import ENGINE_NAME, Settings
 from .db import JobStore
 from .engine import ENGINE_COMMENT_PREFIXES, GATE_PREFIX, Engine, RepoLocks
@@ -125,7 +126,7 @@ class Worker:
         self.queue: asyncio.PriorityQueue = asyncio.PriorityQueue()
         self._seq = itertools.count()
         self.sentry = SentryClient(settings)
-        self.clickup = ClickUp(settings)
+        self.clickup = tracker_for(settings)
         # Epic F2: SQLite → in-process asyncio locks (single consumer); Postgres
         # → cross-process advisory locks (multi-worker safe).
         from .repolocks import resolve_locks

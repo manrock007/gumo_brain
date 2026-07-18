@@ -16,7 +16,7 @@ from pathlib import Path
 
 from .artifacts import ArtifactSync, artifact_path, feature_dir, list_artifacts, normalize
 from .chatstream import ChatBroker
-from .clickup import ClickUp
+from .clickup import ClickUp  # noqa: F401 — re-exported for back-compat imports
 from .config import (  # noqa: F401 — ENGINE_COMMENT_PREFIXES/GATE_PREFIX re-exported for worker
     ENGINE_COMMENT_PREFIXES,
     ENGINE_DIR,
@@ -58,6 +58,7 @@ from .fixer import (
 )
 from .github import GitHub
 from .memory import MemoryReader
+from .tracker import Tracker
 from .prompts import _test_block, build_v1_chat_prompt, build_v1_fastlane_system
 from .textutil import single_line
 from . import transcripts
@@ -128,7 +129,7 @@ def extract_questions_last(analysis: str) -> str:
 
 
 class Engine:
-    def __init__(self, settings: Settings, store: JobStore, clickup: ClickUp,
+    def __init__(self, settings: Settings, store: JobStore, clickup: Tracker,
                  locks: RepoLocks | None = None):
         self.settings = settings
         self.store = store

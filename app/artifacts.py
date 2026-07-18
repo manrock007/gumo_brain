@@ -16,10 +16,10 @@ import logging
 import re
 from pathlib import Path
 
-from .clickup import ClickUp
 from .config import GATE_PREFIX
 from .db import JobStore
 from .fixer import engine_dir, git
+from .tracker import Tracker
 
 log = logging.getLogger("brain.artifacts")
 
@@ -83,7 +83,7 @@ def list_artifacts(workspace: str, job_id: str) -> list[str]:
 class ArtifactSync:
     """Per-job sync between the feature branch and ClickUp subtasks."""
 
-    def __init__(self, store: JobStore, clickup: ClickUp, mirror_max_chars: int = 50000):
+    def __init__(self, store: JobStore, clickup: Tracker, mirror_max_chars: int = 50000):
         self.store = store
         self.clickup = clickup
         self.mirror_max_chars = mirror_max_chars

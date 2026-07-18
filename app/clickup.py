@@ -8,6 +8,7 @@ import logging
 import httpx
 
 from .config import Settings
+from .tracker import Tracker
 
 log = logging.getLogger("brain.clickup")
 
@@ -29,7 +30,13 @@ STATUS_CANDIDATES = {
 }
 
 
-class ClickUp:
+class ClickUpTracker(Tracker):
+    """The DEFAULT tracker driver (Epic H1) — one ClickUp task per issue, the
+    conveyor belt for HITL input. Conforms to the ``Tracker`` ABC; the seam is a
+    pure retype, the HTTP logic below is unchanged."""
+
+    name = "clickup"
+
     def __init__(self, settings: Settings):
         self.enabled = settings.clickup_enabled
         self._list_id = settings.clickup_list_id
@@ -321,3 +328,8 @@ class ClickUp:
                 r.raise_for_status()
         except Exception:
             log.exception("ClickUp set_status(%s) failed for task %s", state, task_id)
+
+
+# Back-compat alias — worker.py and engine.py import `ClickUp`; test_shepherd
+# and others construct it directly. Load-bearing, not cosmetic.
+ClickUp = ClickUpTracker
