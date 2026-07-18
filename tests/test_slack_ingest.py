@@ -161,6 +161,31 @@ class TestIngestLoop:
         assert len(worker.store.decision_candidates(None)) == 2
         assert worker.store.slack_cursor_get("C1") == "100.000002"
 
+    def test_pagination_bound_hit_holds_watermark(self, swarm):
+        """History pages are NEWEST-first, so when the per-pass page bound is
+        hit the unfetched remainder is the OLDER segment: the pass processes
+        what it fetched (candidates still flow) but the watermark must HOLD —
+        advancing to any fetched ts would jump past the older messages and,
+        once aged out of the overlap, lose them forever."""
+        worker, svc, ws = swarm
+        state = {"history": {"C1": {
+            "": {"messages": [_msg("200.000002", "!decision newest page")],
+                 "next": "cur2"},
+            "cur2": {"messages": [_msg("100.000001", "!decision buried older")]},
+        }}}
+        worker.settings.slack_ingest_max_pages = 1
+        asyncio.run(worker._slack_ingest_once(transport=_transport(state)))
+        assert [c["ref"] for c in worker.store.decision_candidates(None)] \
+            == ["C1:200.000002"]
+        # bound hit → watermark held, never advanced past the unfetched page
+        assert worker.store.slack_cursor_get("C1") == "1.000000"
+        # raising SLACK_INGEST_MAX_PAGES lets a pass reach exhaustion: the
+        # older message is ingested and only then does the watermark advance
+        worker.settings.slack_ingest_max_pages = 10
+        asyncio.run(worker._slack_ingest_once(transport=_transport(state)))
+        assert len(worker.store.decision_candidates(None)) == 2
+        assert worker.store.slack_cursor_get("C1") == "200.000002"
+
     def test_first_allowlist_initializes_watermark_to_now(self, swarm):
         worker, svc, ws = swarm
         before = time.time() - 1

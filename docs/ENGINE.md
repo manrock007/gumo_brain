@@ -976,9 +976,13 @@ index, the prompts and the default registry view until a human confirms
 adds; the confirming human becomes `decided_by` while the Slack author is
 preserved in `origin_author`). Watermarks are per channel, initialized to
 NOW at first allowlist (forward-only — no historical flood), advanced only
-after a fully-fetched batch (pagination to exhaustion, bounded per pass),
-with a ~7-day overlap re-scan so late reactions are seen (`(source, ref)`
-dedupe absorbs re-reads). Documented Slack-API limits: reactions older than
+after a fully-fetched batch (pagination to exhaustion, bounded per pass at
+`SLACK_INGEST_MAX_PAGES`; a bound-hit pass processes what it fetched —
+history pages are newest-first, so the unfetched remainder is the OLDER
+segment — but HOLDS the watermark with a logged warning, exactly like a
+failed page: advancing past unfetched messages would exclude them forever
+once they aged out of the overlap), with a ~7-day overlap re-scan so late
+reactions are seen (`(source, ref)` dedupe absorbs re-reads). Documented Slack-API limits: reactions older than
 the overlap window are missed; thread replies are out of scope unless
 broadcast. No job state is ever touched — output is inbox items + parked
 candidates (the Epic I routines invariant, honored now; the loop is
@@ -1045,10 +1049,17 @@ keep firing ('off' never means 'less safe'). A workspace routine whose
 schedule fails to parse is disabled fail-closed
 (`last_status='error: bad schedule'`) — never a guessed cadence.
 Fresh daily/weekly rows wait for their NEXT occurrence (no boot-fire of a
-missed slot). Schedules are seed defaults only — after seeding the routine
-ROW is authoritative (`PUT /api/routines/{id}`, audited in `admin_events`
-as `routine_config`). NOTE (Epic F1): the `COALESCE(workspace_id,-1)`
-unique expression index needs Postgres expression-index syntax review.
+missed slot): daily/weekly `next_due` anchors on `last_run_at`, so seeding
+stamps it (`anchor_fresh_rows`, also a boot-time backfill for rows seeded
+NULL by older builds; a schedule edit onto a never-run row stamps it too) —
+a NULL anchor would re-slide to `now` at every tick and the routine could
+never come due. Schedules are seed defaults only — after seeding the
+routine ROW is authoritative (`PUT /api/routines/{id}`, audited in
+`admin_events` as `routine_config`; an accepted run-now arm is audited as
+`routine_run_now` — `routine_runs` rows carry no actor, so the audit row is
+what ties a forced, spend-bearing firing to a human). NOTE (Epic F1): the
+`COALESCE(workspace_id,-1)` unique expression index needs Postgres
+expression-index syntax review.
 
 ### Inbox items (the substrate)
 

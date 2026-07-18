@@ -1747,7 +1747,10 @@ class Worker:
         oldest = f"{max(0.0, float(cursor) - slack_ingest.RESCAN_OVERLAP_SECONDS):.6f}"
         messages: list[dict] = []
         page_cursor = ""
-        for _ in range(slack_ingest.MAX_PAGES_PER_PASS):
+        max_pages = max(1, int(self.settings.slack_ingest_max_pages
+                               or slack_ingest.MAX_PAGES_PER_PASS))
+        truncated = True
+        for _ in range(max_pages):
             page = await reader.history(channel, oldest, cursor=page_cursor)
             if page["status"] != "ok":
                 # a failed page aborts THIS channel without advancing the
@@ -1757,13 +1760,21 @@ class Worker:
                 return
             messages.extend(page["messages"])
             if not (page["has_more"] and page["next_cursor"]):
+                truncated = False
                 break
             page_cursor = page["next_cursor"]
-        else:
-            # pagination bound hit with more remaining: process what we have
-            # but do NOT advance past it — the next pass continues
-            log.warning("slack channel %s: pagination bound hit; continuing "
-                        "next pass", channel)
+        if truncated:
+            # pagination bound hit with more remaining. History pages are
+            # NEWEST-first, so the unfetched remainder is the OLDER part of
+            # the window: process what we have (candidates still flow; the
+            # dedupe absorbs the next pass's re-reads) but HOLD the
+            # watermark — advancing to any fetched ts would jump past the
+            # unfetched older segment and, once it aged out of the overlap,
+            # exclude it forever. Same fail-closed posture as a failed page
+            # (ENGINE.md §16: advanced only after a fully-fetched batch).
+            # SLACK_INGEST_MAX_PAGES is the catch-up lever.
+            log.warning("slack channel %s: pagination bound hit; watermark "
+                        "held until a pass fetches to exhaustion", channel)
         emoji = self.settings.slack_decision_emoji
         max_ts = float(cursor)
         for msg in messages:
@@ -1792,10 +1803,11 @@ class Worker:
                 max_ts = max(max_ts, float(ts))
             except ValueError:
                 continue
-        # advance the watermark ONLY after the whole batch committed (a crash
-        # re-fetches; the dedupe absorbs). Dismissed candidates stay dismissed:
-        # their (source, ref) row is kept, so a re-scan can never re-create one.
-        if max_ts > float(cursor):
+        # advance the watermark ONLY after the whole batch committed AND the
+        # batch was fully fetched (a crash or a bound-hit re-fetches; the
+        # dedupe absorbs). Dismissed candidates stay dismissed: their
+        # (source, ref) row is kept, so a re-scan can never re-create one.
+        if not truncated and max_ts > float(cursor):
             self.store.slack_cursor_set(channel, f"{max_ts:.6f}")
 
     async def autonomy_forever(self):

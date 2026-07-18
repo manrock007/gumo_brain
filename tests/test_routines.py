@@ -2,7 +2,9 @@
 seeding, builtin-loop generalization, run history, master-flag scoping."""
 
 import asyncio
+import sqlite3
 import time
+import types
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -120,6 +122,28 @@ def test_boot_bump_stamps_sweep_and_janitor_only(store, settings):
                if r["workspace_id"] is None}
     assert stamped["sweep"] is not None and stamped["janitor"] is not None
     assert stamped["reaper"] is None  # reaper stays due-immediately at boot
+
+
+def test_seeding_anchors_daily_weekly_rows(store, settings):
+    """daily/weekly next_due anchors on last_run_at — a NULL anchor re-slides
+    to `now` at every tick, so the row could never come due. Seeding stamps
+    it; every: rows keep NULL history (due immediately, by design)."""
+    with store._conn() as c:
+        c.execute("INSERT INTO workspaces (slug, name, created_at, updated_at) "
+                  "VALUES ('w1', 'W1', 1, 1)")
+    ws_id = store.workspace_list()[0]["id"]
+    routines.ensure_seeds(store, settings)
+    by_kind = {r["kind"]: r for r in store.routines_all()
+               if r["workspace_id"] == ws_id}
+    for kind in ("standup_digest", "memory_upkeep", "weekly_planning"):
+        assert by_kind[kind]["last_run_at"] is not None, kind
+    for kind in ("risk_scan", "proposal_scan"):
+        assert by_kind[kind]["last_run_at"] is None, kind
+    # upgrade path: a daily row seeded NULL by an older build backfills at boot
+    store.routine_set(by_kind["standup_digest"]["id"], last_run_at=None)
+    routines.ensure_seeds(store, settings)
+    assert store.routine_get(
+        by_kind["standup_digest"]["id"])["last_run_at"] is not None
 
 
 # ---------- claim CAS ----------
@@ -328,6 +352,71 @@ def test_handler_exception_records_error_and_retries_later(
     assert after["last_run_at"] is not None
 
 
+def test_fresh_seeded_daily_routine_fires_at_next_occurrence(
+        store, settings, worker, monkeypatch):
+    """End-to-end regression: a freshly seeded daily row must actually come
+    due once its next occurrence passes — with the pre-anchor behavior the
+    due time re-slid past `now` at every tick and the standup/memory-upkeep/
+    weekly-planning seeds silently never ran."""
+    with store._conn() as c:
+        c.execute("INSERT INTO workspaces (slug, name, created_at, updated_at) "
+                  "VALUES ('w1', 'W1', 1, 1)")
+    routines.ensure_seeds(store, settings)
+    ws_id = store.workspace_list()[0]["id"]
+    row = next(r for r in store.routines_all()
+               if r["workspace_id"] == ws_id and r["kind"] == "standup_digest")
+    calls = []
+
+    async def fake_standup(ctx):
+        calls.append(ctx.routine["id"])
+        return "ok", "", 0
+
+    async def quiet(ctx):
+        return "quiet", "", 0
+
+    monkeypatch.setitem(routines.REGISTRY, "standup_digest", fake_standup)
+    for kind in ("memory_upkeep", "risk_scan", "proposal_scan",
+                 "weekly_planning"):
+        monkeypatch.setitem(routines.REGISTRY, kind, quiet)
+
+    due = next_due(parse_schedule(row["schedule"]), row["last_run_at"],
+                   time.time(), UTC)
+    sched = _scheduler(settings, store, worker)
+    # a tick BEFORE the occurrence: not due yet
+    monkeypatch.setattr(routines, "_time",
+                        types.SimpleNamespace(time=lambda: due - 60))
+    asyncio.run(_drive(sched))
+    assert calls == []
+    # a tick AFTER the occurrence: fires exactly once
+    monkeypatch.setattr(routines, "_time",
+                        types.SimpleNamespace(time=lambda: due + 60))
+    asyncio.run(_drive(sched))
+    assert calls == [row["id"]]
+
+
+def test_run_open_failure_never_leaks_inflight(store, settings, worker,
+                                               monkeypatch):
+    """routine_run_open raising (transient 'database is locked', disk full)
+    must still discard the id from _inflight — a leaked id skips the routine
+    (including the non-disableable reaper) forever until restart."""
+    routines.ensure_seeds(store, settings)
+    row = next(r for r in store.routines_all() if r["kind"] == "reaper")
+    sched = _scheduler(settings, store, worker)
+    sched._inflight.add(row["id"])
+
+    def boom(*a, **k):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(store, "routine_run_open", boom)
+
+    async def noop(ctx):
+        return "ok", "", 0
+
+    asyncio.run(sched._run_one(dict(row), noop, time.time()))
+    assert row["id"] not in sched._inflight
+    assert store.routine_get(row["id"])["last_status"] == "error"
+
+
 def test_run_now_request_respects_enablement(store, settings, worker, monkeypatch):
     routines.ensure_seeds(store, settings)
     sched = _scheduler(settings, store, worker)
@@ -400,6 +489,12 @@ def test_routines_api(tmp_path, monkeypatch):
         assert client.post(f"/api/routines/{reaper['id']}/run",
                            headers=AUTH).status_code == 200
         assert reaper["id"] in client.app.state.scheduler._run_now
+        # …and the accepted arm is audited with the admin as actor (a forced
+        # firing is otherwise indistinguishable from a scheduled one)
+        events = [e for e in store.admin_events_recent(10)
+                  if e["kind"] == "routine_run_now"]
+        assert events and events[0]["target"] == str(reaper["id"])
+        assert events[0]["actor"] == "dashboard:gumo"
         # a member sees no instance rows and no foreign-workspace rows
         client.post("/api/users", headers=AUTH,
                     json={"username": "m1", "password": "password1"})

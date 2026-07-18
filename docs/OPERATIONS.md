@@ -119,7 +119,8 @@ pre-upgrade backup is the rollback path.
   `TRANSCRIPT_TTL_DAYS` (30), CLI sessions after `SESSION_TTL_DAYS` (14).
 - **Routines** (Epic I): the dashboard's **Routines panel** shows every
   routine's scope, schedule, enabled state and run history, with a run-now
-  button. The builtin sweep/reaper/janitor rows derive their cadence from
+  button (audited in `admin_events` as `routine_run_now` — the run history
+  itself carries no actor). The builtin sweep/reaper/janitor rows derive their cadence from
   the env (schedule shown as "from settings") unless you set an explicit
   schedule; the reaper cannot be disabled. Stale inbox notices expire after
   `INBOX_NOTICE_TTL_DAYS`; routine run history is pruned after
@@ -286,6 +287,7 @@ Notes:
 | `SLACK_BOT_TOKEN` | *(empty)* | Slack bot token. Secret: env-only, never stored in a workspace row, never returned by any API, never interpolated into logs/details. |
 | `SLACK_API_BASE` | `https://slack.com/api` | test seam; leave alone in production. |
 | `SLACK_INGEST_INTERVAL_SECONDS` | `600` | ingest loop cadence. |
+| `SLACK_INGEST_MAX_PAGES` | `10` | per-channel pagination bound per pass (pages of 100). A bound-hit pass processes what it fetched but holds the watermark (fail closed — never advanced past unfetched messages); raise it temporarily to let a backlogged channel catch up to exhaustion. |
 | `SLACK_DECISION_EMOJI` | `pushpin` | reaction NAME (no colons) marking a decision message; the `!decision` message prefix is always recognized when the flag is on. |
 
 Per-workspace: `slack_channels` (Settings → Workspaces, or

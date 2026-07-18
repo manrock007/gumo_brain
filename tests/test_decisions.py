@@ -284,6 +284,19 @@ class TestDecisionsApi:
         r = client.post("/api/decisions", headers=AUTH,
                         json={"scope": "repo", "text": "t"})
         assert r.status_code == 400
+        # links render as clickable anchors in every member's (and admin's)
+        # registry view — only web URLs pass, never a javascript: scheme
+        for bad in (["javascript:alert(1)"], ["  JavaScript:alert(1)"],
+                    ["ftp://x"], [123], ["https://ok.example", "data:text/html,x"]):
+            r = client.post("/api/decisions", headers=AUTH,
+                            json={"scope": "repo", "text": "t",
+                                  "project": "web", "links": bad})
+            assert r.status_code == 400, bad
+        r = client.post("/api/decisions", headers=AUTH,
+                        json={"scope": "repo", "text": "t", "project": "web",
+                              "links": ["https://ok.example/x"]})
+        assert r.status_code == 200
+        assert r.json()["links"] == ["https://ok.example/x"]
 
     def test_org_scope_admin_only_but_member_visible(self, client):
         """Blocker 2: org rows reach every member's prompts, so every member

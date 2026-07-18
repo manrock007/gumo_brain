@@ -137,7 +137,13 @@ def _next_occurrence(sched: Schedule, after: float, tz) -> float:
 def next_due(sched: Schedule, last_run_at: float | None, now: float, tz) -> float:
     """When the routine should next fire. every: rows with no history are due
     immediately; daily/weekly rows with no history wait for their NEXT
-    occurrence (a fresh seed must not fire a missed slot at boot)."""
+    occurrence (a fresh seed must not fire a missed slot at boot).
+
+    NOTE: for daily/weekly rows the anchor MUST be persisted — a NULL
+    last_run_at anchors at `now`, which re-slides forward on every tick, so
+    the computed due time is always strictly in the future and the row can
+    never come due. Seeding therefore stamps last_run_at for daily/weekly
+    rows (anchor_fresh_rows); the `now` fallback here is defensive only."""
     if sched.kind == "every":
         if last_run_at is None:
             return now
@@ -543,6 +549,30 @@ REGISTRY: dict = {
 # ---------- seeding ----------
 
 
+def anchor_fresh_rows(store: JobStore, now: float | None = None):
+    """Stamp last_run_at=now on never-run daily/weekly rows. Their next_due
+    anchors on last_run_at; a NULL anchor re-slides to `now` at every tick,
+    so the row would never come due (the seeded standup / memory-upkeep /
+    weekly-planning rows would silently never fire). Stamping at seed time
+    keeps the fresh-seed contract — the row fires at its next occurrence
+    after this moment, never a missed slot. every: rows keep NULL history
+    (= due immediately, by design); builtin rows (schedule='' — derive from
+    settings) are every:-shaped and skipped."""
+    now = now if now is not None else _time.time()
+    for row in store.routines_all():
+        if row.get("last_run_at") is not None:
+            continue
+        spec = (row.get("schedule") or "").strip()
+        if not spec:
+            continue
+        try:
+            sched = parse_schedule(spec)
+        except ValueError:
+            continue  # the dispatch paths handle bad schedules fail-closed
+        if sched.kind in ("daily", "weekly"):
+            store.routine_set(row["id"], last_run_at=now)
+
+
 def ensure_seeds_for_workspace(store: JobStore, settings: Settings,
                                workspace_id: int):
     """Seed the per-workspace Epic I rows (INSERT OR IGNORE — operator edits
@@ -557,18 +587,21 @@ def ensure_seeds_for_workspace(store: JobStore, settings: Settings,
     }
     for kind, schedule in seeds.items():
         store.routine_upsert_seed(kind, workspace_id, schedule, name=kind)
+    anchor_fresh_rows(store)
 
 
 def ensure_seeds(store: JobStore, settings: Settings):
     """Called from lifespan after WorkspaceService.ensure_default(): builtin
     instance rows (schedule='' = derive from settings) + per-workspace Epic I
     rows, then the EVERY-boot settle bump for sweep/janitor (distinct from
-    seeding — see routine_boot_bump)."""
+    seeding — see routine_boot_bump). anchor_fresh_rows also backfills
+    daily/weekly rows seeded by older builds with a NULL last_run_at."""
     for kind in BUILTIN_KINDS:
         store.routine_upsert_seed(kind, None, "", name=kind)
     for ws in store.workspace_list():
         ensure_seeds_for_workspace(store, settings, ws["id"])
     store.routine_boot_bump(("sweep", "janitor"))
+    anchor_fresh_rows(store)
 
 
 # ---------- the scheduler ----------
@@ -700,11 +733,17 @@ class RoutineScheduler:
 
     async def _run_one(self, row: dict, handler, now: float):
         """One firing: run-history row, handler with try/except, close +
-        last_status. A raise records 'error'; the next due tick retries."""
-        run_id = self.store.routine_run_open(row["id"], row["kind"],
-                                             row.get("workspace_id"))
+        last_status. A raise records 'error'; the next due tick retries.
+        EVERY line here — including routine_run_open and the closing store
+        writes, which can raise on transient DB trouble ('database is
+        locked', disk full) — runs under the finally that discards the id
+        from _inflight: a leaked id would block the routine (including the
+        non-disableable reaper) forever, until a process restart."""
         status, detail, items = "error", "", 0
+        run_id = None
         try:
+            run_id = self.store.routine_run_open(row["id"], row["kind"],
+                                                 row.get("workspace_id"))
             try:
                 config = json.loads(row.get("config") or "{}")
                 if not isinstance(config, dict):
@@ -723,7 +762,13 @@ class RoutineScheduler:
             log.exception("routine %s#%s failed", row["kind"], row["id"])
             status, detail = "error", str(e)[:300]
         finally:
-            self._inflight.discard(row["id"])
-            self.store.routine_run_close(run_id, status, detail, items)
-            self.store.routine_set(row["id"], last_status=status,
-                                   last_result=(detail or "")[:500])
+            try:
+                if run_id is not None:
+                    self.store.routine_run_close(run_id, status, detail, items)
+                self.store.routine_set(row["id"], last_status=status,
+                                       last_result=(detail or "")[:500])
+            except Exception:
+                log.exception("routine %s#%s: closing store writes failed",
+                              row["kind"], row["id"])
+            finally:
+                self._inflight.discard(row["id"])

@@ -233,6 +233,11 @@ class Settings(BaseSettings):
     slack_bot_token: str = ""       # secret; env-only, never in any API response
     slack_api_base: str = "https://slack.com/api"  # test seam (Mixpanel-driver style)
     slack_ingest_interval_seconds: int = 600
+    # Pagination bound per channel per pass (pages of 100). A bound-hit pass
+    # processes what it fetched but HOLDS the watermark (never advanced past
+    # unfetched messages — fail closed); raise this to let a backlogged
+    # channel catch up to exhaustion.
+    slack_ingest_max_pages: int = 10
     # Reaction NAME that marks a decision thread; the '!decision' message
     # prefix is always recognized when the flag is on.
     slack_decision_emoji: str = "pushpin"

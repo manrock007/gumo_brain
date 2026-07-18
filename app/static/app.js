@@ -23,6 +23,14 @@ function linkify(s) {
   // esc() first: matched URLs then contain no <>"' and are attribute-safe
   return esc(s).replace(URL_RE, (u) => `<a href="${u}" target="_blank">${u}</a>`);
 }
+// member-supplied link values are arbitrary strings: only ever build an
+// anchor from a web URL (linkify's posture) — anything else renders as plain
+// text, so a javascript: value can never reach an href
+function safeHref(u) {
+  u = String(u == null ? '' : u).trim();
+  const lo = u.toLowerCase();
+  return (lo.startsWith('https://') || lo.startsWith('http://')) ? u : '';
+}
 
 function fmtMMSS(ms) {
   if (!ms) return '0:00';
@@ -190,7 +198,7 @@ function candidateStrip() {
         </select>
         <button onclick="confirmCandidate(${Number(c.id)})">Confirm</button>
         <button onclick="dismissCandidate(${Number(c.id)})">Dismiss</button>
-        ${(c.links || []).map((u) => `<a href="${attr(u)}" target="_blank" rel="noopener">thread</a>`).join(' ')}
+        ${(c.links || []).map((u) => safeHref(u) ? `<a href="${attr(safeHref(u))}" target="_blank" rel="noopener">thread</a>` : esc(u)).join(' ')}
       </div>
     </div>`).join('');
   return `<div class="section-label" style="margin:8px 10px 0">Decision candidates (from Slack)</div>${rows}`;
@@ -1029,8 +1037,10 @@ function renderDecisions(data) {
     <select onchange="decSetFilter('source', this.value)">${opts(['gate', 'manual', 'slack'], decFilters.source)}</select>
   </div>`;
   const rows = (data.decisions || []).map((d) => {
-    const links = (d.links || []).map((u, i) =>
-      `<a href="${attr(u)}" target="_blank" rel="noopener">link${i ? i + 1 : ''}</a>`).join(' ');
+    const links = (d.links || []).map((u, i) => {
+      const h = safeHref(u);
+      return h ? `<a href="${attr(h)}" target="_blank" rel="noopener">link${i ? i + 1 : ''}</a>` : esc(u);
+    }).join(' ');
     const act = d.status === 'active'
       ? `<button onclick="patchDecision(${Number(d.id)}, 'supersede')">Supersede</button>`
       : (d.status === 'superseded'

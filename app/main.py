@@ -855,8 +855,18 @@ def _validate_decision_fields(scope: str | None, text: str | None,
             raise HTTPException(status_code=400, detail="text is capped at 4000 chars")
     if title is not None and len(title) > 200:
         raise HTTPException(status_code=400, detail="title is capped at 200 chars")
-    if links is not None and not all(isinstance(l, str) for l in links):
-        raise HTTPException(status_code=400, detail="links must be a list of strings")
+    if links is not None:
+        if not all(isinstance(l, str) for l in links):
+            raise HTTPException(status_code=400,
+                                detail="links must be a list of strings")
+        # stored links render as clickable anchors in every member's (and
+        # admin's) registry view — whitelist web URLs so a javascript: value
+        # can never reach an href (same posture as the dashboard's linkify)
+        for l in links:
+            u = l.strip().lower()
+            if not (u.startswith("https://") or u.startswith("http://")):
+                raise HTTPException(status_code=400,
+                                    detail="links must be http(s):// URLs")
 
 
 def _decision_public(d: dict) -> dict:
@@ -1197,9 +1207,14 @@ async def routine_put(routine_id: int, body: RoutinePutBody,
         spec = body.schedule.strip()
         if spec:
             try:
-                routines.parse_schedule(spec)
+                sched = routines.parse_schedule(spec)
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=str(e))
+            if sched.kind in ("daily", "weekly") and row.get("last_run_at") is None:
+                # daily/weekly rows anchor next_due on last_run_at — a
+                # never-run row must be stamped or it can never come due
+                # (same rationale as routines.anchor_fresh_rows)
+                fields["last_run_at"] = time.time()
         elif row.get("workspace_id") is not None:
             raise HTTPException(status_code=400,
                                 detail="workspace routines need an explicit "
@@ -1222,18 +1237,29 @@ async def routine_put(routine_id: int, body: RoutinePutBody,
     return _routine_public(store, store.routine_get(routine_id))
 
 
-@app.post("/api/routines/{routine_id}/run", dependencies=[Depends(require_admin)])
-async def routine_run_now(routine_id: int):
+@app.post("/api/routines/{routine_id}/run")
+async def routine_run_now(routine_id: int,
+                          admin: dict = Depends(require_admin)):
     """Arm an immediate fire THROUGH the scheduler task (never inline in the
-    HTTP request — a sweep does paginated Sentry HTTP). Returns immediately."""
+    HTTP request — a sweep does paginated Sentry HTTP). Returns immediately.
+    A forced fire is a real mutation (the claim stamps last_run_at; a forced
+    sweep enqueues pipelines and spends run budget), so an accepted arm is
+    audited in admin_events — routine_runs rows carry no actor and a forced
+    firing would otherwise be indistinguishable from a scheduled one."""
     store: JobStore = app.state.store
-    if store.routine_get(routine_id) is None:
+    row = store.routine_get(routine_id)
+    if row is None:
         raise HTTPException(status_code=404, detail="unknown routine")
     accepted = app.state.scheduler.request_run(routine_id)
     if not accepted:
         raise HTTPException(status_code=400,
                             detail="routine is disabled or its kind is not "
                                    "registered on this build")
+    store.admin_event_add(
+        "routine_run_now", target=str(routine_id),
+        detail=json.dumps({"kind": row["kind"],
+                           "workspace_id": row.get("workspace_id")}),
+        actor=f"dashboard:{admin['username']}")
     return {"requested": True, "routine_id": routine_id}
 
 

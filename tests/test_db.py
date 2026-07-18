@@ -361,7 +361,40 @@ class TestFeatureReintakeResetsWatchState:
 
     def test_reintake_never_deletes_a_non_watch_row(self, store):
         """The reset keys on kind='watch' — a hand-made job that happens to be
-        named watch-<id> but isn't a watch survives."""
+        named watch-<id> but isn't a watch survives (state included)."""
         store.insert("watch-feat-odd", source="manual", kind="task")
+        store.guidance_add("watch-feat-odd", None, "proceed", "keep me",
+                           "dashboard:m")
         store.feature_intake("feat-odd", title="F", project="web", stage=0)
         assert store.get("watch-feat-odd") is not None
+        assert [g["text"] for g in store.guidance_for("watch-feat-odd")] \
+            == ["keep me"]
+
+    def test_watch_guidance_and_fts_purged_on_reintake(self, store):
+        """The Iterate-gate answer writes guidance (and FTS rows) under the
+        watch-<job> id; a re-intake clears them with the rest of the dead
+        lap — a dead pipeline's text must not haunt the new lap's retrieval
+        (the _clear_pipeline_state invariant)."""
+        store.feature_intake("feat-lap2", title="F", project="web", stage=0)
+        store.watch_insert("watch-feat-lap2", title="w", project="web",
+                           related_jobs="feat-lap2")
+        store.guidance_add("watch-feat-lap2", None, "proceed",
+                           "zanzibar learning text", "dashboard:m")
+        assert store.guidance_for("watch-feat-lap2")
+        if store.fts_enabled:
+            assert any(r["kind"] == "guidance" for r in
+                       store.fts_search(["zanzibar"], project="web"))
+        store.feature_intake("feat-lap2", title="F", project="web", stage=0)
+        assert store.guidance_for("watch-feat-lap2") == []
+        if store.fts_enabled:
+            assert store.fts_search(["zanzibar"], project="web") == []
+
+    def test_orphaned_watch_guidance_clears_without_a_watch_row(self, store):
+        """Upgrade path: laps re-intaken before the watch-state clear left
+        guidance rows under a watch id whose jobs row is gone — the next
+        re-intake still purges them."""
+        store.feature_intake("feat-lap3", title="F", project="web", stage=0)
+        store.guidance_add("watch-feat-lap3", None, "proceed", "old orphan",
+                           "dashboard:m")
+        store.feature_intake("feat-lap3", title="F", project="web", stage=0)
+        assert store.guidance_for("watch-feat-lap3") == []

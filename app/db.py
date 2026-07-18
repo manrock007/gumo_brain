@@ -1974,11 +1974,23 @@ class JobStore:
         The previous lap's outcome-watch state resets in the SAME transaction
         (Epic B): a stale `watch-<job>` row would block the fresh lap's spawn
         forever (idempotent-by-existence), and its readings/ledger row would mix
-        two laps' measurements. The new lap is measured from scratch."""
+        two laps' measurements. The new lap is measured from scratch. The watch
+        job's OWN pipeline state clears too: the Iterate-gate answer writes
+        guidance (and FTS rows) under the `watch-<job>` id, and leaving them
+        would let the dead lap's text haunt retrieval (the _clear_pipeline_state
+        invariant) while its registry decision was superseded."""
         now = time.time()
         watch_id = f"watch-{job_id}"
         with self._conn() as c:
             self._clear_pipeline_state(c, job_id)
+            # same kind='watch' guard as the DELETE below: a hand-made
+            # non-watch job that happens to be named watch-<id> keeps its
+            # state; an absent row still clears (orphans left by laps that
+            # predate the watch-state clear)
+            row = c.execute("SELECT kind FROM jobs WHERE issue_id = ?",
+                            (watch_id,)).fetchone()
+            if row is None or row["kind"] == "watch":
+                self._clear_pipeline_state(c, watch_id)
             c.execute("DELETE FROM jobs WHERE issue_id = ? AND kind = 'watch'", (watch_id,))
             c.execute("DELETE FROM metric_readings WHERE job_id = ?", (watch_id,))
             c.execute("DELETE FROM outcomes WHERE job_id = ?", (watch_id,))

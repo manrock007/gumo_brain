@@ -33,8 +33,10 @@ log = logging.getLogger("brain.slack")
 # re-scan window behind the watermark so late reactions on recent messages
 # are still captured (bounded; dedupe absorbs the re-reads)
 RESCAN_OVERLAP_SECONDS = 7 * 86400
-# pagination bound per channel per pass — runaway-history guard; the next
-# pass continues from the advanced watermark
+# default pagination bound per channel per pass (SLACK_INGEST_MAX_PAGES
+# overrides) — runaway-history guard. A bound-hit pass processes what it
+# fetched but HOLDS the watermark: pages are newest-first, so the unfetched
+# remainder is the OLDER segment and advancing would skip it forever.
 MAX_PAGES_PER_PASS = 10
 PAGE_LIMIT = 100
 
