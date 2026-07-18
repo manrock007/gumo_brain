@@ -477,6 +477,7 @@ class WorkspaceCreateBody(BaseModel):
     analytics_provider: str | None = None          # Epic B3: '' = none | 'mixpanel'
     analytics_config: dict | str | None = None     # Epic B3: stored secret; NEVER echoed back
     slack_channels: list | str | None = None       # Epic D3: ingest allowlist; '' clears
+    budget_monthly_usd: float | str | None = None  # Epic I4/G4: '' = inherit instance
 
 
 class WorkspacePatchBody(WorkspaceCreateBody):
@@ -654,11 +655,148 @@ async def inbox(user: dict = Depends(require_user)):
     ws_ids = None if user.get("role") == "admin" \
         else sorted(store.workspace_ids_for_user(user["id"]))
     candidates = [_decision_public(d) for d in store.decision_candidates(ws_ids, 50)]
+    # Epic I0: durable routine outputs — open notices, membership-scoped
+    # (workspace_id NULL rows are admin-only, matching the jobs posture).
+    # Additive keys only: items/counts.mine keep their exact pre-I semantics.
+    notices = [_notice_public(n) for n in store.inbox_items_open(ws_ids)]
     return {"items": items,
             "candidates": candidates,
+            "notices": notices,
             "counts": {"mine": len(items), "unassigned": unassigned_n,
                        "overdue": sum(1 for i in items if i["overdue"]),
-                       "candidates": len(candidates)}}
+                       "candidates": len(candidates),
+                       "notices": len(notices)}}
+
+
+def _notice_public(n: dict) -> dict:
+    try:
+        refs = json.loads(n.get("refs") or "{}")
+        if not isinstance(refs, dict):
+            refs = {}
+    except (ValueError, TypeError):
+        refs = {}
+    return {k: n.get(k) for k in ("id", "workspace_id", "kind", "source",
+                                  "title", "body", "status", "status_by",
+                                  "status_at", "created_at", "updated_at")} | {"refs": refs}
+
+
+def _notice_scoped(item_id: int, user: dict) -> dict:
+    """The notice iff the user may see it — 404 either way (no existence
+    leaks). NULL-workspace notices are instance-wide → admin-only."""
+    item = app.state.store.inbox_item_get(item_id)
+    if item is None or not _ws_svc().user_can_access(user, item.get("workspace_id")):
+        raise HTTPException(status_code=404, detail="unknown notice")
+    return item
+
+
+class NoticeDismissBody(BaseModel):
+    reason: str = ""
+
+
+class NoticeAdoptBody(BaseModel):
+    as_: str = "feature"  # 'feature' | 'task'
+    project: str = ""
+    title: str | None = None
+    request: str | None = None
+    founder_dri: str | None = None
+    dev_dri: str | None = None
+    success_metric: str | None = None
+    metric_target: str | None = None
+    metric_window_days: int | None = None
+
+    model_config = {"populate_by_name": True}
+
+    def __init__(self, **data):
+        if "as" in data:  # accept the design's `as` key (reserved word in Python)
+            data.setdefault("as_", data.pop("as"))
+        super().__init__(**data)
+
+
+@app.post("/api/inbox/notices/{item_id}/dismiss")
+async def notice_dismiss(item_id: int, body: NoticeDismissBody,
+                         user: dict = Depends(require_user)):
+    """Dismiss a notice. The row is KEPT (dismissal memory): its dedupe key
+    blocks any unchanged re-proposal forever. CAS — 409 to the loser."""
+    store: JobStore = app.state.store
+    _notice_scoped(item_id, user)
+    extra = {"dismiss_reason": body.reason.strip()[:500]} if body.reason.strip() else None
+    if not store.inbox_item_resolve(item_id, "dismissed",
+                                    f"dashboard:{user['username']}", extra):
+        raise HTTPException(status_code=409, detail="notice changed state concurrently")
+    return _notice_public(store.inbox_item_get(item_id))
+
+
+@app.post("/api/inbox/notices/{item_id}/adopt")
+async def notice_adopt(item_id: int, body: NoticeAdoptBody,
+                       user: dict = Depends(require_user)):
+    """Adopt a proposal into the ordinary intake — the ONLY path from a
+    proposal to a pipeline (routines never self-initiate one). Validation
+    happens BEFORE the CAS resolve, exactly like POST /api/features: project
+    must be mapped, non-admins need project access. The brief flows into
+    job.request and takes the untrusted-fragment posture of a ClickUp
+    description in every stage prompt."""
+    store: JobStore = app.state.store
+    worker: Worker = app.state.worker
+    item = _notice_scoped(item_id, user)
+    if (item.get("kind") or "") != "proposal":
+        raise HTTPException(status_code=400, detail="only proposals can be adopted")
+    as_kind = (body.as_ or "feature").strip().lower()
+    if as_kind not in ("feature", "task"):
+        raise HTTPException(status_code=400, detail="as must be 'feature' or 'task'")
+    try:
+        refs = json.loads(item.get("refs") or "{}")
+        if not isinstance(refs, dict):
+            refs = {}
+    except (ValueError, TypeError):
+        refs = {}
+    project = (body.project or "").strip() or str(refs.get("project") or "").strip()
+    if not project or settings.repo_for_project(project) is None:
+        raise HTTPException(status_code=400, detail=f"unknown project '{project}'")
+    if user["role"] != "admin":
+        _require_project_access(project, user)
+    if body.metric_window_days is not None and not 1 <= body.metric_window_days <= 365:
+        raise HTTPException(status_code=400,
+                            detail="metric_window_days must be between 1 and 365")
+    title = (body.title or "").strip() or item["title"]
+    request_text = (body.request or "").strip() or (item.get("body") or "").strip() \
+        or item["title"]
+    request_text = f"{request_text}\n\n_adopted from proposal #{item['id']}_"
+    prefix = "feat" if as_kind == "feature" else "task"
+    job_id = f"{prefix}-prop-{item['id']}"
+    # CAS-resolve FIRST (409 to the loser) — after the validation above, the
+    # only intake refusal path (a duplicate job id) is unreachable post-CAS,
+    # so there is no compensating rollback.
+    if not store.inbox_item_resolve(
+            item_id, "adopted", f"dashboard:{user['username']}",
+            {"adopted_as": job_id, "adopted_kind": as_kind, "project": project}):
+        raise HTTPException(status_code=409, detail="notice changed state concurrently")
+    try:
+        if as_kind == "feature":
+            worker.intake_feature(
+                job_id, title=title, project=project, request=request_text,
+                founder_dri=(body.founder_dri or "").strip(),
+                dev_dri=(body.dev_dri or "").strip(),
+                success_metric=(body.success_metric or "").strip(),
+                metric_target=(body.metric_target or "").strip(),
+                metric_window_days=body.metric_window_days,
+            )
+        else:
+            worker.intake_task(job_id, title=title, project=project,
+                               request=request_text)
+        job = store.get(job_id)
+        if job is None:
+            raise RuntimeError("intake did not create the job row")
+    except HTTPException:
+        raise
+    except Exception as e:
+        # visible + auditable: the item stays 'adopted' with the error in
+        # refs — never a silent un-adopt (single-writer posture)
+        store.inbox_item_merge_refs(item_id, {"intake_error": str(e)[:300]})
+        log.exception("proposal adoption intake failed for notice %s", item_id)
+        raise HTTPException(status_code=500,
+                            detail=f"intake failed after adoption: {str(e)[:200]}")
+    return {"job_id": job_id, "kind": as_kind, "project": project,
+            "notice": _notice_public(store.inbox_item_get(item_id))}
 
 
 @app.get("/api/outcomes")

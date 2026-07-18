@@ -69,7 +69,7 @@ def test_inbox_items_counts_and_ordering(client):
     assert ids == ["feat-i2", "feat-i1"]  # overdue first, other's gate excluded
     # Epic D3 adds the additive `candidates` key; the pre-D3 keys are unchanged
     assert data["counts"] == {"mine": 2, "unassigned": 1, "overdue": 1,
-                              "candidates": 0}
+                              "candidates": 0, "notices": 0}
     mine = data["items"][0]
     assert mine["gate_owner"]["is_you"] is True
     assert mine["overdue"] is True and mine["sla_hours"] == 24
@@ -101,7 +101,7 @@ def test_inbox_membership_scoped_no_leak(client):
     data = client.get("/api/inbox", headers=_basic("outsider", "password1")).json()
     assert data["items"] == []
     assert data["counts"] == {"mine": 0, "unassigned": 0, "overdue": 0,
-                              "candidates": 0}
+                              "candidates": 0, "notices": 0}
 
 
 def test_inbox_includes_v1_awaiting_and_feature_errors(client):

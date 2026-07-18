@@ -32,7 +32,7 @@ WORKSPACE_FIELDS = ("name", "product_name", "workspace_context", "canonical_proj
                     "gate_mode_default", "require_attributed_answers",
                     "stage_role_map", "gate_sla_hours",
                     "analytics_provider", "analytics_config",
-                    "slack_channels")
+                    "slack_channels", "budget_monthly_usd")
 
 SLACK_CHANNELS_MAX = 50
 
@@ -176,22 +176,29 @@ class WorkspaceService:
         return bool(self.settings.clickup_token and ws["clickup_enabled"] and list_id), \
             (list_id or None)
 
+    async def notify_text(self, ws: dict | None, text: str):
+        """Best-effort Slack send to a workspace's incoming webhook — never
+        raises, never drives control flow (Epic I2 digests + gate nudges both
+        funnel through here)."""
+        url = (ws or {}).get("slack_webhook_url") or ""
+        if not url:
+            return
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=10) as client:
+                await client.post(url, json={"text": text})
+        except Exception:  # visibility only — never let a send break anything
+            log.warning("slack notify failed for workspace %s (non-fatal)",
+                        (ws or {}).get("slug"))
+
     async def notify_gate(self, job: dict, text: str):
         """Best-effort Slack nudge at gate park — the dashboard-only nudge
         channel for workspaces without ClickUp (and extra signal with it)."""
         ws = self.for_job(job)
-        url = (ws or {}).get("slack_webhook_url") or ""
-        if not url:
-            return
         link = ""  # deep link only when a public base is configured
         if self.settings.public_base_url:
             link = f"\n{self.settings.public_base_url}/#/job/{job.get('issue_id')}"
-        try:
-            import httpx
-            async with httpx.AsyncClient(timeout=10) as client:
-                await client.post(url, json={"text": f"{text}{link}"})
-        except Exception:  # visibility only — never let a nudge break a gate
-            log.warning("slack gate nudge failed for %s (non-fatal)", job.get("issue_id"))
+        await self.notify_text(ws, f"{text}{link}")
 
     # ---------- validated writes ----------
 
@@ -372,6 +379,20 @@ class WorkspaceService:
                 except (ValueError, TypeError) as e:
                     raise WorkspaceError(f"slack_channels: {e}")
                 clean[key] = json.dumps(channels) if channels else ""
+            elif key == "budget_monthly_usd":
+                # Epic I4 (Epic G4 extends): empty string -> NULL = inherit the
+                # instance BUDGET_MONTHLY_USD; 0 = no budget. Fail closed on
+                # anything unparseable or negative.
+                if isinstance(value, str) and not value.strip():
+                    clean[key] = None
+                    continue
+                try:
+                    budget = float(value)
+                except (ValueError, TypeError):
+                    raise WorkspaceError("budget_monthly_usd must be a number ≥ 0")
+                if budget < 0:
+                    raise WorkspaceError("budget_monthly_usd must be a number ≥ 0")
+                clean[key] = budget
             elif key == "gate_sla_hours":
                 # empty string -> NULL = inherit the instance default
                 if isinstance(value, str) and not value.strip():
@@ -430,6 +451,7 @@ class WorkspaceService:
             "require_attributed_answers": ws.get("require_attributed_answers") or "auto",
             "stage_role_map": ws.get("stage_role_map") or "",
             "gate_sla_hours": ws.get("gate_sla_hours"),
+            "budget_monthly_usd": ws.get("budget_monthly_usd"),
             "analytics_provider": ws.get("analytics_provider") or "",
             "analytics_configured": self._analytics_configured(ws),
             # channel ids are not secrets (the bot token is, and lives in env)

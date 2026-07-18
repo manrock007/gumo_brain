@@ -328,6 +328,86 @@ CREATE TABLE IF NOT EXISTS people (
     updated_at REAL NOT NULL
 );
 
+-- Epic I0: durable inbox notices — every proactive-routine output lands here
+-- (risk alerts, proposal briefs, standup digests, planning packs, routine
+-- notes), never a silent side effect. UNIQUE(kind, dedupe_key) is BOTH the
+-- re-scan idempotence guard and the DISMISSAL MEMORY: rows are never deleted,
+-- so a dismissed key blocks re-insert forever; only a candidate whose
+-- contributing content changed (folded into the key) can surface again.
+CREATE TABLE IF NOT EXISTS inbox_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id INTEGER,            -- NULL = instance-wide (admin-only visibility)
+    kind TEXT NOT NULL,              -- 'risk_alert' | 'proposal' | 'standup_digest'
+                                     -- | 'planning_pack' | 'routine_note'
+    source TEXT NOT NULL DEFAULT '', -- emitting routine kind, e.g. 'risk_scan'
+    dedupe_key TEXT NOT NULL,        -- idempotence + dismissal memory (see above)
+    source_sig TEXT NOT NULL DEFAULT '',  -- coarse source signature for the
+                                     -- proposal recency guard (project:stage etc.)
+    title TEXT NOT NULL,
+    body TEXT NOT NULL DEFAULT '',   -- markdown; fed to prompts ONLY via adoption,
+                                     -- where it takes the untrusted-fragment
+                                     -- posture of a ClickUp description
+    refs TEXT NOT NULL DEFAULT '{}', -- JSON: {job_id, project, pr_url, ...}
+    status TEXT NOT NULL DEFAULT 'open',  -- open | dismissed | adopted | expired
+    status_by TEXT NOT NULL DEFAULT '',   -- 'dashboard:<user>' / 'engine'
+    status_at REAL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_inbox_items_dedupe ON inbox_items(kind, dedupe_key);
+
+-- Epic I5: friction becomes engine data, not just a ClickUp mirror. Rows come
+-- from run FRICTION: protocol lines AND human redos — written regardless of
+-- clickup_field_sync_enabled (the row is the record; the mirror stays
+-- best-effort visibility, the exact Epic B posture).
+CREATE TABLE IF NOT EXISTS frictions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL,
+    workspace_id INTEGER,
+    project TEXT NOT NULL DEFAULT '',
+    stage INTEGER,
+    source TEXT NOT NULL,            -- 'run' | 'redo'
+    text TEXT NOT NULL,
+    at REAL NOT NULL
+);
+
+-- Epic I1: the routine engine. One row per (kind, scope); builtin instance
+-- rows (workspace_id NULL) generalize the hardcoded loops. schedule='' on a
+-- builtin row means "derive from live settings at each tick" so env contracts
+-- (SWEEP_INTERVAL_HOURS, …) keep working; an operator-edited non-empty
+-- schedule wins. last_run_at doubles as the CAS claim column.
+-- NOTE (Epic F1): the COALESCE expression index needs Postgres expression-
+-- index syntax review when the Alembic baseline is generated.
+CREATE TABLE IF NOT EXISTS routines (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id INTEGER,             -- NULL = instance-scoped (builtin loops)
+    kind TEXT NOT NULL,               -- registry key
+    name TEXT NOT NULL DEFAULT '',
+    schedule TEXT NOT NULL,           -- 'every:<seconds>' | 'daily@HH:MM[;days=…]'
+                                      -- | 'weekly@<day> HH:MM' | '' (builtin: derive)
+    config TEXT NOT NULL DEFAULT '{}',-- JSON per-kind knobs (override settings)
+    enabled INTEGER NOT NULL DEFAULT 1,
+    last_run_at REAL,                 -- CAS claim column
+    last_status TEXT NOT NULL DEFAULT '',   -- ok | error | quiet | skipped
+    last_result TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_routines_scope
+    ON routines(kind, COALESCE(workspace_id, -1));
+
+CREATE TABLE IF NOT EXISTS routine_runs (    -- INSERT-only run history
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    routine_id INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    workspace_id INTEGER,
+    started_at REAL NOT NULL,
+    ended_at REAL,
+    status TEXT NOT NULL DEFAULT '',  -- ok | error | quiet | skipped
+    detail TEXT NOT NULL DEFAULT '',
+    items_emitted INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS gate_chat (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     job_id TEXT NOT NULL,
@@ -380,6 +460,10 @@ MIGRATIONS = {  # table -> columns added after that table first shipped (in-plac
         "metric_event": "TEXT DEFAULT ''",     # Epic B2: analytics event, harvested from P9 METRIC_EVENT:
         "watch_started_at": "REAL",            # Epic B4: watch jobs only
         "watch_deadline": "REAL",              # Epic B4: persisted so restarts never re-derive the window
+        # Epic I5: sentry-cluster substrate — the issue culprit, single-lined
+        # and capped at write (worker._process_sentry). Pre-upgrade sentry rows
+        # keep culprit='' — clusters only accumulate from upgrade forward.
+        "culprit": "TEXT DEFAULT ''",
     },
     "users": {
         "clickup_user_id": "TEXT NOT NULL DEFAULT ''",  # Epic A1: ClickUp id ↔ CtrlLoop identity
@@ -394,6 +478,10 @@ MIGRATIONS = {  # table -> columns added after that table first shipped (in-plac
         # Epic D3: JSON list of Slack channel ids to ingest (FLAG'd feature);
         # '' = ingestion off for this workspace. Channel ids are not secrets.
         "slack_channels": "TEXT NOT NULL DEFAULT ''",
+        # Epic I4 (and the substrate Epic G4 extends into the warn/block
+        # ladder): per-workspace monthly budget in USD. NULL = inherit the
+        # instance BUDGET_MONTHLY_USD; 0 = no budget (spend alerts inert).
+        "budget_monthly_usd": "REAL",
     },
     "stage_runs": {
         "session_id": "TEXT DEFAULT ''",
@@ -1347,6 +1435,197 @@ class JobStore:
                 "SELECT * FROM gate_events WHERE job_id = ? ORDER BY id", (job_id,)
             ).fetchall()
             return [dict(r) for r in rows]
+
+    # ---------- inbox items (Epic I0: durable routine outputs) ----------
+
+    def inbox_item_add(self, kind: str, dedupe_key: str, title: str,
+                       body: str = "", refs: dict | str | None = None,
+                       workspace_id: int | None = None, source: str = "",
+                       source_sig: str = "") -> bool:
+        """INSERT OR IGNORE keyed on UNIQUE(kind, dedupe_key) — returns True
+        only when the row is NEW (callers key Slack sends off it, exactly like
+        gate_event_add). The same index is the DISMISSAL MEMORY: a dismissed
+        key blocks re-insert forever. Empty dedupe_key is refused loudly."""
+        dedupe_key = str(dedupe_key or "").strip()
+        if not dedupe_key:
+            raise ValueError("inbox_item_add requires a non-empty dedupe_key")
+        if isinstance(refs, dict):
+            refs = json.dumps(refs)
+        now = time.time()
+        with self._conn() as c:
+            cur = c.execute(
+                """INSERT OR IGNORE INTO inbox_items
+                     (workspace_id, kind, source, dedupe_key, source_sig, title,
+                      body, refs, status, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)""",
+                (workspace_id, kind, source, dedupe_key, source_sig,
+                 (title or "")[:300], body or "", refs or "{}", now, now),
+            )
+            return cur.rowcount == 1
+
+    def inbox_item_get(self, item_id: int) -> dict | None:
+        with self._conn() as c:
+            row = c.execute("SELECT * FROM inbox_items WHERE id = ?",
+                            (int(item_id),)).fetchone()
+            return dict(row) if row else None
+
+    def inbox_items_open(self, workspace_ids: list[int] | None,
+                         kinds: tuple = (), limit: int = 200) -> list[dict]:
+        """Open notices, membership-scoped: None = all rows incl. instance-wide
+        NULL-workspace ones (admins); a list = only those workspaces (members
+        never see NULL-workspace rows); [] = none."""
+        where, params = ["status = 'open'"], []
+        if workspace_ids is not None:
+            if not workspace_ids:
+                return []
+            marks = ",".join("?" for _ in workspace_ids)
+            where.append(f"workspace_id IN ({marks})")
+            params.extend(int(w) for w in workspace_ids)
+        if kinds:
+            marks = ",".join("?" for _ in kinds)
+            where.append(f"kind IN ({marks})")
+            params.extend(kinds)
+        with self._conn() as c:
+            rows = c.execute(
+                f"SELECT * FROM inbox_items WHERE {' AND '.join(where)} "
+                f"ORDER BY id DESC LIMIT ?", (*params, int(limit))).fetchall()
+            return [dict(r) for r in rows]
+
+    def inbox_item_resolve(self, item_id: int, to_status: str, by: str,
+                           extra_refs: dict | None = None) -> bool:
+        """CAS on the ONLY state transition these rows have: open → dismissed/
+        adopted/expired. Returns True iff this caller won (the loser of a
+        dismiss/adopt race gets a 409 upstream). The row itself (status_by/
+        status_at, never deleted) is the audit record. extra_refs merges into
+        the stored refs JSON."""
+        now = time.time()
+        with self._conn() as c:
+            row = c.execute("SELECT refs FROM inbox_items WHERE id = ?",
+                            (int(item_id),)).fetchone()
+            refs = "{}" if row is None else (row["refs"] or "{}")
+            if extra_refs:
+                try:
+                    merged = json.loads(refs)
+                    if not isinstance(merged, dict):
+                        merged = {}
+                except (ValueError, TypeError):
+                    merged = {}
+                merged.update(extra_refs)
+                refs = json.dumps(merged)
+            cur = c.execute(
+                """UPDATE inbox_items SET status = ?, status_by = ?, status_at = ?,
+                     updated_at = ?, refs = ?
+                   WHERE id = ? AND status = 'open'""",
+                (to_status, by, now, now, refs, int(item_id)))
+            return cur.rowcount == 1
+
+    def inbox_item_merge_refs(self, item_id: int, extra_refs: dict):
+        """Merge refs on an already-resolved row (e.g. recording an intake
+        error on an adopted proposal — visible, auditable, never a silent
+        un-adopt)."""
+        with self._conn() as c:
+            row = c.execute("SELECT refs FROM inbox_items WHERE id = ?",
+                            (int(item_id),)).fetchone()
+            if row is None:
+                return
+            try:
+                merged = json.loads(row["refs"] or "{}")
+                if not isinstance(merged, dict):
+                    merged = {}
+            except (ValueError, TypeError):
+                merged = {}
+            merged.update(extra_refs)
+            c.execute("UPDATE inbox_items SET refs = ?, updated_at = ? WHERE id = ?",
+                      (json.dumps(merged), time.time(), int(item_id)))
+
+    def inbox_items_expire(self, kinds: tuple, older_than_days: float) -> int:
+        """Flip stale OPEN rows of the given kinds to 'expired' (visible aging,
+        never silent deletion). Dismissed/adopted rows are never touched — the
+        dismissal memory must persist."""
+        if not kinds:
+            return 0
+        cutoff = time.time() - float(older_than_days) * 86400
+        marks = ",".join("?" for _ in kinds)
+        with self._conn() as c:
+            cur = c.execute(
+                f"""UPDATE inbox_items SET status = 'expired', status_by = 'engine',
+                      status_at = ?, updated_at = ?
+                    WHERE status = 'open' AND kind IN ({marks}) AND created_at < ?""",
+                (time.time(), time.time(), *kinds, cutoff))
+            return cur.rowcount
+
+    def inbox_expire_predecessors(self, kind: str, workspace_id: int | None,
+                                  before_id: int) -> int:
+        """A fresh digest/pack expires its still-open predecessors directly
+        (status_by='engine') so counts.notices never grows monotonically."""
+        with self._conn() as c:
+            cur = c.execute(
+                """UPDATE inbox_items SET status = 'expired', status_by = 'engine',
+                     status_at = ?, updated_at = ?
+                   WHERE status = 'open' AND kind = ? AND id < ?
+                     AND (workspace_id = ? OR (workspace_id IS NULL AND ? IS NULL))""",
+                (time.time(), time.time(), kind, int(before_id),
+                 workspace_id, workspace_id))
+            return cur.rowcount
+
+    def inbox_item_recent_sig(self, kind: str, source_sig: str,
+                              since: float) -> bool:
+        """Any item (ANY status — dismissal memory included) of this kind with
+        the same coarse source signature newer than `since`? The proposal
+        recency guard: a dismissed friction brief holds until the pain
+        measurably grows AND the window has passed."""
+        if not source_sig:
+            return False
+        with self._conn() as c:
+            return c.execute(
+                "SELECT 1 FROM inbox_items WHERE kind = ? AND source_sig = ? "
+                "AND created_at >= ? LIMIT 1",
+                (kind, source_sig, since)).fetchone() is not None
+
+    # ---------- frictions (Epic I5: engine data, not just a mirror) ----------
+
+    def friction_add(self, job_id: str, workspace_id: int | None, project: str,
+                     stage: int | None, source: str, text: str):
+        text = (text or "").strip()
+        if not text:
+            return
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO frictions (job_id, workspace_id, project, stage, "
+                "source, text, at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (job_id, workspace_id, project or "", stage, source,
+                 text[:500], time.time()))
+
+    def frictions_since(self, since: float,
+                        workspace_id: int | None = None) -> list[dict]:
+        with self._conn() as c:
+            if workspace_id is None:
+                rows = c.execute(
+                    "SELECT * FROM frictions WHERE at >= ? ORDER BY id",
+                    (since,)).fetchall()
+            else:
+                rows = c.execute(
+                    "SELECT * FROM frictions WHERE at >= ? AND workspace_id = ? "
+                    "ORDER BY id", (since, int(workspace_id))).fetchall()
+            return [dict(r) for r in rows]
+
+    # ---------- spend (Epic I0/I4; the substrate Epic G4 extends) ----------
+
+    def costs_since(self, since: float) -> dict:
+        """workspace_id -> total USD since `since`, aggregating stage_runs AND
+        gate_chat costs through the owning job's workspace. Jobs without a
+        workspace land under None."""
+        with self._conn() as c:
+            rows = c.execute(
+                """SELECT j.workspace_id AS ws, SUM(x.c) AS total FROM (
+                     SELECT job_id, COALESCE(cost_usd, 0) AS c FROM stage_runs
+                       WHERE started_at >= ?
+                     UNION ALL
+                     SELECT job_id, COALESCE(cost_usd, 0) FROM gate_chat
+                       WHERE at >= ?
+                   ) x JOIN jobs j ON j.issue_id = x.job_id
+                   GROUP BY j.workspace_id""", (since, since)).fetchall()
+            return {r["ws"]: float(r["total"] or 0) for r in rows}
 
     def awaiting_gates(self) -> list[dict]:
         """Everything answerable right now: parked gates (all kinds) plus

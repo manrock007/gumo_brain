@@ -45,6 +45,7 @@ from .prompts import (
     build_task_plan_prompt,
 )
 from .sentry_api import SentryClient, format_stacktrace
+from .textutil import single_line
 from . import transcripts
 
 log = logging.getLogger("brain.worker")
@@ -84,14 +85,13 @@ def _clean_metric_value(raw: str) -> str:
     return (raw or "").strip().strip("*").strip()
 
 
-def _single_line(value: str, cap: int = 300) -> str:
-    """Collapse untrusted free text to ONE bounded line (every whitespace run
-    — newlines included — becomes a single space). Metric/target values are
-    interpolated into engine-voiced prompt headers on EVERY stage run: a
-    multiline value could smuggle markdown headings/instructions into the
-    prompt as if the engine had written them, so the stored value is forced
-    single-line and capped at intake (both channels funnel through here)."""
-    return " ".join(str(value or "").split())[:cap].strip()
+# Metric/target values are interpolated into engine-voiced prompt headers on
+# EVERY stage run: a multiline value could smuggle markdown headings/
+# instructions into the prompt as if the engine had written them, so the
+# stored value is forced single-line and capped at intake (both channels
+# funnel through here). Moved to textutil (Epic I) — this alias stays for
+# existing call sites and tests.
+_single_line = single_line
 
 
 class GateConflict(Exception):
