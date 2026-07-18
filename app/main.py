@@ -110,6 +110,7 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(worker.sla_forever()),
         asyncio.create_task(worker.watch_forever()),
         asyncio.create_task(worker.autonomy_forever()),
+        asyncio.create_task(worker.slack_ingest_forever()),
     ]
     app.state.store = store
     app.state.worker = worker
@@ -475,6 +476,7 @@ class WorkspaceCreateBody(BaseModel):
     gate_sla_hours: int | str | None = None        # Epic A5: '' = inherit instance default
     analytics_provider: str | None = None          # Epic B3: '' = none | 'mixpanel'
     analytics_config: dict | str | None = None     # Epic B3: stored secret; NEVER echoed back
+    slack_channels: list | str | None = None       # Epic D3: ingest allowlist; '' clears
 
 
 class WorkspacePatchBody(WorkspaceCreateBody):
@@ -645,9 +647,18 @@ async def inbox(user: dict = Depends(require_user)):
             "overdue": overdue, "due_at": due_at,
         })
     items.sort(key=lambda i: (not i["overdue"], i["gate_posted_at"] or 0))
+    # Epic D3: parked Slack decision candidates — inbox material awaiting a
+    # human confirm/dismiss, membership-scoped, oldest first. Additive keys
+    # only: items and counts.mine keep their exact pre-D3 semantics (the
+    # badge number never includes candidates).
+    ws_ids = None if user.get("role") == "admin" \
+        else sorted(store.workspace_ids_for_user(user["id"]))
+    candidates = [_decision_public(d) for d in store.decision_candidates(ws_ids, 50)]
     return {"items": items,
+            "candidates": candidates,
             "counts": {"mine": len(items), "unassigned": unassigned_n,
-                       "overdue": sum(1 for i in items if i["overdue"])}}
+                       "overdue": sum(1 for i in items if i["overdue"]),
+                       "candidates": len(candidates)}}
 
 
 @app.get("/api/outcomes")
@@ -665,6 +676,206 @@ async def outcomes_ledger(user: dict = Depends(require_user)):
         v = r.get("verdict") or "unmeasured"
         verdicts[v] = verdicts.get(v, 0) + 1
     return {"outcomes": rows, "verdicts": verdicts}
+
+
+# ---------- decision registry (Epic D2, docs/ENGINE.md §16) ----------
+
+
+DECISION_SCOPES = ("job", "repo", "product", "org")
+
+
+class DecisionCreateBody(BaseModel):
+    scope: str
+    text: str
+    title: str = ""
+    project: str | None = None
+    links: list | None = None
+    workspace_id: int | None = None
+
+
+class DecisionPatchBody(BaseModel):
+    action: str  # supersede | reactivate
+
+
+class DecisionConfirmBody(BaseModel):
+    scope: str | None = None
+    title: str | None = None
+    text: str | None = None
+
+
+def _validate_decision_fields(scope: str | None, text: str | None,
+                              title: str | None, links: list | None,
+                              user: dict):
+    """Shared validation for create AND confirm-with-edits (amendment: the
+    exact same rules on both paths). Raises HTTPException."""
+    if scope is not None:
+        if scope not in DECISION_SCOPES:
+            raise HTTPException(status_code=400,
+                                detail="scope must be one of: "
+                                       + ", ".join(DECISION_SCOPES))
+        if scope == "org" and user.get("role") != "admin":
+            # org-scope rows reach EVERY member's prompts and registry view —
+            # creating/confirming one is an admin action (ENGINE.md §16)
+            raise HTTPException(status_code=403,
+                                detail="org-scope decisions are admin-only")
+    if text is not None:
+        if not text.strip():
+            raise HTTPException(status_code=400, detail="text must be non-empty")
+        if len(text) > 4000:
+            raise HTTPException(status_code=400, detail="text is capped at 4000 chars")
+    if title is not None and len(title) > 200:
+        raise HTTPException(status_code=400, detail="title is capped at 200 chars")
+    if links is not None and not all(isinstance(l, str) for l in links):
+        raise HTTPException(status_code=400, detail="links must be a list of strings")
+
+
+def _decision_public(d: dict) -> dict:
+    try:
+        links = json.loads(d.get("links") or "[]")
+    except (ValueError, TypeError):
+        links = []
+    return d | {"links": links}
+
+
+def _decision_scoped(decision_id: int, user: dict) -> dict:
+    """The decision row iff the user may see it — the visibility predicate is
+    EXACTLY the prompt-admission predicate: own-workspace rows plus
+    scope='org' rows; anything else (incl. workspace_id NULL rows for
+    members) is a 404, no existence leaks."""
+    row = app.state.store.decision_get(decision_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="unknown decision")
+    if user.get("role") != "admin" and row.get("scope") != "org" \
+            and not _ws_svc().user_can_access(user, row.get("workspace_id")):
+        raise HTTPException(status_code=404, detail="unknown decision")
+    return row
+
+
+@app.post("/api/decisions")
+async def decisions_create(body: DecisionCreateBody,
+                           user: dict = Depends(require_user)):
+    store: JobStore = app.state.store
+    _validate_decision_fields(body.scope, body.text, body.title, body.links, user)
+    ws_id = None
+    if body.workspace_id is not None:
+        ws = store.workspace_get(body.workspace_id)
+        if ws is None or not _ws_svc().user_can_access(user, ws["id"]):
+            raise HTTPException(status_code=400, detail="unknown workspace")
+        ws_id = ws["id"]
+    elif (body.project or "").strip():
+        ws = _ws_svc().for_project(body.project.strip())
+        if ws is None or not _ws_svc().user_can_access(user, ws["id"]):
+            raise HTTPException(status_code=400,
+                                detail=f"unknown project '{body.project}'")
+        ws_id = ws["id"]
+    if body.scope != "org" and ws_id is None:
+        raise HTTPException(status_code=400,
+                            detail="provide a workspace_id or project "
+                                   "(only org-scope decisions may omit both)")
+    did = store.decision_add(
+        "manual", body.text.strip(), scope=body.scope,
+        title=(body.title or "").strip(), project=(body.project or "").strip(),
+        workspace_id=ws_id, links=body.links or [],
+        decided_by=f"dashboard:{user['username']}")
+    return _decision_public(store.decision_get(did))
+
+
+@app.get("/api/decisions")
+async def decisions_list(q: str = "", scope: str = "", status: str = "",
+                         project: str = "", source: str = "",
+                         limit: int = 100, offset: int = 0,
+                         user: dict = Depends(require_user)):
+    """The registry view. Members see their workspaces' rows PLUS every
+    org-scope row (org rows reach every member's prompts, so every member may
+    read — and ask an admin to supersede — them). Default status view
+    excludes candidates (inbox material) and dismissed (remembered
+    rejections)."""
+    if scope and scope not in DECISION_SCOPES:
+        raise HTTPException(status_code=400, detail="unknown scope")
+    if status and status not in ("active", "superseded", "candidate", "dismissed"):
+        raise HTTPException(status_code=400, detail="unknown status")
+    store: JobStore = app.state.store
+    ws_ids = None if user.get("role") == "admin" \
+        else sorted(store.workspace_ids_for_user(user["id"]))
+    rows = store.decisions_query(
+        q=q, scope=scope, status=status, project=project, source=source,
+        workspace_ids=ws_ids, limit=max(1, min(500, limit)),
+        offset=max(0, offset))
+    return {"decisions": [_decision_public(d) for d in rows]}
+
+
+@app.patch("/api/decisions/{decision_id}")
+async def decisions_patch(decision_id: int, body: DecisionPatchBody,
+                          user: dict = Depends(require_user)):
+    store: JobStore = app.state.store
+    row = _decision_scoped(decision_id, user)
+    if row.get("scope") == "org" and user.get("role") != "admin":
+        raise HTTPException(status_code=403,
+                            detail="org-scope decisions are admin-only")
+    action = body.action.strip().lower()
+    if action == "supersede":
+        ok = store.decision_set_status(decision_id, ["active"], "superseded",
+                                       f"dashboard:{user['username']}")
+    elif action == "reactivate":
+        ok = store.decision_set_status(decision_id, ["superseded"], "active",
+                                       f"dashboard:{user['username']}")
+    else:
+        raise HTTPException(status_code=400,
+                            detail="action must be 'supersede' or 'reactivate'")
+    if not ok:
+        raise HTTPException(status_code=409,
+                            detail="decision changed state concurrently")
+    return _decision_public(store.decision_get(decision_id))
+
+
+@app.post("/api/decisions/{decision_id}/confirm")
+async def decisions_confirm(decision_id: int, body: DecisionConfirmBody,
+                            user: dict = Depends(require_user)):
+    """Confirm a Slack candidate into the registry (Epic D3). The human may
+    edit scope/title/text while confirming — validated with EXACTLY the same
+    rules as POST /api/decisions (org scope stays admin-only). Confirmation
+    stamps decided_by with the ratifying HUMAN; the original Slack author is
+    preserved in origin_author (written at ingest) — auditable either way.
+    CAS candidate→active; 409 on a lost race. The FTS insert rides the same
+    transaction (decision_set_status)."""
+    store: JobStore = app.state.store
+    row = _decision_scoped(decision_id, user)
+    if row.get("status") != "candidate":
+        raise HTTPException(status_code=409, detail="not a candidate")
+    _validate_decision_fields(body.scope, body.text, body.title, None, user)
+    edits = {}
+    if body.scope is not None:
+        edits["scope"] = body.scope
+    if body.title is not None:
+        edits["title"] = body.title.strip()
+    if body.text is not None:
+        edits["text"] = body.text.strip()
+    ok = store.decision_set_status(
+        decision_id, ["candidate"], "active",
+        f"dashboard:{user['username']}",
+        decided_by=f"dashboard:{user['username']}", **edits)
+    if not ok:
+        raise HTTPException(status_code=409,
+                            detail="candidate changed state concurrently")
+    return _decision_public(store.decision_get(decision_id))
+
+
+@app.post("/api/decisions/{decision_id}/dismiss")
+async def decisions_dismiss(decision_id: int, user: dict = Depends(require_user)):
+    """Dismiss a candidate. The row is KEPT (status='dismissed') so its
+    (source, ref) key survives — a re-scan can never re-propose it. An
+    ordinary work mutation recorded on the row itself (updated_by/updated_at);
+    it grants no authority, so no admin_events row."""
+    store: JobStore = app.state.store
+    row = _decision_scoped(decision_id, user)
+    if row.get("status") != "candidate":
+        raise HTTPException(status_code=409, detail="not a candidate")
+    ok = store.decision_set_status(decision_id, ["candidate"], "dismissed",
+                                   f"dashboard:{user['username']}")
+    if not ok:
+        raise HTTPException(status_code=409,
+                            detail="candidate changed state concurrently")
+    return _decision_public(store.decision_get(decision_id))
 
 
 # ---------- graduated autonomy (Epic C, docs/ENGINE.md §15) ----------

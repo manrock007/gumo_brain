@@ -105,9 +105,13 @@ def _entries_tail(workspace: str, rel_dir: str, cap: int) -> str:
 
 
 class MemoryReader:
-    def __init__(self, settings: Settings, locks=None):
+    def __init__(self, settings: Settings, locks=None, store=None):
         self.settings = settings
         self.locks = locks  # RepoLocks; None for read-only cache use (dashboard)
+        # Epic D4: when a JobStore is injected, refresh_cache feeds the FTS
+        # retrieval index. The dashboard-only readers stay store-less (they
+        # never refresh, so they must never write the index).
+        self.store = store
         # Phase 2: slug -> canonical slug via its workspace (injected at startup);
         # None falls back to the instance-wide memory_canonical_project
         self.canonical_resolver = None
@@ -188,33 +192,95 @@ class MemoryReader:
                                 f"{last.strip()}..origin/{base}")
         return int(count.strip()) if code == 0 and count.strip().isdigit() else None
 
+    # newest N per-entry bodies cached + indexed per refresh (bounded — the
+    # top-level cached() glob("*.md") is unaffected; entries live in subdirs)
+    ENTRY_INDEX_MAX = 50
+
     async def refresh_cache(self, project: str, workspace: str, base: str):
         """Copy origin/<base> memory into data_dir/memory/<project>/ for the
-        dashboard. Base-pinned: never branch or bootstrap-draft content."""
+        dashboard, and (with a store injected — Epic D4) mirror every file
+        into the FTS retrieval index. Base-pinned: never branch or
+        bootstrap-draft content.
+
+        Cost guard: refresh_cache runs at the end of EVERY stage — when
+        origin/<base> hasn't moved since the cached commit_sha, the per-file
+        `git show` reads (up to ~100 with entries) are skipped entirely and
+        only meta.json (fetched_at/staleness) is rewritten. A fresh DB with an
+        old cache still reindexes once (fts_has probe)."""
         cache = Path(self.settings.data_dir) / "memory" / project
         cache.mkdir(parents=True, exist_ok=True)
         code, sha = await git(workspace, "rev-parse", f"origin/{base}")
-        listed: dict[str, int] = {}
-        for scope, names in (("memory", REPO_FILES), ("product", PRODUCT_FILES)):
-            for name in names:
-                fcode, out = await git_show_ns(workspace, f"origin/{base}", f"{scope}/{name}")
-                if fcode == 0 and out.strip():
-                    (cache / name).write_text(out)
-                    listed[name] = len(out)
-        for entry_dir in ("changelog", "decisions"):
-            n = 0
-            # same precedence as every other read: legacy wins when present
-            for ns in (*LEGACY_ENGINE_DIRS, ENGINE_DIR):
-                lcode, out = await git(workspace, "ls-tree", "--name-only",
-                                       f"origin/{base}", f"{ns}/memory/{entry_dir}/")
-                if lcode == 0:
-                    n = len([l for l in out.splitlines() if l.strip().endswith(".md")])
-                    if n:
-                        break
-            listed[entry_dir] = n
+        new_sha = sha.strip() if code == 0 else ""
+        prev_meta: dict = {}
+        try:
+            prev_meta = json.loads((cache / "meta.json").read_text())
+        except (OSError, json.JSONDecodeError):
+            pass
+        unchanged = bool(new_sha) and new_sha == (prev_meta.get("commit_sha") or "")
+        if unchanged and self.store is not None \
+                and getattr(self.store, "fts_enabled", False) \
+                and not self.store.fts_has("memory", project):
+            unchanged = False  # old cache, fresh index — reindex once
+        if unchanged:
+            listed = prev_meta.get("files") or {}
+        else:
+            listed = {}
+            for scope, names in (("memory", REPO_FILES), ("product", PRODUCT_FILES)):
+                for name in names:
+                    fcode, out = await git_show_ns(workspace, f"origin/{base}",
+                                                   f"{scope}/{name}")
+                    if fcode == 0 and out.strip():
+                        (cache / name).write_text(out)
+                        listed[name] = len(out)
+                        if self.store is not None:
+                            self.store.fts_upsert(
+                                "memory", f"{project}/{name}", project=project,
+                                path=f"{ENGINE_DIR}/{scope}/{name}",
+                                title=name, body=out)
+                    else:
+                        # vanished from the base tree: drop the stale cache
+                        # copy and its index row
+                        if (cache / name).exists():
+                            (cache / name).unlink()
+                        if self.store is not None:
+                            self.store.fts_delete("memory", f"{project}/{name}")
+            for entry_dir in ("changelog", "decisions"):
+                names = []
+                # same precedence as every other read: legacy wins when present
+                for ns in (*LEGACY_ENGINE_DIRS, ENGINE_DIR):
+                    lcode, out = await git(workspace, "ls-tree", "--name-only",
+                                           f"origin/{base}", f"{ns}/memory/{entry_dir}/")
+                    if lcode == 0:
+                        names = [l.strip().rsplit("/", 1)[-1]
+                                 for l in out.splitlines()
+                                 if l.strip().endswith(".md")]
+                        if names:
+                            break
+                listed[entry_dir] = len(names)
+                keep = sorted(names, reverse=True)[:self.ENTRY_INDEX_MAX]
+                edir = cache / entry_dir
+                edir.mkdir(exist_ok=True)
+                # vanished-entry detection: diff the new name-set against the
+                # cache dir listing (the manifest) and drop the difference
+                for name in {p.name for p in edir.glob("*.md")} - set(keep):
+                    (edir / name).unlink()
+                    if self.store is not None:
+                        self.store.fts_delete("memory",
+                                              f"{project}/{entry_dir}/{name}")
+                for name in keep:
+                    fcode, out = await git_show_ns(workspace, f"origin/{base}",
+                                                   f"memory/{entry_dir}/{name}")
+                    if fcode == 0 and out.strip():
+                        (edir / name).write_text(out)
+                        if self.store is not None:
+                            self.store.fts_upsert(
+                                "memory", f"{project}/{entry_dir}/{name}",
+                                project=project,
+                                path=f"{ENGINE_DIR}/memory/{entry_dir}/{name}",
+                                title=name, body=out)
         fresh = await self.freshness(workspace, base)
         (cache / "meta.json").write_text(json.dumps({
-            "commit_sha": sha.strip() if code == 0 else "",
+            "commit_sha": new_sha,
             "fetched_at": time.time(),
             "files": listed,
             "staleness_commits": fresh,

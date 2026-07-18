@@ -278,6 +278,44 @@ CREATE TABLE IF NOT EXISTS autonomy_events (
 );
 CREATE INDEX IF NOT EXISTS idx_autonomy_events_ws_at ON autonomy_events(workspace_id, at);
 
+-- Epic D2: cross-ticket decision registry. Auto-registered from substantive
+-- gate answers (ref='g<guidance id>' — idempotent under replay), manual adds
+-- from the dashboard, Slack candidates (D3 — status='candidate', quarantined:
+-- never indexed, never in prompts, never in the default registry view until
+-- a human confirms). origin_author preserves the ORIGINAL author when a
+-- confirmation stamps decided_by with the ratifying human (auditability).
+CREATE TABLE IF NOT EXISTS decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL DEFAULT 'gate',    -- gate | manual | slack
+    status TEXT NOT NULL DEFAULT 'active',  -- active | superseded | candidate | dismissed
+    scope TEXT NOT NULL DEFAULT 'job',      -- job | repo | product | org
+    job_id TEXT NOT NULL DEFAULT '',
+    workspace_id INTEGER,
+    project TEXT NOT NULL DEFAULT '',
+    stage INTEGER,
+    title TEXT NOT NULL DEFAULT '',
+    text TEXT NOT NULL,                     -- decision + rationale (capped 4000 at write)
+    decided_by TEXT NOT NULL DEFAULT '',    -- via string: 'dashboard:<u>' | 'clickup:<u>' | 'slack:<u>'
+    origin_author TEXT NOT NULL DEFAULT '', -- original author when decided_by is later overwritten
+    links TEXT NOT NULL DEFAULT '[]',       -- JSON list of URLs
+    ref TEXT NOT NULL DEFAULT '',           -- idempotence key ('' allowed for manual adds)
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    updated_by TEXT NOT NULL DEFAULT ''
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_decisions_ref ON decisions(source, ref) WHERE ref != '';
+
+-- Epic D3: per-channel Slack read watermarks. Deliberately NOT app_config
+-- (that is the context-override KV). last_ts is Slack's ts string
+-- (lexicographic-safe); rows are created — initialized to NOW — when a
+-- channel is first allowlisted, so ingestion is forward-only by construction
+-- (no historical candidate flood).
+CREATE TABLE IF NOT EXISTS slack_cursors (
+    channel TEXT PRIMARY KEY,
+    last_ts TEXT NOT NULL DEFAULT '0',
+    updated_at REAL NOT NULL
+);
+
 -- Epic D1: people profile layer OVER users (1:1; never a parallel identity).
 -- Feeds intake-time DRI defaults + the prompt ownership block; gate
 -- enforcement still keys exclusively on the jobs.founder_dri/dev_dri columns.
@@ -353,6 +391,9 @@ MIGRATIONS = {  # table -> columns added after that table first shipped (in-plac
         "analytics_provider": "TEXT NOT NULL DEFAULT ''",  # Epic B3: '' = none | 'mixpanel'
         # SECRET AT REST — never returned by the API (workspaces.public redacts it)
         "analytics_config": "TEXT NOT NULL DEFAULT '{}'",
+        # Epic D3: JSON list of Slack channel ids to ingest (FLAG'd feature);
+        # '' = ingestion off for this workspace. Channel ids are not secrets.
+        "slack_channels": "TEXT NOT NULL DEFAULT ''",
     },
     "stage_runs": {
         "session_id": "TEXT DEFAULT ''",
@@ -379,6 +420,17 @@ MIGRATIONS = {  # table -> columns added after that table first shipped (in-plac
 # Artifact bodies cached for the fast-lane chat bundle are capped — they are
 # markdown documents, not blobs; anything longer is truncated with a banner.
 ARTIFACT_CONTENT_MAX = 60000
+
+# Epic D4: FTS index body cap and the caps the registry enforces at write.
+FTS_BODY_MAX = 20000
+DECISION_TEXT_MAX = 4000
+DECISION_SCOPES = ("job", "repo", "product", "org")
+DECISION_STATUSES = ("active", "superseded", "candidate", "dismissed")
+
+# FTS terms are sanitized HARD before they reach a MATCH expression: FTS5
+# syntax injection is a crash vector, not a security one, but a crash in
+# prompt assembly would park the job.
+_FTS_TERM_RE = re.compile(r"[^0-9A-Za-z_]+")
 
 
 class JobStore:
@@ -411,6 +463,19 @@ class JobStore:
             # index creation is always safe.
             c.execute("""CREATE UNIQUE INDEX IF NOT EXISTS idx_users_clickup_id
                          ON users(clickup_user_id) WHERE clickup_user_id != ''""")
+            # Epic D4: the memory-retrieval index lives beside the data it
+            # mirrors. SQLite built without FTS5 (exotic) degrades to ABSENT
+            # retrieval — fail-open ONLY for a read enhancement: no control
+            # flow ever depends on the index; the prompt block just never
+            # renders. Candidates (D3) are never indexed by construction.
+            try:
+                c.execute("""CREATE VIRTUAL TABLE IF NOT EXISTS mem_fts USING fts5(
+                    kind UNINDEXED, key UNINDEXED, project UNINDEXED,
+                    workspace_id UNINDEXED, scope UNINDEXED, job_id UNINDEXED,
+                    path UNINDEXED, title, body, tokenize='porter unicode61')""")
+                self.fts_enabled = True
+            except sqlite3.OperationalError:
+                self.fts_enabled = False
 
     @contextmanager
     def _conn(self):
@@ -885,12 +950,27 @@ class JobStore:
     # ---------- guidance log (INSERT-only) ----------
 
     def guidance_add(self, job_id: str, stage: int | None, action: str, text: str,
-                     via: str, artifact_sha: str = ""):
+                     via: str, artifact_sha: str = "") -> int:
+        """INSERT-only; returns the new row id (Epic D2: the decision
+        registry's auto-registration ref 'g<id>')."""
         with self._conn() as c:
-            c.execute(
+            cur = c.execute(
                 "INSERT INTO guidance_log (job_id, stage, action, text, via, artifact_sha, at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (job_id, stage, action, text, via, artifact_sha, time.time()),
             )
+            gid = cur.lastrowid
+            # Epic D4: human decisions are retrievable context. gate_events /
+            # admin_events are deliberately NEVER indexed (refusals and
+            # escalations must never reach model context as human decisions).
+            if action in ("proceed", "redo", "answer", "chat", "steer") and (text or "").strip():
+                row = c.execute("SELECT project, workspace_id FROM jobs WHERE issue_id = ?",
+                                (job_id,)).fetchone()
+                self._fts_upsert(
+                    c, "guidance", f"g{gid}",
+                    project=(row["project"] if row else "") or "",
+                    workspace_id=row["workspace_id"] if row else None,
+                    job_id=job_id, title=f"P{stage} {action}", body=text)
+            return gid
 
     def guidance_for(self, job_id: str) -> list[dict]:
         with self._conn() as c:
@@ -898,6 +978,329 @@ class JobStore:
                 "SELECT * FROM guidance_log WHERE job_id = ? ORDER BY id", (job_id,)
             ).fetchall()
             return [dict(r) for r in rows]
+
+    # ---------- FTS memory retrieval (Epic D4, docs/ENGINE.md §16) ----------
+    # Indexed: active decisions, human guidance, live artifacts, memory files.
+    # Deliberately NOT indexed: gate_events/admin_events (refusals must never
+    # read as human decisions), candidate/dismissed/superseded decisions, and
+    # artifacts flagged 'superseded' (the engine banners them "will be
+    # regenerated"). Absence of FTS5 degrades retrieval to absent — additive
+    # prompt context only, no control flow depends on it.
+
+    def _fts_upsert(self, c, kind: str, key: str, *, project: str = "",
+                    workspace_id=None, scope: str = "", job_id: str = "",
+                    path: str = "", title: str = "", body: str = ""):
+        """DELETE+INSERT on an open connection (fts5 has no ON CONFLICT).
+        No-op when FTS is unavailable or the body is blank."""
+        if not self.fts_enabled:
+            return
+        body = (body or "").strip()
+        if not body:
+            return
+        c.execute("DELETE FROM mem_fts WHERE kind = ? AND key = ?", (kind, key))
+        c.execute(
+            "INSERT INTO mem_fts (kind, key, project, workspace_id, scope, "
+            "job_id, path, title, body) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (kind, key, project or "",
+             "" if workspace_id is None else str(int(workspace_id)),
+             scope or "", job_id or "", path or "", (title or "")[:300],
+             body[:FTS_BODY_MAX]),
+        )
+
+    def _fts_delete(self, c, kind: str, key: str):
+        if not self.fts_enabled:
+            return
+        c.execute("DELETE FROM mem_fts WHERE kind = ? AND key = ?", (kind, key))
+
+    def fts_upsert(self, kind: str, key: str, **kwargs):
+        """Standalone upsert (memory.refresh_cache uses this)."""
+        if not self.fts_enabled:
+            return
+        with self._conn() as c:
+            self._fts_upsert(c, kind, key, **kwargs)
+
+    def fts_delete(self, kind: str, key: str):
+        if not self.fts_enabled:
+            return
+        with self._conn() as c:
+            self._fts_delete(c, kind, key)
+
+    def fts_has(self, kind: str, project: str) -> bool:
+        """Any rows of a kind for a project? (cache-warm check for reindexing)."""
+        if not self.fts_enabled:
+            return False
+        with self._conn() as c:
+            return c.execute(
+                "SELECT 1 FROM mem_fts WHERE kind = ? AND project = ? LIMIT 1",
+                (kind, project)).fetchone() is not None
+
+    def fts_search(self, terms: list[str], *, project: str = "",
+                   workspace_id=None, exclude_job_id: str = "",
+                   kinds: tuple = (), limit: int = 5) -> list[dict]:
+        """Ranked snippet search for prompt assembly. Scoping is an explicit
+        per-kind whitelist (never one shared OR-chain — a project='' admission
+        must not leak workspace-scoped decisions into every run):
+        - guidance/artifact: exact project match (project-less rows excluded),
+          never the asking job's own rows;
+        - memory: exact project match;
+        - decision: workspace match OR scope='org' (candidates are simply not
+          in the index), never the asking job's own rows.
+        A malformed query must never fail a stage run → [] on any FTS error."""
+        if not self.fts_enabled:
+            return []
+        clean: list[str] = []
+        for t in terms or []:
+            for part in _FTS_TERM_RE.sub(" ", str(t or "")).split():
+                if part and part not in clean:
+                    clean.append(part)
+        if not clean:
+            return []  # MATCH '' raises — an empty term list is 'no results'
+        match = " OR ".join(f'"{t}"' for t in clean)
+        ws = "" if workspace_id is None else str(int(workspace_id))
+        excl = exclude_job_id or ""
+        # exclude rows of the asking job ONLY when an exclusion is requested —
+        # '' must not accidentally exclude job-less rows (manual decisions)
+        not_own = "(? = '' OR job_id != ?)"
+        where = ("("
+                 f"(kind IN ('guidance','artifact') AND project != '' "
+                 f" AND project = ? AND {not_own})"
+                 " OR (kind = 'memory' AND project = ?)"
+                 " OR (kind = 'decision' AND (scope = 'org' OR (? != '' AND workspace_id = ?))"
+                 f"     AND {not_own})"
+                 ")")
+        params: list = [match, project or "", excl, excl,
+                        project or "", ws, ws, excl, excl]
+        kind_clause = ""
+        if kinds:
+            marks = ",".join("?" for _ in kinds)
+            kind_clause = f" AND kind IN ({marks})"
+            params.extend(kinds)
+        params.append(int(limit))
+        try:
+            with self._conn() as c:
+                rows = c.execute(
+                    f"""SELECT kind, key, project, path, title,
+                               snippet(mem_fts, 8, '', '', ' … ', 24) AS snippet
+                        FROM mem_fts
+                        WHERE mem_fts MATCH ? AND {where}{kind_clause}
+                        ORDER BY bm25(mem_fts) LIMIT ?""",
+                    params).fetchall()
+                return [dict(r) for r in rows]
+        except sqlite3.OperationalError:
+            return []
+
+    # ---------- decision registry (Epic D2, docs/ENGINE.md §16) ----------
+
+    def decision_add(self, source: str, text: str, *, ref: str = "",
+                     status: str = "active", scope: str = "job",
+                     job_id: str = "", workspace_id=None, project: str = "",
+                     stage: int | None = None, title: str = "",
+                     decided_by: str = "", links="[]",
+                     origin_author: str = "") -> int | None:
+        """INSERT OR IGNORE keyed on the partial UNIQUE (source, ref) index —
+        idempotent under any replay; a previously DISMISSED candidate's ref
+        row still exists, so it can never be re-created. Returns the new row
+        id, or None when deduped — detected via cur.rowcount, NEVER lastrowid
+        (an ignored insert leaves lastrowid at the previous insert's id).
+        Empty text is refused loudly (same posture as gate_event_add).
+        Active rows enter the FTS index in the same transaction; candidates
+        never do."""
+        text = (text or "").strip()
+        if not text:
+            raise ValueError("decision_add requires non-empty text")
+        text = text[:DECISION_TEXT_MAX]
+        if isinstance(links, (list, tuple)):
+            links = json.dumps([str(l) for l in links])
+        now = time.time()
+        with self._conn() as c:
+            cur = c.execute(
+                """INSERT OR IGNORE INTO decisions
+                     (source, status, scope, job_id, workspace_id, project, stage,
+                      title, text, decided_by, origin_author, links, ref,
+                      created_at, updated_at, updated_by)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (source, status, scope, job_id, workspace_id, project, stage,
+                 (title or "")[:200], text, decided_by, origin_author,
+                 links or "[]", (ref or "").strip(), now, now, decided_by),
+            )
+            if cur.rowcount == 0:
+                return None  # deduped by (source, ref)
+            did = cur.lastrowid
+            if status == "active":
+                self._fts_upsert(c, "decision", f"d{did}", project=project,
+                                 workspace_id=workspace_id, scope=scope,
+                                 job_id=job_id, path=f"decisions/#{did}",
+                                 title=title or f"{scope} decision",
+                                 body=f"{title}\n{text}".strip())
+            return did
+
+    def decision_get(self, decision_id: int) -> dict | None:
+        with self._conn() as c:
+            row = c.execute("SELECT * FROM decisions WHERE id = ?",
+                            (int(decision_id),)).fetchone()
+            return dict(row) if row else None
+
+    DECISION_EDIT_FIELDS = ("scope", "title", "text", "links", "decided_by",
+                            "project", "stage")
+
+    def decision_set_status(self, decision_id: int, from_statuses: list[str],
+                            to_status: str, updated_by: str, **fields) -> bool:
+        """CAS on status — the single-writer guard for confirm/dismiss/
+        supersede races (one UPDATE, WHERE status IN (...)). Returns True iff
+        this caller won. Syncs the FTS row: delete on leaving 'active',
+        insert on entering it. Extra fields (confirm-with-edits) are
+        whitelisted; callers validate values first."""
+        fields = {k: v for k, v in fields.items() if k in self.DECISION_EDIT_FIELDS}
+        if "text" in fields:
+            fields["text"] = str(fields["text"] or "")[:DECISION_TEXT_MAX]
+        if "title" in fields:
+            fields["title"] = str(fields["title"] or "")[:200]
+        if "links" in fields and isinstance(fields["links"], (list, tuple)):
+            fields["links"] = json.dumps([str(l) for l in fields["links"]])
+        marks = ",".join("?" for _ in from_statuses)
+        cols = "".join(f", {k} = ?" for k in fields)
+        with self._conn() as c:
+            cur = c.execute(
+                f"UPDATE decisions SET status = ?, updated_at = ?, updated_by = ?"
+                f"{cols} WHERE id = ? AND status IN ({marks})",
+                (to_status, time.time(), updated_by, *fields.values(),
+                 int(decision_id), *from_statuses),
+            )
+            if cur.rowcount != 1:
+                return False
+            row = c.execute("SELECT * FROM decisions WHERE id = ?",
+                            (int(decision_id),)).fetchone()
+            if to_status == "active" and row:
+                self._fts_upsert(c, "decision", f"d{decision_id}",
+                                 project=row["project"],
+                                 workspace_id=row["workspace_id"],
+                                 scope=row["scope"], job_id=row["job_id"],
+                                 path=f"decisions/#{decision_id}",
+                                 title=row["title"] or f"{row['scope']} decision",
+                                 body=f"{row['title']}\n{row['text']}".strip())
+            else:
+                self._fts_delete(c, "decision", f"d{decision_id}")
+            return True
+
+    @staticmethod
+    def _like_escape(q: str) -> str:
+        return (q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_"))
+
+    def decisions_query(self, *, q: str = "", scope: str = "", status: str = "",
+                        project: str = "", source: str = "",
+                        workspace_ids: list[int] | None = None,
+                        limit: int = 100, offset: int = 0) -> list[dict]:
+        """Registry view. workspace_ids=None = admin (all rows); a list =
+        member visibility — EXACTLY the prompt-admission predicate: rows of
+        the member's workspaces plus scope='org' rows (which reach every
+        member's prompts, so every member may see and read them); [] = org
+        rows only. Default status view excludes candidates AND dismissed
+        (inbox material / remembered rejections, not registry truth).
+        q is a LIKE filter with %/_ escaped (user-supplied search text) —
+        deliberately not FTS: the index excludes non-active rows, and a
+        status-filtered registry search must not depend on it."""
+        where, params = [], []
+        if scope:
+            where.append("scope = ?"); params.append(scope)
+        if status:
+            where.append("status = ?"); params.append(status)
+        else:
+            where.append("status IN ('active', 'superseded')")
+        if project:
+            where.append("project = ?"); params.append(project)
+        if source:
+            where.append("source = ?"); params.append(source)
+        if workspace_ids is not None:
+            if workspace_ids:
+                marks = ",".join("?" for _ in workspace_ids)
+                where.append(f"(scope = 'org' OR workspace_id IN ({marks}))")
+                params.extend(int(w) for w in workspace_ids)
+            else:
+                where.append("scope = 'org'")
+        if q.strip():
+            esc = f"%{self._like_escape(q.strip())}%"
+            where.append("(title LIKE ? ESCAPE '\\' OR text LIKE ? ESCAPE '\\')")
+            params.extend([esc, esc])
+        clause = " AND ".join(where) if where else "1=1"
+        with self._conn() as c:
+            rows = c.execute(
+                f"SELECT * FROM decisions WHERE {clause} "
+                f"ORDER BY id DESC LIMIT ? OFFSET ?",
+                (*params, int(limit), int(offset))).fetchall()
+            return [dict(r) for r in rows]
+
+    def decisions_for_job(self, job_id: str) -> list[dict]:
+        """This feature's own ACTIVE decisions — the P9 registry feed.
+        Superseded rows (incl. a re-intaken lap's, cleared by
+        _clear_pipeline_state) never resurface here."""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM decisions WHERE job_id = ? AND status = 'active' "
+                "ORDER BY id", (job_id,)).fetchall()
+            return [dict(r) for r in rows]
+
+    def decisions_recent_scoped(self, workspace_id: int, scopes: tuple,
+                                limit: int = 10) -> list[dict]:
+        """Recent active decisions for a prompt: org-scope rows are admitted
+        regardless of workspace_id; every other scope requires an exact
+        workspace match (callers skip this entirely when the job has no
+        stamped workspace — fail closed)."""
+        marks = ",".join("?" for _ in scopes)
+        with self._conn() as c:
+            rows = c.execute(
+                f"""SELECT * FROM decisions
+                    WHERE status = 'active' AND scope IN ({marks})
+                      AND (scope = 'org' OR workspace_id = ?)
+                    ORDER BY id DESC LIMIT ?""",
+                (*scopes, int(workspace_id), int(limit))).fetchall()
+            return [dict(r) for r in rows]
+
+    def decision_candidates(self, workspace_ids: list[int] | None,
+                            limit: int = 50) -> list[dict]:
+        """Parked Slack candidates for the inbox — oldest first, membership-
+        scoped (None = admin/all; [] = none: candidates are always workspace-
+        routed, so there is no org admission here)."""
+        with self._conn() as c:
+            if workspace_ids is None:
+                rows = c.execute(
+                    "SELECT * FROM decisions WHERE status = 'candidate' "
+                    "ORDER BY id LIMIT ?", (int(limit),)).fetchall()
+            elif not workspace_ids:
+                rows = []
+            else:
+                marks = ",".join("?" for _ in workspace_ids)
+                rows = c.execute(
+                    f"SELECT * FROM decisions WHERE status = 'candidate' "
+                    f"AND workspace_id IN ({marks}) ORDER BY id LIMIT ?",
+                    (*[int(w) for w in workspace_ids], int(limit))).fetchall()
+            return [dict(r) for r in rows]
+
+    # ---------- Slack ingest cursors (Epic D3) ----------
+
+    def slack_cursor_get(self, channel: str) -> str | None:
+        """The channel's watermark, or None when the channel was never
+        initialized (the loop initializes to NOW and skips — forward-only)."""
+        with self._conn() as c:
+            row = c.execute("SELECT last_ts FROM slack_cursors WHERE channel = ?",
+                            (channel,)).fetchone()
+            return row["last_ts"] if row else None
+
+    def slack_cursor_set(self, channel: str, ts: str):
+        with self._conn() as c:
+            c.execute(
+                """INSERT INTO slack_cursors (channel, last_ts, updated_at)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(channel) DO UPDATE SET
+                     last_ts = excluded.last_ts, updated_at = excluded.updated_at""",
+                (channel, str(ts), time.time()))
+
+    def slack_cursor_init(self, channel: str, ts: str):
+        """First-allowlist initialization: INSERT OR IGNORE — an existing
+        watermark (channel re-added) is never moved."""
+        with self._conn() as c:
+            c.execute(
+                "INSERT OR IGNORE INTO slack_cursors (channel, last_ts, updated_at) "
+                "VALUES (?, ?, ?)", (channel, str(ts), time.time()))
 
     # ---------- gate events (Epic A: audit substrate + idempotence store) ----------
     # NOT guidance_log: guidance renders into stage prompts, and refusals /
@@ -980,6 +1383,23 @@ class JobStore:
                 (job_id, artifact, merged["subtask_id"], merged["synced_hash"],
                  merged["flags"], merged["content"]),
             )
+            # Epic D4: the index refreshes on every artifact write — and drops
+            # rows the engine itself banners SUPERSEDED ("will be regenerated;
+            # edits ignored") the moment the flag lands. Both artifact write
+            # paths (commit_file + the human-edit pull) funnel through here.
+            if self.fts_enabled and ("content" in fields or "flags" in fields):
+                if "superseded" in (merged["flags"] or ""):
+                    self._fts_delete(c, "artifact", f"{job_id}/{artifact}")
+                elif (merged["content"] or "").strip():
+                    row = c.execute(
+                        "SELECT project, workspace_id FROM jobs WHERE issue_id = ?",
+                        (job_id,)).fetchone()
+                    self._fts_upsert(
+                        c, "artifact", f"{job_id}/{artifact}",
+                        project=(row["project"] if row else "") or "",
+                        workspace_id=row["workspace_id"] if row else None,
+                        job_id=job_id, path=f"features/{job_id}/{artifact}",
+                        title=artifact, body=merged["content"])
 
     def artifact_content_set(self, job_id: str, artifact: str, content: str):
         """Cache the artifact body for the fast-lane chat bundle (truncated)."""
@@ -1016,11 +1436,24 @@ class JobStore:
         with self._conn() as c:
             self._clear_pipeline_state(c, job_id)
 
-    @staticmethod
-    def _clear_pipeline_state(c, job_id: str):
+    def _clear_pipeline_state(self, c, job_id: str):
+        """Runs on the CALLER's open connection so the whole reset commits
+        atomically. The same fail-closed rationale that clears guidance_log
+        extends to Epic D: the dead lap's registry rows are superseded (never
+        re-injected into the new lap's P9 as registry truth) and its FTS
+        guidance/artifact/decision rows are purged in the SAME transaction —
+        a dead pipeline's text must not haunt retrieval."""
         c.execute("DELETE FROM artifact_state WHERE job_id = ?", (job_id,))
         c.execute("DELETE FROM stage_state WHERE job_id = ?", (job_id,))
         c.execute("DELETE FROM guidance_log WHERE job_id = ?", (job_id,))
+        c.execute(
+            "UPDATE decisions SET status = 'superseded', updated_at = ?, "
+            "updated_by = 'engine:reintake' WHERE job_id = ? AND status = 'active'",
+            (time.time(), job_id))
+        if self.fts_enabled:
+            c.execute("DELETE FROM mem_fts WHERE kind IN "
+                      "('guidance', 'artifact', 'decision') AND job_id = ?",
+                      (job_id,))
 
     def feature_intake(self, job_id: str, title: str, project: str, **fields):
         """Atomic feature (re-)intake: child-state clears + row upsert + pipeline

@@ -244,7 +244,9 @@ P8-review.md. If it is absent, record `INSTRUMENTATION MISSING: <what>` in the
 artifact and raise it in `## Questions` — do not silently pass the review.""",
     9: """Ship: (1) Memory distillation — add `{ns}/memory/changelog/<YYYY-MM-DD>-{job_id}.md`
 (what shipped, PR link), one `{ns}/memory/decisions/<YYYY-MM-DD>-<slug>.md` per
-significant decision made at the gates (read `{ns}/features/{job_id}/guidance.md`),
+significant decision made at the gates (read `{ns}/features/{job_id}/guidance.md`,
+and distill ADRs from the `## Decision registry` entries above AS WELL AS
+guidance.md when that block is present),
 and update any `{ns}/memory/architecture.md` / `map.md` sections this feature
 changed{product_scope_note}. (2) Finalize the PR body: link the ticket, summarize
 per-stage outcomes, test results, and human decisions. (3) Commit, push. Write
@@ -269,6 +271,8 @@ def build_stage_prompt(*, target: RepoTarget, branch: str, job: dict, stage: int
                        product_name: str = DEFAULT_PRODUCT_NAME,
                        business_context: str = "",
                        people_block: str = "",
+                       decisions_block: str = "",
+                       memory_search: str = "",
                        ns: str = ENGINE_DIR) -> str:
     job_id = job["issue_id"]
     kind = stage_kind(stage)
@@ -310,9 +314,14 @@ binding:
 
     # org context (Epic D1), between the memory block and the artifacts block
     people_section = f"\n\n{people_block.strip()}" if people_block.strip() else ""
+    # FTS retrieval snippets (Epic D4), directly after the memory block
+    search_section = f"\n\n{memory_search.strip()}" if memory_search.strip() else ""
+    # decision registry (Epic D2), next to the guidance block (P9 only today)
+    decisions_section = (f"\n\n{decisions_block.strip()}"
+                         if decisions_block.strip() else "")
 
-    return f"""{_header(target, branch, job, stage, product_name, business_context)}{_memory_block(memory_context, ns)}{people_section}\
-{_artifacts_block(artifact_names, job_id, inline_artifacts, ns)}{_guidance_block(guidance_entries, stage)}{redo_block}{test_block}
+    return f"""{_header(target, branch, job, stage, product_name, business_context)}{_memory_block(memory_context, ns)}{search_section}{people_section}\
+{_artifacts_block(artifact_names, job_id, inline_artifacts, ns)}{_guidance_block(guidance_entries, stage)}{decisions_section}{redo_block}{test_block}
 
 {task_header}
 

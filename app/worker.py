@@ -774,6 +774,27 @@ class Worker:
         await self.clickup.field_append(task_id, "Decisions",
                                         f"P{stage}{label}: {text[:400]}")
 
+    def _register_decision(self, job: dict, stage: int | None, title: str,
+                           text: str, via: str, *, gid: int,
+                           scope: str = "job", job_id: str | None = None):
+        """Epic D2: auto-register a SUBSTANTIVE gate answer (non-empty text —
+        the same emptiness guard as _sync_decision_field) into the decision
+        registry, ref='g<guidance id>' so any replay dedupes. Best-effort:
+        a registry hiccup must never break a won gate transition."""
+        if not (text or "").strip():
+            return
+        links = [job["clickup_task_url"]] if job.get("clickup_task_url") else []
+        try:
+            self.store.decision_add(
+                "gate", text.strip(), ref=f"g{gid}", scope=scope,
+                job_id=job_id if job_id is not None else job["issue_id"],
+                workspace_id=job.get("workspace_id"),
+                project=job.get("project") or "", stage=stage,
+                title=title, decided_by=via, links=links)
+        except Exception:
+            log.exception("decision auto-registration failed for %s (non-fatal)",
+                          job.get("issue_id"))
+
     def _owner_guard(self, job: dict, actor: dict | None,
                      override: bool) -> tuple["roles.GateOwner | None", bool]:
         """Role-exclusive enforcement shared by feature gates AND the watch
@@ -847,8 +868,10 @@ class Worker:
                                          resume_head="", resume_answer="", ask_count=0,
                                          auto_retries=0):
                 raise GateConflict("already answered")
-            self.store.guidance_add(job_id, target_stage, "redo", text, via,
-                                    job.get("parked_head") or "")
+            gid = self.store.guidance_add(job_id, target_stage, "redo", text, via,
+                                          job.get("parked_head") or "")
+            self._register_decision(job, target_stage, f"P{target_stage} redo",
+                                    text, via, gid=gid)
             self.store.stage_run_gate_answered(job_id, stage, "redo")
             await self._sync_decision_field(task_id, target_stage, " (redo)", text)
             if (self.settings.clickup_field_sync_enabled and text and task_id
@@ -879,8 +902,9 @@ class Worker:
                                          expected_stage=stage,
                                          question="", resume_answer=answer):
                 raise GateConflict("already answered")
-            self.store.guidance_add(job_id, stage, "answer", answer, via,
-                                    job.get("parked_head") or "")
+            gid = self.store.guidance_add(job_id, stage, "answer", answer, via,
+                                          job.get("parked_head") or "")
+            self._register_decision(job, stage, f"P{stage} answer", text, via, gid=gid)
             self.store.stage_run_gate_answered(job_id, stage, "answer")
             self._distill_chat(job, stage)
             await self._sync_decision_field(task_id, stage, " (ask)", text)
@@ -898,8 +922,9 @@ class Worker:
                                          expected_stage=stage, question="",
                                          detail="pipeline complete — P9 approved"):
                 raise GateConflict("already answered")
-            self.store.guidance_add(job_id, stage, "proceed", guidance, via,
-                                    job.get("parked_head") or "")
+            gid = self.store.guidance_add(job_id, stage, "proceed", guidance, via,
+                                          job.get("parked_head") or "")
+            self._register_decision(job, stage, f"P{stage} proceed", text, via, gid=gid)
             self.store.stage_run_gate_answered(job_id, stage, "proceed")
             await self._sync_decision_field(task_id, stage, "", text)
             await self.clickup.comment(
@@ -924,8 +949,9 @@ class Worker:
                                      stage=stage + 1, stage_attempts=0, question="",
                                      ask_count=0):
             raise GateConflict("already answered")
-        self.store.guidance_add(job_id, stage, "proceed", guidance, via,
-                                job.get("parked_head") or "")
+        gid = self.store.guidance_add(job_id, stage, "proceed", guidance, via,
+                                      job.get("parked_head") or "")
+        self._register_decision(job, stage, f"P{stage} proceed", text, via, gid=gid)
         self.store.stage_run_gate_answered(job_id, stage, "proceed")
         self._distill_chat(job, stage)
         await self._sync_decision_field(task_id, stage, "", text)
@@ -1249,7 +1275,16 @@ class Worker:
                                      question="", detail="outcome recorded"):
             raise GateConflict("already answered")
         self.store.outcome_set(job_id, learning=text, decided_by=via, decided_at=now)
-        self.store.guidance_add(job_id, None, "proceed", text, via)
+        gid = self.store.guidance_add(job_id, None, "proceed", text, via)
+        # Epic D2: the Iterate learning is the measured-reality decision the
+        # next lap starts from — registered scope='product' against the
+        # FEATURE id, ref='g<gid>' (the proceed guidance row) so any replay
+        # dedupes instead of duplicating.
+        feature_id = (job.get("related_jobs") or "").split(",")[0].strip()
+        feature_title = (job.get("title") or job_id).removeprefix("watch: ")
+        self._register_decision(job, None, f"Outcome: {feature_title}"[:200],
+                                text, via, gid=gid, scope="product",
+                                job_id=feature_id)
         await self.clickup.comment(
             task_id, f"{GATE_PREFIX} Outcome recorded (via {via})."
                      + (f" Learning: {text[:400]}" if text else ""))
@@ -1646,6 +1681,110 @@ class Worker:
         await self.clickup.comment(
             task_id, f"{GATE_PREFIX} 📥 adopted as a {adopted_as}. ({decision})")
         log.info("clickup intake: %s %s from ticket %s (%s)", kind, job_id, task_id, decision)
+
+    async def slack_ingest_forever(self):
+        """Epic D3 (FLAG, off by default): poll allowlisted Slack channels for
+        decision-shaped messages and park them as registry CANDIDATES — inbox
+        items for human confirmation, never auto-committed, no job state ever
+        touched. Plain worker loop today (sla_forever shape) so Epic I1's
+        routine engine can adopt it as a routine kind without rework."""
+        if not (self.settings.slack_ingest_enabled and self.settings.slack_bot_token):
+            log.info("slack ingestion disabled (flag off or no bot token)")
+            return
+        while True:
+            await asyncio.sleep(self.settings.slack_ingest_interval_seconds)
+            try:
+                await self._slack_ingest_once()
+            except Exception:
+                log.exception("slack ingest pass failed")
+
+    def _slack_reader(self, transport=None):
+        from .slack_ingest import SlackReader
+
+        return SlackReader(self.settings, transport=transport)
+
+    async def _slack_ingest_once(self, transport=None):
+        """One ingest pass. Per-channel isolation: one bad channel never
+        starves the rest. Everything best-effort + logged."""
+        if not (self.settings.slack_ingest_enabled and self.settings.slack_bot_token):
+            return
+        if not self.workspaces:
+            return
+        reader = self._slack_reader(transport=transport)
+        for ws in self.store.workspace_list():
+            channels = self.workspaces.slack_channels_of(ws)
+            for channel in channels:
+                try:
+                    await self._slack_ingest_channel(reader, ws, channel)
+                except Exception:
+                    log.exception("slack ingest failed for channel %s", channel)
+
+    async def _slack_ingest_channel(self, reader, ws: dict, channel: str):
+        from . import slack_ingest
+
+        cursor = self.store.slack_cursor_get(channel)
+        if cursor is None:
+            # never initialized (hand-edited row / pre-init channel): start
+            # NOW and ingest forward only — no historical candidate flood
+            self.store.slack_cursor_set(channel, f"{time.time():.6f}")
+            return
+        # bounded overlap re-scan so late reactions on recent messages are
+        # seen (conversations.history keys on ORIGINAL ts); the (source, ref)
+        # dedupe absorbs the re-reads. Reactions older than the overlap are a
+        # documented limit.
+        oldest = f"{max(0.0, float(cursor) - slack_ingest.RESCAN_OVERLAP_SECONDS):.6f}"
+        messages: list[dict] = []
+        page_cursor = ""
+        for _ in range(slack_ingest.MAX_PAGES_PER_PASS):
+            page = await reader.history(channel, oldest, cursor=page_cursor)
+            if page["status"] != "ok":
+                # a failed page aborts THIS channel without advancing the
+                # watermark — a partial fetch must never skip messages
+                log.warning("slack history failed for %s: %s", channel,
+                            page.get("detail") or "")
+                return
+            messages.extend(page["messages"])
+            if not (page["has_more"] and page["next_cursor"]):
+                break
+            page_cursor = page["next_cursor"]
+        else:
+            # pagination bound hit with more remaining: process what we have
+            # but do NOT advance past it — the next pass continues
+            log.warning("slack channel %s: pagination bound hit; continuing "
+                        "next pass", channel)
+        emoji = self.settings.slack_decision_emoji
+        max_ts = float(cursor)
+        for msg in messages:
+            ts = str(msg.get("ts") or "")
+            if not ts:
+                continue
+            if slack_ingest.is_decision_shaped(msg, emoji):
+                fields = slack_ingest.candidate_fields(msg)
+                if not fields["text"]:
+                    continue
+                link = await reader.permalink(channel, ts)
+                try:
+                    did = self.store.decision_add(
+                        "slack", fields["text"], ref=f"{channel}:{ts}",
+                        status="candidate", scope="product",
+                        workspace_id=ws["id"], title=fields["title"],
+                        decided_by=fields["decided_by"],
+                        origin_author=fields["decided_by"],
+                        links=[link] if link else [])
+                    if did is not None:
+                        log.info("slack candidate #%s from %s (%s)", did,
+                                 channel, ts)
+                except ValueError:
+                    pass  # empty text — guarded above, belt and braces
+            try:
+                max_ts = max(max_ts, float(ts))
+            except ValueError:
+                continue
+        # advance the watermark ONLY after the whole batch committed (a crash
+        # re-fetches; the dedupe absorbs). Dismissed candidates stay dismissed:
+        # their (source, ref) row is kept, so a re-scan can never re-create one.
+        if max_ts > float(cursor):
+            self.store.slack_cursor_set(channel, f"{max_ts:.6f}")
 
     async def autonomy_forever(self):
         """Nightly autonomy scorer (Epic C1, docs/ENGINE.md §15). The flag is
