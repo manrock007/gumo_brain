@@ -207,6 +207,86 @@ def routine_tz(settings: Settings):
         return ZoneInfo("UTC")
 
 
+# ---------- I3: memory upkeep (staleness acts, bounded, budget-aware) ----------
+
+
+async def _handle_memory_upkeep(ctx: RoutineContext):
+    """When a repo's cached staleness crosses the threshold, auto-queue the
+    EXISTING memory job kind (two-run bootstrap → draft PR → parks for human
+    review — git stays truth). The ONE sanctioned queue interaction of any
+    routine. No git/clone work here: staleness comes from the cache the
+    engine refreshes after every stage run — an engine-idle repo's staleness
+    is FROZEN (under-fires, the safe direction; documented in ENGINE.md §17)."""
+    from .memory import MemoryReader  # lazy: keeps module import light
+
+    ws = ctx.workspace
+    if ws is None:
+        return "skipped", "workspace row missing", 0
+    threshold = int(ctx.config.get("staleness_threshold")
+                    or ctx.settings.memory_staleness_threshold or 0)
+    if threshold <= 0:
+        return ("skipped", "inert: staleness threshold 0 (opt-in via "
+                "MEMORY_STALENESS_THRESHOLD or the routine config)", 0)
+    reader = MemoryReader(ctx.settings)
+    cooldown = ctx.settings.memory_upkeep_cooldown_days * 86400
+    iso_week = datetime.fromtimestamp(ctx.now, routine_tz(ctx.settings)).strftime("%G-W%V")
+    month_start = digests.month_start(ctx.now)
+    budget = digests.effective_budget(ws, ctx.settings)
+    emitted = queued = 0
+    notes: list[str] = []
+    for repo in ctx.store.workspace_repos_for(ws["id"]):
+        slug = repo["slug"]
+        cached = reader.cached(slug) or {}
+        meta = cached.get("meta") or {}  # .get chains: {'exists': False} has no meta
+        if not cached.get("exists"):
+            if ctx.store.inbox_item_add(
+                    "routine_note", f"nocache:{slug}",
+                    f"no memory cache for {slug}",
+                    body=f"Memory upkeep cannot judge `{slug}`: no cached memory "
+                         "exists yet. Run a manual bootstrap (Product brain → "
+                         "bootstrap) to seed it.",
+                    refs={"project": slug}, workspace_id=ws["id"],
+                    source="memory_upkeep"):
+                emitted += 1
+            notes.append(f"{slug}: no cache")
+            continue
+        staleness = meta.get("staleness_commits")
+        if staleness is None or int(staleness) < threshold:
+            continue
+        fetched_age_d = int((ctx.now - float(meta.get("fetched_at") or ctx.now)) // 86400)
+        mem = ctx.store.get(f"mem-{slug}")
+        if mem and (mem.get("status") in ACTIVE_JOB_STATUSES
+                    or float(mem.get("updated_at") or 0) > ctx.now - cooldown):
+            # one per repo per cooldown window — human-triggered bootstraps
+            # count toward the bound (the work happened)
+            notes.append(f"{slug}: within the {ctx.settings.memory_upkeep_cooldown_days}d bound")
+            continue
+        if ctx.store.runs_today() >= ctx.settings.max_runs_per_day:
+            notes.append(f"{slug}: daily run cap reached — skipped")
+            continue
+        if budget > 0 and ctx.store.costs_since(month_start).get(ws["id"], 0.0) >= budget:
+            notes.append(f"{slug}: monthly budget spent — skipped")
+            continue
+        decision = ctx.worker.intake_memory(slug, source="routine")
+        if "queued" not in decision:
+            notes.append(f"{slug}: {decision}")
+            continue
+        queued += 1
+        if ctx.store.inbox_item_add(
+                "routine_note", f"memup:{slug}:{iso_week}",
+                f"memory refresh queued for {slug} ({staleness} commits stale)",
+                body=f"Staleness {staleness} ≥ threshold {threshold} (cache "
+                     f"last refreshed {fetched_age_d}d ago). The bootstrap "
+                     "parks a draft PR for human review like any other.",
+                refs={"project": slug, "job_id": f"mem-{slug}"},
+                workspace_id=ws["id"], source="memory_upkeep"):
+            emitted += 1
+    if queued:
+        return "ok", f"queued {queued} refresh(es); " + "; ".join(notes), emitted
+    status = "skipped" if notes else "quiet"
+    return status, "; ".join(notes) or "all repos fresh", emitted
+
+
 # ---------- I2: the daily standup digest ----------
 
 
@@ -248,6 +328,7 @@ REGISTRY: dict = {
     "reaper": _handle_reaper,
     "janitor": _handle_janitor,
     "standup_digest": _handle_standup,
+    "memory_upkeep": _handle_memory_upkeep,
 }
 
 

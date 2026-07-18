@@ -299,12 +299,14 @@ class Worker:
         self._enqueue(job_id, PRIO_HUMAN)
         return f"feature {job_id} queued at P0"
 
-    def intake_memory(self, project: str) -> str:
+    def intake_memory(self, project: str, source: str = "manual") -> str:
+        """source='routine' records upkeep-queued bootstraps' provenance
+        (Epic I3); grading/caps are unaffected — memory jobs bypass grading."""
         job_id = f"mem-{project}"
         existing = self.store.get(job_id)
         if existing and existing["status"] in ACTIVE_STATUSES:
             return f"memory bootstrap for {project} already in progress ({existing['status']})"
-        self.store.insert(job_id, source="manual", forced=True,
+        self.store.insert(job_id, source=source, forced=True,
                           title=f"memory bootstrap: {project}", project=project, kind="memory")
         self._stamp_workspace(job_id, project)
         self._enqueue(job_id, PRIO_HUMAN)
