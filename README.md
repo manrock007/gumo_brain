@@ -70,11 +70,20 @@ Also runs a periodic **sweep** that grades the top unresolved Sentry issues of t
 
 ## Endpoints
 
-All `api/*` and `/` require a signed-in user (cookie session via `/login`, or
-per-user HTTP Basic for automation — docs/ENGINE.md §11); `/health`, `/login`,
-static assets and the webhook are open. Roles: admin (configuration + users)
-and member (submits work, answers gates). See MIGRATION-CTRLLOOP.md for the
-rename/infra checklist.
+All `api/*` and `/` require a signed-in user (cookie session via `/login`, an
+API token `Authorization: Bearer ctl_…`, or per-user HTTP Basic for automation
+— docs/ENGINE.md §11, §18). OIDC SSO is optional (`GET /api/auth/providers`,
+`/login/oidc`); `/health`, `/login`, static assets, `/api/auth/providers` and
+the webhook are open. Roles (RBAC v2, Epic E3): `instance_admin` / workspace
+`admin` / `member` / `viewer` (read-only) with an optional per-member repo
+restriction. See MIGRATION-CTRLLOOP.md for the rename/infra checklist.
+
+- `POST /api/tokens` / `GET /api/tokens` / `DELETE /api/tokens/{id}` — scoped
+  API tokens (ctl_ prefix, shown once; Bearer auth; Basic deprecated once
+  tokened). Admins: `/api/users/{u}/tokens`.
+- `GET /api/audit` / `GET /api/audit/export` — the append-only audit log viewer
+  and the SIEM JSONL cursor-paged export (Epic E4).
+- `GET /api/budgets` — per-workspace spend vs budget (Epic G4).
 
 - `GET /` — dashboard: intake (Sentry fix / request / **feature pipeline**), queue
   columns with inline gate answering (Proceed / Redo / Skip), feature **stage strips**

@@ -1151,3 +1151,74 @@ do next lap" ranking (regressed outcomes → risk-linked clusters → friction
 count desc → age), with the formula stated in the pack body (the §15
 transparency posture). Carried by `GET /api/inbox` — no bespoke endpoint
 (deliberate). ISO-week deduped; predecessor packs expire on the new insert.
+
+## 18. Identity, RBAC & audit (Epic E) + credentials & security (Epic G)
+
+**SSO / identity (E1).** Authentication resolves through an
+`IdentityProvider` interface (`app/identity.py`). `LocalProvider` (password) is
+always present — the break-glass path; a local account with a usable password
+can always sign in regardless of SSO state or active tokens. `OIDCProvider`
+(BUILD) does the authorization-code flow via discovery, validating the
+id_token's nonce/aud/exp/iss; state+nonce live single-use in `auth_oidc_txn`.
+JIT provisioning auto-links ONLY on the IdP-stable `sub` (`users.external_id`,
+partial-unique per provider) — an email/username collision with a LOCAL account
+raises `SSOConflict` and never adopts it (protecting the admin's break-glass
+password). Role-sync never demotes a local-provider admin nor the last enabled
+instance admin. SAML/SCIM are inert scaffolds behind the same interface.
+
+**API tokens (E2).** `api_tokens` (ctl_ prefix, sha256 at rest, non-secret
+`ctl_…<last4>` hint, scopes, expiry, revoke, throttled last-used). Auth
+precedence: `Bearer ctl_` token (hard 401 on miss, never falls through) > Basic
+password (deprecated to 403 once the account has an active token, except
+break-glass instance admins) > cookie. SSO-only accounts carry an `UNUSABLE_PW`
+sentinel and cannot password-auth.
+
+**RBAC v2 (E3).** Instance role `instance_admin|member` on `users.role`;
+workspace role `admin|member|viewer` + a per-member repo allow-list on
+`workspace_members`. `app/rbac.py` centralizes the scoped checks
+(`workspace_role`, `can_configure_workspace`, `can_submit`/`repo_allowed`,
+`require_write`). Legacy `admin` is migrated on boot and normalized on read
+(`normalize_role`); the last instance admin can never be demoted. The gate
+admin-override is now a workspace-admin power (via `can_configure_workspace`).
+
+**Audit log (E4).** `audit_log` is the canonical append-only record (monotonic
+`id` = SIEM cursor). `admin_events` is superseded — `admin_event_add` mirrors
+into `audit_log` and legacy rows are boot-copied once (durable
+`audit_legacy_copied` marker, not table-emptiness). Gate decisions are audited
+at the single `answer_job` choke point both channels funnel through (fires only
+after a won CAS), with verdict/stage/channel/actor/state; overrides, logins,
+config/user/token/autonomy mutations too. `detail` is redacted by an allow-list
+inside `audit_add` so no call site can leak a secret. `GET /api/audit` (viewer,
+membership-scoped) and `GET /api/audit/export` (JSONL cursor pages,
+`X-Next-Cursor`) surface it.
+
+**GitHub App (G1).** `app/githubapp.py` mints a short-lived, single-repo
+installation token per run (RS256 app JWT, cached with early refresh); the run
+subprocess gets ONLY that token via `GH_TOKEN`, never the PAT or the private
+key. Any app error falls back to the PAT (`github_token`) — additive, never a
+hard replacement.
+
+**Secrets & subprocess env (G2).** `app/secrets.py` — `SecretsProvider` seam
+(env default, file driver, vault scaffold) + `read_secret` (`@path` support).
+The security core: `fixer._claude_cmd_env` builds an explicit allow-listed
+environment (plumbing + model-auth incl. Bedrock/Vertex + gh/git families),
+replacing `os.environ.copy()`, so operator secrets never reach the model's
+shell; `SUBPROCESS_ENV_ALLOWLIST` widens it but a hard-deny secret set can never
+be re-added.
+
+**Prompt-injection hardening (G3).** `app/untrusted.py` `wrap_untrusted` fences
+every untrusted input (Sentry title/culprit/stacktrace, ClickUp request/title,
+PR finding bodies, chat/reviewer text, human gate answers/redo notes) in a
+per-call random-nonce delimited block the model is told to treat as inert DATA,
+stripping forged sentinels; short inline references use `inline_untrusted`
+(whitespace-collapsed + sentinel-stripped). A coverage/property test asserts no
+injected protocol line or forged sentinel escapes a fence.
+
+**Budgets (G4).** `app/budgets.py` resolves the effective budget (ws column >
+instance fallback) and warn/block state; enforced at every Claude-run dispatch
+(sentry/task AND every feature stage — before a run opens, so pipeline state is
+never discarded). Non-forced ≥100% parks + audits `budget.block`; a forced
+override re-kick audits `budget.override`. Budget 0 is inert.
+
+**Model billing (G5).** `using_max_oauth_token` is the policy signal; startup
+warns when personal Max creds run a >1-user instance (flip to `ANTHROPIC_API_KEY`).

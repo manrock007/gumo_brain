@@ -345,6 +345,123 @@ Per-workspace: `budget_monthly_usd` (Settings → Workspaces or
 budget). Slack copies of digests/packs use the workspace's existing
 `slack_webhook_url` — no new secret.
 
+## 12. Identity & SSO (Epic E1)
+
+Local password auth is ALWAYS present and can never be turned off in a way that
+locks the instance out — a local-provider account with a usable password
+(`is_break_glass`) can always sign in. OIDC is additive.
+
+**OIDC setup** (Okta / Entra / Google / any OIDC provider):
+
+| Env var | Default | Meaning |
+| --- | --- | --- |
+| `OIDC_ENABLED` | `false` | master switch. OIDC also needs issuer + client id + secret + redirect (`oidc_configured` fails closed on partial config). |
+| `OIDC_ISSUER` | `""` | e.g. `https://your-org.okta.com` — discovery at `{issuer}/.well-known/openid-configuration`. |
+| `OIDC_CLIENT_ID` / `OIDC_CLIENT_SECRET` | `""` | app credentials. The secret is never returned by any API or logged. |
+| `OIDC_REDIRECT_URL` | `""` | the registered callback, e.g. `https://host/auth/oidc/callback`. |
+| `OIDC_SCOPES` | `openid email profile` | requested scopes. |
+| `OIDC_ROLE_CLAIM` | `""` | the id_token claim carrying group/role membership (e.g. `groups`). |
+| `OIDC_ROLE_MAP` | `{}` | JSON `{claim_value: role}` (`instance_admin`\|`member`\|`viewer`). |
+| `OIDC_ADMIN_GROUP` | `""` | membership in this group → `instance_admin`. |
+| `OIDC_DEFAULT_ROLE` | `member` | role when nothing maps. |
+| `OIDC_ROLE_SYNC` | `true` | re-map role on repeat login (never demotes the last instance admin, never touches a local-provider admin). |
+| `CTRLLOOP_LOCAL_LOGIN` | `true` | `false` only HIDES the password form; break-glass local login still works. |
+
+Login page shows SSO buttons from `GET /api/auth/providers` (public, no
+secrets). JIT provisioning auto-links ONLY on the IdP-stable `sub`
+(`external_id`) — an SSO login whose email/username collides with an existing
+LOCAL account is refused (never adopts/overwrites the local password). SAML and
+SCIM are scaffolds behind the same interface (`SAML_ENABLED` / `SCIM_ENABLED` /
+`SCIM_TOKEN`), inert by default.
+
+## 13. Scoped API tokens (Epic E2)
+
+Per-user tokens for automation, replacing HTTP Basic passwords. `POST
+/api/tokens` returns the `ctl_…` plaintext ONCE; only its sha256 is stored.
+`GET /api/tokens` lists yours (no secret); `DELETE /api/tokens/{id}` revokes;
+instance admins revoke others' via `/api/users/{u}/tokens`. Use it with
+`Authorization: Bearer ctl_…`. Once an account has an active token, HTTP Basic
+password auth is refused (403) for that account — EXCEPT break-glass instance
+admins, so ops can always get in. `API_TOKEN_DEFAULT_TTL_DAYS` (default `0` =
+no expiry) sets the default lifetime.
+
+## 14. RBAC v2 (Epic E3)
+
+Two axes: instance role (`instance_admin` | `member` on `users.role`) and
+workspace role (`admin` | `member` | `viewer` on `workspace_members.role`) plus
+a per-member repo allow-list (`repos`, `[]` = all). Instance admins are admins
+everywhere. Viewers are read-only (GET works, mutations 403). Config mutations
+require the admin role OF THAT SCOPE. Set a member's workspace role/repos via
+`PUT /api/workspaces/{id}/members` (`role`, `repos`). Legacy `admin` rows are
+migrated to `instance_admin` on boot (and normalized on read); the last
+instance admin can never be demoted.
+
+## 15. Audit log (Epic E4)
+
+Append-only `audit_log` covers gate decisions (both channels, with actor),
+admin overrides, logins (password + OIDC), config mutations, user/token
+lifecycle, and autonomy events (it supersedes `admin_events`, which is
+mirrored + boot-copied in). `GET /api/audit` is the dashboard viewer
+(membership-scoped). `GET /api/audit/export?after=<id>&limit=<n>` streams
+cursor-paged JSONL for a SIEM — one JSON object per line, next cursor in the
+`X-Next-Cursor` header (re-fetch with `?after=`). Instance-admin only
+(workspace admins get a membership-scoped export).
+
+| Env var | Default | Meaning |
+| --- | --- | --- |
+| `AUDIT_EXPORT_PAGE_SIZE` | `500` | max rows per export page. |
+| `AUDIT_RETENTION_DAYS` | `0` | `0` = keep forever (the SIEM is the archive); `>0` lets the daily janitor prune older rows. |
+
+## 16. GitHub App (Epic G1)
+
+Additive to the PAT: when configured, the engine mints a short-lived,
+single-repo installation token per run and hands ONLY that token to the
+subprocess (never the PAT, never the private key). A repo the app can't reach,
+or any app error, falls back to the PAT (`github_token`).
+
+| Env var | Default | Meaning |
+| --- | --- | --- |
+| `GITHUB_APP_ID` | `""` | the app id. |
+| `GITHUB_APP_PRIVATE_KEY` | `""` | the RSA private key (PEM or `@/path/to/key.pem` for a mounted file). SECRET — never logged, never in a subprocess env. |
+| `GITHUB_TOKEN` | `""` | the PAT — still the documented fallback; covers repos the app can't. |
+
+## 17. Secrets & subprocess env (Epic G2)
+
+| Env var | Default | Meaning |
+| --- | --- | --- |
+| `SECRETS_PROVIDER` | `env` | `env` (default), `file` (`SECRETS_DIR/<name>` files, Docker/K8s), or `vault` (scaffold → env). Unknown → env. |
+| `SECRETS_DIR` | `""` | base dir for the file provider. |
+| `SUBPROCESS_ENV_ALLOWLIST` | `""` | extra env var NAMES (comma list) to pass through to Claude/git runs, on top of the built-in plumbing + model-auth (incl. Bedrock/Vertex) + gh/git allow-list. A hard-deny secret set can never be re-added here. |
+
+Claude/git subprocesses get an explicitly allow-listed environment — operator
+secrets (Sentry token, dashboard password, OIDC secret, the app private key)
+never reach the model's shell. Startup logs the detected model-auth backend.
+
+## 18. Budgets (Epic G4)
+
+| Env var | Default | Meaning |
+| --- | --- | --- |
+| `BUDGET_MONTHLY_USD` | `0` | instance fallback for the per-workspace budget. `0` = inert. |
+| `BUDGET_WARN_PCT` | `80` | warn at ≥ this % of budget. |
+| `BUDGET_BLOCK_ENABLED` | `true` | block non-forced Claude runs at ≥100%. `false` = warn-only, never blocks. |
+
+Enforced at every Claude-run dispatch (sentry/task AND every feature stage). A
+non-forced run at ≥100% parks (feature pipelines park as `error` preserving
+stage/artifacts/gate answer), emits an inbox item, and audits `budget.block`;
+re-kick with override runs it and audits `budget.override`. `GET /api/budgets`
+powers the spend panel; set a workspace budget via `PATCH /api/workspaces/{id}`.
+
+## 19. Model billing (Max → API) (Epic G5)
+
+The engine runs the same under personal Claude Max OAuth
+(`CLAUDE_CODE_OAUTH_TOKEN`) or API billing (`ANTHROPIC_API_KEY`). **Anthropic
+policy prohibits routing OTHER users' requests through personal Max
+credentials.** Before onboarding a second user, flip to API billing: set
+`ANTHROPIC_API_KEY`, unset `CLAUDE_CODE_OAUTH_TOKEN`, restart. Startup logs the
+detected backend and warns loudly when a Max token is used on an instance with
+>1 enabled user. Stage runs, sessions, and the fast lane all resolve the same
+auth (fast lane prefers `CHAT_API_KEY` → `ANTHROPIC_API_KEY`).
+
 ## Appendix — Example configuration: the original Gumo instance
 
 The values that used to ship as code defaults, now purely this one customer's
