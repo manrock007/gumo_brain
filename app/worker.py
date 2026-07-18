@@ -20,7 +20,7 @@ import time
 import uuid
 from pathlib import Path
 
-from . import analytics, audit, autonomy, budgets, outcome, people, rbac, roles
+from . import analytics, audit, autonomy, budgets, logconfig, outcome, people, rbac, roles
 from .clickup import ClickUp
 from .config import ENGINE_NAME, Settings
 from .db import JobStore
@@ -364,7 +364,9 @@ class Worker:
             job, queued_at = nxt
             job_id = job["issue_id"]
             try:
-                await self._process(job, queued_at)
+                # F4: every log line emitted while this job runs carries its id
+                with logconfig.logctx(job_id=job_id):
+                    await self._process(job, queued_at)
             except Exception as e:
                 log.exception("job %s failed", job_id)
                 self.store.set_status(job_id, "error", detail=str(e)[:2000])

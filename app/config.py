@@ -532,6 +532,14 @@ class Settings(BaseSettings):
     runner_container_network: str = ""
     runner_container_extra_args: str = ""
 
+    # Epic F4: observability. log_format='text' (default) keeps today's exact
+    # log format byte-for-byte; 'json' emits structured lines with request/job
+    # ids. metrics_token empty (default) → /metrics requires instance-admin
+    # auth (never unauthenticated-open — workspace names/costs are sensitive);
+    # set a token → Prometheus authenticates with `Authorization: Bearer <token>`.
+    log_format: str = "text"
+    metrics_token: str = ""
+
     @property
     def multi_worker(self) -> bool:
         """The DB-claim loop + advisory locks engage only on Postgres. SQLite

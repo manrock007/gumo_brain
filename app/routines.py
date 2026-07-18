@@ -618,6 +618,7 @@ class RoutineScheduler:
         self._run_now: set[int] = set()
         self._inflight: set[int] = set()
         self._tasks: set = set()
+        self.last_tick: float = _time.time()  # F4: heartbeat for /health/ready
 
     # -- public --
 
@@ -640,6 +641,7 @@ class RoutineScheduler:
         # belongs to the boot bump + _recover_interrupted, not a dispatch
         # storm in the first event-loop tick. request_run wakes us early.
         while True:
+            self.last_tick = _time.time()  # F4 heartbeat
             try:
                 await asyncio.wait_for(self._wake.wait(),
                                        timeout=self.settings.routine_tick_seconds)

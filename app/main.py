@@ -15,6 +15,7 @@ from fastapi.responses import (
     FileResponse,
     HTMLResponse,
     JSONResponse,
+    PlainTextResponse,
     RedirectResponse,
     StreamingResponse,
 )
@@ -29,6 +30,7 @@ from .auth import (
     issue_session,
     jit_provision,
     require_admin,
+    require_instance_admin,
     require_user,
     revoke_session,
     verify_login,
@@ -46,10 +48,13 @@ from .worker import GateConflict, GateForbidden, Worker
 from .workspaces import WorkspaceError, WorkspaceNotFound, WorkspaceService
 from . import transcripts
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
-log = logging.getLogger("brain")
+from . import logconfig, metrics as metrics_mod
 
 settings = get_settings()
+# Epic F4: LOG_FORMAT=text (default) keeps the historical basicConfig format
+# byte-for-byte; 'json' emits structured lines with request/job ids.
+logconfig.configure_logging(settings)
+log = logging.getLogger("brain")
 
 ISSUE_URL_RE = re.compile(r"/issues/(\d+)")
 SHORT_ID_RE = re.compile(r"^[A-Z][A-Z0-9_-]*-[A-Z0-9]+$")
@@ -165,9 +170,61 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title=ENGINE_NAME, lifespan=lifespan)
 
 
+@app.middleware("http")
+async def _request_id_mw(request: Request, call_next):
+    """Epic F4: correlate every request. Read (or mint) X-Request-ID, bind it to
+    the contextvar for the request's logs, and echo it on the response."""
+    import uuid
+    rid = request.headers.get("X-Request-ID") or uuid.uuid4().hex
+    with logconfig.logctx(request_id=rid):
+        response = await call_next(request)
+    response.headers["X-Request-ID"] = rid
+    return response
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok", "queued": app.state.worker.queue.qsize()}
+
+
+@app.get("/health/ready")
+async def health_ready():
+    """Epic F4: readiness. Hard dependency = DB (503 when down). Worker and
+    scheduler liveness are reported from heartbeats. Never inlines credentials
+    or upstream error bodies — only booleans."""
+    store = app.state.store
+    worker = app.state.worker
+    scheduler = getattr(app.state, "scheduler", None)
+    db_ok = store.ping()
+    now = time.time()
+    # a worker/scheduler is 'alive' if its heartbeat is recent; generous window
+    # so a long-running job (no tick mid-run) isn't flagged unhealthy.
+    worker_ok = bool(worker is not None
+                     and (now - getattr(worker, "last_tick", 0)) < 900)
+    sched_ok = bool(scheduler is not None
+                    and (now - getattr(scheduler, "last_tick", now)) < 900)
+    checks = {"db": db_ok, "worker": worker_ok, "scheduler": sched_ok}
+    ready = db_ok  # DB is the only HARD dependency
+    return JSONResponse({"ready": ready, "checks": checks},
+                        status_code=200 if ready else 503)
+
+
+@app.get("/metrics")
+async def metrics_endpoint(request: Request):
+    """Epic F4: Prometheus text exposition. Auth: metrics_token empty (default)
+    → require instance-admin; a set token → Bearer token match."""
+    token = (app.state.settings.metrics_token or "").strip()
+    if token:
+        auth = request.headers.get("Authorization", "")
+        if auth != f"Bearer {token}":
+            raise HTTPException(status_code=401, detail="metrics token required",
+                                headers={"WWW-Authenticate": "Bearer"})
+    else:
+        require_instance_admin(request)  # admin-gated by default (never open)
+    text = metrics_mod.render_cached(
+        app.state.store, app.state.worker, app.state.settings,
+        getattr(app.state, "workspaces", None))
+    return PlainTextResponse(text, media_type="text/plain; version=0.0.4")
 
 
 # The UI lives in app/static (docs/ENGINE.md §11): index behind auth (browser

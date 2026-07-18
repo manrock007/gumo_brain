@@ -858,6 +858,59 @@ class JobStore:
         """Jobs that must be re-enqueued on startup — SQLite is the queue of record."""
         return self.by_status(["received", "queued"])
 
+    def ping(self) -> bool:
+        """Epic F4: DB reachability probe for /health/ready. Returns True iff a
+        trivial SELECT 1 succeeds; never raises."""
+        try:
+            with self._conn() as c:
+                c.execute("SELECT 1").fetchone()
+            return True
+        except Exception:
+            return False
+
+    def metrics_snapshot(self) -> dict:
+        """Epic F4: read-only aggregations for /metrics, computed at scrape time
+        (metrics.py caches with a small TTL so a scrape can't DoS the DB). Every
+        aggregate degrades to empty on a missing table so a partial schema never
+        breaks the scrape."""
+        snap: dict = {
+            "jobs_by_status_kind": [], "queue_db_depth": 0, "runs_today": 0,
+            "stage_run_cost_usd_total": 0.0, "gate_latency": {},
+            "autonomy_levels": [], "watch_jobs": 0,
+        }
+        with self._conn() as c:
+            def _q(sql, params=()):
+                try:
+                    return c.execute(sql, params).fetchall()
+                except self._driver.OperationalError:
+                    return []
+            for r in _q("SELECT status, kind, COUNT(*) AS n FROM jobs "
+                        "GROUP BY status, kind"):
+                snap["jobs_by_status_kind"].append(
+                    {"status": r["status"], "kind": r["kind"], "n": r["n"]})
+            row = _q("SELECT COUNT(*) AS n FROM jobs WHERE status IN ('received','queued')")
+            snap["queue_db_depth"] = row[0]["n"] if row else 0
+            row = _q("SELECT COUNT(*) AS n FROM jobs WHERE kind='watch' "
+                     "AND status='watching'")
+            snap["watch_jobs"] = row[0]["n"] if row else 0
+            row = _q("SELECT COALESCE(SUM(cost_usd),0) AS s FROM stage_runs")
+            snap["stage_run_cost_usd_total"] = float(row[0]["s"]) if row else 0.0
+            # gate latency summary from answered gates (seconds)
+            row = _q("SELECT COUNT(*) AS n, "
+                     "COALESCE(SUM(gate_answered_at - gate_posted_at),0) AS s "
+                     "FROM stage_runs WHERE gate_posted_at IS NOT NULL "
+                     "AND gate_answered_at IS NOT NULL "
+                     "AND gate_answered_at >= gate_posted_at")
+            if row:
+                snap["gate_latency"] = {"count": row[0]["n"], "sum": float(row[0]["s"])}
+            for r in _q("SELECT workspace_id, project, stage, level "
+                        "FROM autonomy_scores"):
+                snap["autonomy_levels"].append(
+                    {"workspace_id": r["workspace_id"], "project": r["project"],
+                     "stage": r["stage"], "level": r["level"]})
+        snap["runs_today"] = self.runs_today()
+        return snap
+
     def claim_next_job(self, worker_id: str) -> dict | None:
         """Epic F2 (Postgres only): atomically claim the highest-priority
         received/queued job for this worker. ONE statement removes the row from
