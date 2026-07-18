@@ -226,15 +226,23 @@ per-tenant isolation are boring. (XL)
   which is deferred to the very end. The GitHub PAT → GitHub App migration is
   in scope now.
 - **Dual-DRI correction (folds into bet 4)**: the original workflow contract
-  is TWO DRIs (founder + developer). The engine currently flattens them: at
-  ClickUp adoption it takes `assigned dev dri` and uses `assigned founder dri`
-  only as a *fallback when dev is empty*, keeps just the first person, and
-  stores a single `owner` column (`app/worker.py:1016-1019`, `app/db.py:31`);
-  every gate then assigns that one person regardless of stage
-  (`app/engine.py:633-635`). Fix: store both DRIs, type each stage's gate
-  (product vs technical), route product gates (P0/P1 intake-PRD, P9 ship)
-  to the founder DRI and technical gates (P2–P8) to the dev DRI, with the
-  other DRI CC'd and either allowed to answer.
+  is TWO DRIs (founder + developer) with **stage-exclusive ownership** — the
+  product phases (brief/PRD and the post-implementation dogfood/ship gates)
+  belong to the founder/product-owner DRI; the technical phases belong to the
+  dev DRI. The engine currently flattens this: at ClickUp adoption it takes
+  `assigned dev dri` and uses `assigned founder dri` only as a *fallback when
+  dev is empty*, keeps just the first person, and stores a single `owner`
+  column (`app/worker.py:1016-1019`, `app/db.py:31`); every gate then assigns
+  that one person regardless of stage (`app/engine.py:633-635`). Fix: store
+  both DRIs; give every stage a configurable owning role (per-workspace
+  stage→role map; default: P0/P1 founder, P2–P8 dev, P9 founder); **only the
+  owning DRI's decision moves the pipeline** — a `/proceed` from the wrong
+  role is refused (dashboard 403, ClickUp reply explaining who owns the gate),
+  never silently honored. The non-owning DRI can comment and use gate chat,
+  but cannot approve, redo, or skip. This also requires closing the anonymous
+  ClickUp-answer hole first (commenter identity is currently discarded,
+  `app/clickup.py:288`) — role enforcement is meaningless while any ClickUp
+  commenter is accepted unattributed.
 
 ### The sequence in one line
 
