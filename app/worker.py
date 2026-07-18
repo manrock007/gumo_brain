@@ -20,7 +20,7 @@ import time
 import uuid
 from pathlib import Path
 
-from . import analytics, autonomy, outcome, roles
+from . import analytics, autonomy, outcome, people, roles
 from .clickup import ClickUp
 from .config import ENGINE_NAME, Settings
 from .db import JobStore
@@ -220,8 +220,13 @@ class Worker:
         """Enqueue a feature pipeline at P0. Dual DRIs (Epic A2): the legacy
         `owner` column becomes a computed alias at write time. A re-intake
         resets ALL of them from the fresh submission (consistent with the
-        atomic pipeline-reset contract) — resubmitting without DRIs clears
-        previously recorded ones and turns role enforcement off."""
+        atomic pipeline-reset contract). NOTE (Epic D1): with
+        PEOPLE_ROUTING_DEFAULTS on and people profiles covering the repo, an
+        EMPTY slot re-fills from the profiles — resubmitting without DRIs no
+        longer guarantees enforcement turns off; PEOPLE_ROUTING_DEFAULTS=false
+        is the opt-out (ENGINE.md §16). Explicit submitted values always win;
+        the fill is computed BEFORE store.feature_intake so the DRIs land
+        inside the single atomic upsert (never a second write)."""
         existing = self.store.get(job_id)
         if existing:
             if existing["status"] in ACTIVE_STATUSES:
@@ -241,6 +246,16 @@ class Worker:
             metric_window_days = None  # fail closed: never store a nonsense window
         founder_dri = (founder_dri or "").strip()
         dev_dri = (dev_dri or "").strip()
+        # Epic D1: people-profile routing defaults fill ONLY empty slots —
+        # explicit submitted values (dashboard AND ClickUp adoption's people
+        # fields, both funneling here) always win. Guarded for bare-Worker
+        # tests (no workspace service → no membership check → no fill).
+        if (self.settings.people_routing_defaults and self.workspaces
+                and (not founder_dri or not dev_dri)):
+            ws = self.workspaces.for_project(project)
+            d_founder, d_dev = people.default_dris(self.store, ws, project)
+            founder_dri = founder_dri or d_founder
+            dev_dri = dev_dri or d_dev
         owner = (owner or "").strip() or dev_dri or founder_dri  # legacy computed alias
         self.store.feature_intake(
             job_id, title=title, project=project,

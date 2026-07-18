@@ -268,6 +268,7 @@ def build_stage_prompt(*, target: RepoTarget, branch: str, job: dict, stage: int
                        canonical_project: str = "",
                        product_name: str = DEFAULT_PRODUCT_NAME,
                        business_context: str = "",
+                       people_block: str = "",
                        ns: str = ENGINE_DIR) -> str:
     job_id = job["issue_id"]
     kind = stage_kind(stage)
@@ -307,7 +308,10 @@ binding:
 
 {redo_notes}{evidence_note}"""
 
-    return f"""{_header(target, branch, job, stage, product_name, business_context)}{_memory_block(memory_context, ns)}\
+    # org context (Epic D1), between the memory block and the artifacts block
+    people_section = f"\n\n{people_block.strip()}" if people_block.strip() else ""
+
+    return f"""{_header(target, branch, job, stage, product_name, business_context)}{_memory_block(memory_context, ns)}{people_section}\
 {_artifacts_block(artifact_names, job_id, inline_artifacts, ns)}{_guidance_block(guidance_entries, stage)}{redo_block}{test_block}
 
 {task_header}

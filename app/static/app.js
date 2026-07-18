@@ -1386,7 +1386,13 @@ async function loadUsers() {
       // no self-reset: the admin reset ARMS the temp-pw flag (it hands out a
       // new temporary credential) — resetting yourself just loops the forced
       // change forever. Your own password changes live in Account below.
-      return `<tr><td>${name}</td><td>${esc(u.role)}</td><td>${cu}</td><td>${esc(flags)}</td><td>
+      // Epic D1: people profile summary (role · areas · authority tags)
+      const areas = (u.areas || []).map((a) => `${a.kind}:${a.value}`).join(', ');
+      const prof = [u.person_role || '', areas,
+                    (u.authority || []).join(' / ')].filter(Boolean).join(' · ')
+        || '<span class="hint" style="margin:0">no profile</span>';
+      return `<tr><td>${name}</td><td>${esc(u.role)}</td><td>${cu}</td><td>${prof.startsWith('<') ? prof : esc(prof)}</td><td>${esc(flags)}</td><td>
+        <button onclick="editProfile('${esc(u.username)}')">Profile</button>
         <button onclick="linkClickUp('${esc(u.username)}')">${u.clickup_user_id ? 'Edit' : 'Link'} ClickUp id</button>
         ${self ? '<span class="hint" style="margin:0">you &mdash; change your password in Account below</span>'
                : `<button onclick="resetUserPw('${esc(u.username)}')">Reset password</button>
@@ -1395,8 +1401,36 @@ async function loadUsers() {
       </td></tr>`;
     }).join('');
     document.getElementById('users-list').innerHTML =
-      `<table><tr><th>user</th><th>role</th><th>ClickUp id</th><th>flags</th><th></th></tr>${rows}</table>`;
+      `<table><tr><th>user</th><th>role</th><th>ClickUp id</th><th>profile</th><th>flags</th><th></th></tr>${rows}</table>`;
+    USERS_CACHE = users;
   } catch (e) {}
+}
+
+let USERS_CACHE = [];
+
+function editProfile(username) {
+  // Epic D1 people profile: person role, ownership areas, authority tags.
+  // Profiles fill EMPTY DRI slots at intake and render the prompt's
+  // ownership block — they never override explicit DRIs or gate enforcement.
+  const u = USERS_CACHE.find((x) => x.username === username) || {};
+  const role = prompt('Person role for ' + username
+    + ' (founder / product / dev / design; empty = none):', u.person_role || '');
+  if (role === null) return;
+  const areasCur = (u.areas || []).map((a) => `${a.kind}:${a.value}`).join(', ');
+  const areasIn = prompt('Ownership areas — comma-separated kind:value entries '
+    + '(kinds: workspace, repo, area; e.g. "workspace:default, repo:web"):', areasCur);
+  if (areasIn === null) return;
+  const areas = areasIn.split(',').map((s) => s.trim()).filter(Boolean).map((s) => {
+    const i = s.indexOf(':');
+    return { kind: i > 0 ? s.slice(0, i).trim() : 'area',
+             value: i > 0 ? s.slice(i + 1).trim() : s };
+  });
+  const authIn = prompt('Decision-authority tags (comma-separated, e.g. '
+    + '"pricing, api design"):', (u.authority || []).join(', '));
+  if (authIn === null) return;
+  const authority = authIn.split(',').map((s) => s.trim()).filter(Boolean);
+  patchUser(username, { person_role: role.trim(), areas, authority },
+            'Profile updated for ' + username + '.');
 }
 
 async function patchUser(username, body, okMsg) {

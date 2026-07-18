@@ -27,6 +27,7 @@ from .config import (  # noqa: F401 — ENGINE_COMMENT_PREFIXES/GATE_PREFIX re-e
 from .db import JobStore
 from . import autonomy
 from . import fastlane
+from . import people
 from . import roles
 from .feature_prompts import (
     STAGES,
@@ -961,6 +962,15 @@ class Engine:
                            "they are AUTHORITATIVE and newer than anything above: "
                            + ", ".join(f"`{a}`" for a in edited))
 
+        # Epic D1: org-context ownership block — profiles for display, the
+        # JOB's own DRI columns for the gate-authority lines (never contradict
+        # roles.gate_owner). Empty when nothing covers the job.
+        ws = self.workspaces.for_job(job) if self.workspaces else None
+        stage_roles = {str(i): roles.role_for_stage(self.settings, ws, i)
+                       for i in range(10)}
+        people_block = people.ownership_block(
+            self.store, ws, job.get("project") or "", stage_roles, job)
+
         return build_stage_prompt(
             target=target, branch=branch, job=job, stage=stage,
             memory_context=memory_context,
@@ -974,6 +984,7 @@ class Engine:
             canonical_project=(self.workspaces.canonical_for(job.get("project") or "")
                                if self.workspaces else self.settings.memory_canonical_project),
             product_name=pname, business_context=brief,
+            people_block=people_block,
         )
 
     # ---------- workflow-conveyor mirror (ClickUp custom fields; originally the gumo-speed workflow) ----------

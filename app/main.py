@@ -37,7 +37,7 @@ from .feature_prompts import stage_name
 from .fixer import ensure_session_store
 from .memory import MemoryReader
 from .sentry_api import extract_issue_ref, verify_signature
-from . import autonomy, roles
+from . import autonomy, people, roles
 from .worker import GateConflict, GateForbidden, Worker
 from .workspaces import WorkspaceError, WorkspaceNotFound, WorkspaceService
 from . import transcripts
@@ -191,6 +191,11 @@ class UserPatchBody(BaseModel):
     disabled: bool | None = None
     password: str | None = None  # admin reset — forces a change at next login
     clickup_user_id: str | None = None  # Epic A1: '' clears; digits link
+    # Epic D1 people profile (validated via people.validate_profile):
+    person_role: str | None = None      # '' | founder | product | dev | design
+    areas: list | None = None           # [{kind: workspace|repo|area, value}]
+    authority: list | None = None       # decision-authority tags
+    person_notes: str | None = None
 
 
 def _public_user(u: dict) -> dict:
@@ -250,9 +255,58 @@ async def change_password(body: PasswordBody, response: Response,
     return {"ok": True, "detail": "password changed — other sessions signed out"}
 
 
+def _decode_profile(row: dict) -> dict:
+    return {
+        "person_role": row.get("person_role") or "",
+        "areas": people._areas_of(row),
+        "authority": people._authority_of(row),
+        "notes": row.get("notes") or "",
+    }
+
+
 @app.get("/api/users", dependencies=[Depends(require_admin)])
 async def users_list():
-    return app.state.store.user_list()
+    store: JobStore = app.state.store
+    profiles = {p["id"]: p for p in store.people_all()}
+    out = []
+    for u in store.user_list():
+        p = profiles.get(u["id"], {})
+        out.append(u | _decode_profile(p))
+    return out
+
+
+@app.get("/api/people")
+async def people_list(user: dict = Depends(require_user)):
+    """Who owns what — the member-readable ownership directory (Epic D1).
+    Admins see everyone; members see only people whose areas intersect the
+    member's OWN workspaces (and only those area entries) — the rest of the
+    org's structure never leaks (same 404-posture as workspaces)."""
+    store: JobStore = app.state.store
+    rows = store.people_all()
+    if user.get("role") == "admin":
+        return [{"username": p["username"],
+                 "person_role": p.get("person_role") or "",
+                 "areas": people._areas_of(p),
+                 "authority": people._authority_of(p)}
+                for p in rows if not p.get("disabled")]
+    my_ws = store.workspace_ids_for_user(user["id"])
+    ws_slugs = {w["slug"] for w in store.workspace_list() if w["id"] in my_ws}
+    repo_slugs = {r["slug"] for r in store.repo_rows_all()
+                  if r["workspace_id"] in my_ws}
+    out = []
+    for p in rows:
+        if p.get("disabled"):
+            continue
+        visible = [a for a in people._areas_of(p)
+                   if (a.get("kind") == "workspace" and a.get("value") in ws_slugs)
+                   or (a.get("kind") == "repo" and a.get("value") in repo_slugs)]
+        if not visible:
+            continue
+        out.append({"username": p["username"],
+                    "person_role": p.get("person_role") or "",
+                    "areas": visible,
+                    "authority": people._authority_of(p)})
+    return out
 
 
 @app.post("/api/users", dependencies=[Depends(require_admin)])
@@ -333,6 +387,39 @@ async def users_patch(username: str, body: UserPatchBody,
             store.admin_event_add(
                 "clickup_link", target=username,
                 detail=f"clickup_user_id: {old or '(none)'} -> {cu_id or '(cleared)'}",
+                actor=f"dashboard:{admin['username']}")
+    # Epic D1: people profile. Validated BEFORE any write (a bad areas list
+    # changes nothing); only-audit-when-changed against the current row —
+    # authority tags + areas GRANT routing/decision authority, so the change
+    # and its author must be reconstructable (same posture as clickup_link).
+    profile_fields = {}
+    if body.person_role is not None:
+        profile_fields["person_role"] = body.person_role
+    if body.areas is not None:
+        profile_fields["areas"] = body.areas
+    if body.authority is not None:
+        profile_fields["authority"] = body.authority
+    if body.person_notes is not None:
+        profile_fields["notes"] = body.person_notes
+    if profile_fields:
+        try:
+            cleaned = people.validate_profile(profile_fields)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        current = store.person_get(user["id"]) or {
+            "person_role": "", "areas": "[]", "authority": "[]", "notes": ""}
+        stored = {}
+        changed = {}
+        for key, value in cleaned.items():
+            encoded = json.dumps(value) if key in ("areas", "authority") else value
+            stored[key] = encoded
+            if (current.get(key) or ("[]" if key in ("areas", "authority") else "")) != encoded:
+                changed[key] = value
+        if changed:
+            store.person_set(user["id"], **stored)
+            store.admin_event_add(
+                "people_profile", target=username,
+                detail=json.dumps(changed, default=str)[:1000],
                 actor=f"dashboard:{admin['username']}")
     return _public_user(store.user_get(username))
 

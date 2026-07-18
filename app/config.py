@@ -216,6 +216,27 @@ class Settings(BaseSettings):
     gate_sla_hours: int = 24            # 0 disables SLA escalation (Epic A5)
     sla_check_interval_seconds: int = 900  # escalation sweep cadence
 
+    # ---- Organizational context (Epic D) ----
+    # People profiles fill EMPTY DRI slots at feature intake (exactly-one-match
+    # per role, workspace members only — ambiguity fills nothing). Neutral:
+    # with an empty people table (every fresh/upgraded install) this is inert.
+    # False = profiles feed prompts/display only, never the DRI columns —
+    # the opt-out when profiles cover a repo but a team wants DRI-less jobs.
+    people_routing_defaults: bool = True
+    # FTS memory retrieval: top-k snippets injected into stage prompts.
+    # 0 disables the block entirely; values OUTSIDE 1..20 also disable it
+    # (never clamped toward permissiveness — same posture as AUTONOMY_AUTO_LEVEL).
+    memory_search_top_k: int = 5
+    # Slack read ingestion (D3) — FLAG, off by default. Even when enabled it
+    # needs the bot token AND a per-workspace channel allowlist.
+    slack_ingest_enabled: bool = False
+    slack_bot_token: str = ""       # secret; env-only, never in any API response
+    slack_api_base: str = "https://slack.com/api"  # test seam (Mixpanel-driver style)
+    slack_ingest_interval_seconds: int = 600
+    # Reaction NAME that marks a decision thread; the '!decision' message
+    # prefix is always recognized when the flag is on.
+    slack_decision_emoji: str = "pushpin"
+
     # ---- Outcome loop (Epic B) ----
     # Default measurement window (days) for features submitted without one.
     metric_window_days_default: int = 14

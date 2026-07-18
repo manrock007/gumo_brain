@@ -278,6 +278,18 @@ CREATE TABLE IF NOT EXISTS autonomy_events (
 );
 CREATE INDEX IF NOT EXISTS idx_autonomy_events_ws_at ON autonomy_events(workspace_id, at);
 
+-- Epic D1: people profile layer OVER users (1:1; never a parallel identity).
+-- Feeds intake-time DRI defaults + the prompt ownership block; gate
+-- enforcement still keys exclusively on the jobs.founder_dri/dev_dri columns.
+CREATE TABLE IF NOT EXISTS people (
+    user_id INTEGER PRIMARY KEY,          -- users(id)
+    person_role TEXT NOT NULL DEFAULT '', -- '' | founder | product | dev | design
+    areas TEXT NOT NULL DEFAULT '[]',     -- JSON list of {"kind": workspace|repo|area, "value": str}
+    authority TEXT NOT NULL DEFAULT '[]', -- JSON list of decision-authority tags
+    notes TEXT NOT NULL DEFAULT '',
+    updated_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS gate_chat (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     job_id TEXT NOT NULL,
@@ -716,6 +728,48 @@ class JobStore:
                 return user
         return self.user_get(value)
 
+    # ---------- people profiles (Epic D1 — a layer over users, never identity) ----------
+
+    def person_get(self, user_id: int) -> dict | None:
+        with self._conn() as c:
+            row = c.execute("SELECT * FROM people WHERE user_id = ?",
+                            (int(user_id),)).fetchone()
+            return dict(row) if row else None
+
+    def person_set(self, user_id: int, **fields):
+        """UPSERT the profile row in a single statement. Callers validate via
+        people.validate_profile FIRST — a bad profile must change nothing."""
+        allowed = {k: v for k, v in fields.items()
+                   if k in ("person_role", "areas", "authority", "notes")}
+        if not allowed:
+            return
+        now = time.time()
+        cols = ", ".join(allowed)
+        marks = ", ".join("?" for _ in allowed)
+        sets = ", ".join(f"{k} = excluded.{k}" for k in allowed)
+        with self._conn() as c:
+            c.execute(
+                f"INSERT INTO people (user_id, {cols}, updated_at) "
+                f"VALUES (?, {marks}, ?) "
+                f"ON CONFLICT(user_id) DO UPDATE SET {sets}, "
+                f"updated_at = excluded.updated_at",
+                (int(user_id), *allowed.values(), now),
+            )
+
+    def people_all(self) -> list[dict]:
+        """Every user with their profile (empty defaults when no row) —
+        excludes pw_hash, mirrors user_list's safe shape."""
+        with self._conn() as c:
+            rows = c.execute(
+                """SELECT u.id, u.username, u.role, u.clickup_user_id, u.disabled,
+                          COALESCE(p.person_role, '') AS person_role,
+                          COALESCE(p.areas, '[]') AS areas,
+                          COALESCE(p.authority, '[]') AS authority,
+                          COALESCE(p.notes, '') AS notes
+                   FROM users u LEFT JOIN people p ON p.user_id = u.id
+                   ORDER BY u.username""").fetchall()
+            return [dict(r) for r in rows]
+
     def user_create(self, username: str, pw_hash: str, role: str = "member",
                     must_change_pw: bool = True) -> dict:
         now = time.time()
@@ -997,11 +1051,12 @@ class JobStore:
                      updated_at = excluded.updated_at""",
                 (job_id, project, title, now, now),
             )
-            cols = ", ".join(f"{k} = ?" for k in fields)
-            c.execute(
-                f"UPDATE jobs SET {cols}, updated_at = ? WHERE issue_id = ?",
-                (*fields.values(), now, job_id),
-            )
+            if fields:
+                cols = ", ".join(f"{k} = ?" for k in fields)
+                c.execute(
+                    f"UPDATE jobs SET {cols}, updated_at = ? WHERE issue_id = ?",
+                    (*fields.values(), now, job_id),
+                )
 
     # ---------- outcome watch (Epic B4/B5) ----------
 
