@@ -1731,6 +1731,46 @@ class JobStore:
                 (cutoff, int(keep_latest)))
             return cur.rowcount
 
+    # ---------- proposal-lane reads (Epic I5) ----------
+
+    def sentry_jobs_since(self, since: float) -> list[dict]:
+        """Stored sentry job rows in the window (project/title/culprit) —
+        the cluster scanner's pure-DB input."""
+        with self._conn() as c:
+            rows = c.execute(
+                """SELECT issue_id, project, title, culprit, workspace_id,
+                          created_at FROM jobs
+                   WHERE kind = 'sentry' AND created_at >= ?
+                   ORDER BY created_at""", (since,)).fetchall()
+            return [dict(r) for r in rows]
+
+    def outcomes_decided(self) -> list[dict]:
+        """Decided flat/regressed ledger rows — the iterate-candidate source
+        (the Iterate gate was already answered; this is the *beyond* lane)."""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM outcomes WHERE decided_at IS NOT NULL "
+                "AND verdict IN ('flat', 'regressed') ORDER BY id").fetchall()
+            return [dict(r) for r in rows]
+
+    def jobs_with_related(self) -> list[dict]:
+        """Jobs referencing sibling pipelines — the live-successor check."""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT issue_id, related_jobs, status, kind FROM jobs "
+                "WHERE related_jobs != ''").fetchall()
+            return [dict(r) for r in rows]
+
+    def jobs_count_by_project(self, since: float) -> dict[str, int]:
+        """project -> jobs created in the window (the memory proposal's
+        high-traffic test)."""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT project, COUNT(*) AS n FROM jobs "
+                "WHERE created_at >= ? AND project != '' GROUP BY project",
+                (since,)).fetchall()
+            return {r["project"]: r["n"] for r in rows}
+
     # ---------- spend (Epic I0/I4; the substrate Epic G4 extends) ----------
 
     def costs_since(self, since: float) -> dict:

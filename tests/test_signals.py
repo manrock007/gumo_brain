@@ -3,6 +3,7 @@ redo decay, sentry spikes (injection-guarded), spend pacing, and the
 resolve_short_id regression (amendment 12)."""
 
 import asyncio
+import json
 import time
 from datetime import datetime, timezone
 
@@ -215,6 +216,175 @@ def test_risk_scan_redo_and_spend_sections(store, settings, worker, ws):
     keys = {i["dedupe_key"] for i in store.inbox_items_open(None)}
     assert "redo:feat-rd:4:3" in keys
     assert any(k.startswith(f"spend:{ws['id']}:") for k in keys)
+
+
+# ---------- I5: friction becomes engine data ----------
+
+
+def test_run_friction_lines_harvested_regardless_of_field_sync(store, settings, worker):
+    settings.clickup_field_sync_enabled = False
+    store.feature_intake("feat-fr1", title="t", project="demo")
+    store.set_fields("feat-fr1", workspace_id=4)
+    job = store.get("feat-fr1")
+    worker.engine.harvest_friction_lines(
+        job, 4, "blah\nFRICTION: gates too chatty · batch questions\n"
+                "FRICTION: second\npayload")
+    rows = store.frictions_since(0)
+    assert [r["source"] for r in rows] == ["run", "run"]
+    assert rows[0]["project"] == "demo" and rows[0]["stage"] == 4
+    assert rows[0]["workspace_id"] == 4
+    # v1 kinds never harvest
+    store.insert("task-x", source="manual", kind="task", project="demo")
+    worker.engine.harvest_friction_lines(store.get("task-x"), 0, "FRICTION: nope")
+    assert len(store.frictions_since(0)) == 2
+
+
+def test_human_redo_writes_friction_row(store, settings, worker):
+    settings.clickup_field_sync_enabled = False  # the row is independent
+    store.feature_intake("feat-fr2", title="t", project="demo", stage=5)
+    store.set_fields("feat-fr2", workspace_id=4)
+    store.set_status("feat-fr2", "awaiting_input")
+    asyncio.run(worker.answer_job("feat-fr2", "redo", "P4 wrong data model",
+                                  via="dashboard:x"))
+    rows = [r for r in store.frictions_since(0) if r["source"] == "redo"]
+    assert len(rows) == 1
+    assert rows[0]["stage"] == 4  # TARGET stage attribution
+    assert rows[0]["text"] == "wrong data model"
+
+
+# ---------- I5: proposal scanners ----------
+
+
+class TestProposalScanners:
+    def test_friction_bucket_key_stability(self):
+        rows = [{"project": "web", "stage": 4, "text": f"pain {i}",
+                 "source": "run", "job_id": f"feat-{i}"} for i in range(3)]
+        d3 = signals.friction_proposals(rows, 3)[0]
+        # two more rows: same 3-5 bucket → SAME key (a dismissal holds)
+        rows += [{"project": "web", "stage": 4, "text": "x", "source": "run",
+                  "job_id": "j"} for _ in range(2)]
+        d5 = signals.friction_proposals(rows, 3)[0]
+        assert d3["dedupe_key"] == d5["dedupe_key"]
+        # crossing into 6-10 → NEW key (pain measurably grew)
+        rows.append({"project": "web", "stage": 4, "text": "y", "source": "run",
+                     "job_id": "k"})
+        d6 = signals.friction_proposals(rows, 3)[0]
+        assert d6["dedupe_key"] != d3["dedupe_key"]
+        assert d6["source_sig"] == d3["source_sig"] == "friction:web:4"
+
+    def test_friction_text_fenced_and_flattened(self):
+        rows = [{"project": "web", "stage": 4, "source": "run", "job_id": "j",
+                 "text": "line`1\n## heading"} for _ in range(3)]
+        body = signals.friction_proposals(rows, 3)[0]["body"]
+        assert "\n## heading" not in body and "line'1 ## heading" in body
+
+    def test_outcome_proposal_keys_on_verdict_and_learning(self):
+        row = {"job_id": "watch-feat-o", "feature_id": "feat-o",
+               "verdict": "regressed", "decided_at": 1.0, "metric": "m",
+               "target": "at least 5", "observed": 2.0, "learning": "L1",
+               "project": "demo"}
+        d1 = signals.outcome_proposals([row], lambda f: False)[0]
+        assert "feat-o" in d1["title"] and d1["refs"]["verdict"] == "regressed"
+        # unchanged evidence → same key; changed learning → new key
+        assert signals.outcome_proposals([row], lambda f: False)[0]["dedupe_key"] \
+            == d1["dedupe_key"]
+        d2 = signals.outcome_proposals([row | {"learning": "L2"}],
+                                       lambda f: False)[0]
+        assert d2["dedupe_key"] != d1["dedupe_key"]
+        # a live successor suppresses the proposal; undecided/moved rows never fire
+        assert signals.outcome_proposals([row], lambda f: True) == []
+        assert signals.outcome_proposals([row | {"verdict": "moved"}],
+                                         lambda f: False) == []
+        assert signals.outcome_proposals([row | {"decided_at": None}],
+                                         lambda f: False) == []
+
+    def test_sentry_cluster_head_normalization(self):
+        rows = [{"issue_id": str(i), "project": "demo",
+                 "title": f"Boom {i}", "culprit": "app.pay.charge in do_it"}
+                for i in range(3)]
+        rows.append({"issue_id": "9", "project": "demo", "title": "old",
+                     "culprit": ""})  # pre-upgrade row — skipped
+        drafts = signals.sentry_cluster_proposals(rows, 3)
+        assert len(drafts) == 1
+        d = drafts[0]
+        assert d["refs"]["culprit_head"] == "app.pay.charge"
+        assert d["refs"]["count"] == 3
+        assert signals.sentry_cluster_proposals(rows, 4) == []
+
+    def test_memory_proposal_bucket_monotone(self):
+        d1 = signals.memory_proposals({"demo": 25}, {"demo": 5}, 10)[0]
+        d2 = signals.memory_proposals({"demo": 30}, {"demo": 5}, 10)[0]
+        assert d1["dedupe_key"] == d2["dedupe_key"]  # both in the 2x tier
+        d5 = signals.memory_proposals({"demo": 55}, {"demo": 5}, 10)[0]
+        assert d5["dedupe_key"] != d1["dedupe_key"]  # crossed the 5x tier
+        # low traffic → no proposal
+        assert signals.memory_proposals({"demo": 55}, {"demo": 1}, 10) == []
+        assert signals.memory_proposals({"demo": 55}, {}, 0) == []
+
+
+# ---------- the proposal_scan handler end-to-end ----------
+
+
+def _prop_ctx(settings, store, worker, ws):
+    routine = next(r for r in store.routines_all()
+                   if r["workspace_id"] == ws["id"] and r["kind"] == "proposal_scan")
+    return RoutineContext(settings=settings, store=store, worker=worker,
+                          workspaces=None, routine=routine, now=time.time())
+
+
+def test_proposal_scan_friction_dedupe_and_recency_guard(store, settings,
+                                                         worker, ws):
+    for i in range(3):
+        store.friction_add(f"feat-{i}", ws["id"], "demo", 4, "run", f"pain {i}")
+    ctx = _prop_ctx(settings, store, worker, ws)
+    status, _, emitted = asyncio.run(routines._handle_proposal_scan(ctx))
+    assert emitted == 1
+    prop = next(i for i in store.inbox_items_open(None) if i["kind"] == "proposal")
+    assert prop["source"] == "proposal_scan"
+    # dismiss it, grow the pain into a NEW bucket within the window: the
+    # source-signature recency guard still holds the dismissal
+    store.inbox_item_resolve(prop["id"], "dismissed", "dashboard:x")
+    for i in range(4):
+        store.friction_add(f"feat-x{i}", ws["id"], "demo", 4, "run", "more pain")
+    assert asyncio.run(routines._handle_proposal_scan(ctx))[2] == 0
+    # once the guard window passes, the grown (new-bucket) evidence surfaces
+    with store._conn() as c:
+        c.execute("UPDATE inbox_items SET created_at = ? WHERE id = ?",
+                  (time.time() - (settings.proposal_window_days + 1) * 86400,
+                   prop["id"]))
+    assert asyncio.run(routines._handle_proposal_scan(ctx))[2] == 1
+
+
+def test_proposal_scan_outcome_and_cluster_sources(store, settings, worker, ws):
+    # decided regressed outcome, feature terminal, no successor
+    store.feature_intake("feat-oc", title="shipped thing", project="demo")
+    store.set_fields("feat-oc", workspace_id=ws["id"])
+    store.set_status("feat-oc", "pr_opened")
+    store.outcome_add("watch-feat-oc", "feat-oc", ws["id"], verdict="regressed",
+                      metric="signups", target="at least 5", observed=1.0)
+    store.outcome_set("watch-feat-oc", learning="too hidden",
+                      decided_by="dashboard:x", decided_at=time.time())
+    # a sentry cluster
+    for i in range(3):
+        store.insert(f"90{i}", source="webhook", kind="sentry", project="demo",
+                     title=f"Crash {i}")
+        store.set_fields(f"90{i}", workspace_id=ws["id"],
+                         culprit="app.checkout in pay")
+    ctx = _prop_ctx(settings, store, worker, ws)
+    status, _, emitted = asyncio.run(routines._handle_proposal_scan(ctx))
+    kinds = {json.loads(i["refs"]).get("source_kind")
+             for i in store.inbox_items_open(None) if i["kind"] == "proposal"}
+    assert kinds == {"outcome", "sentry-cluster"}
+    # a live successor suppresses the outcome proposal on the next scan
+    ids = [i["id"] for i in store.inbox_items_open(None)]
+    for i in ids:
+        store.inbox_item_resolve(i, "dismissed", "dashboard:x")
+    store.feature_intake("feat-oc2", title="follow-up", project="demo")
+    store.set_fields("feat-oc2", workspace_id=ws["id"], related_jobs="feat-oc")
+    # (feat-oc2 is 'received' → active). Different learning would make a new
+    # key, but the successor check now suppresses it entirely.
+    store.outcome_set("watch-feat-oc", learning="changed learning")
+    assert asyncio.run(routines._handle_proposal_scan(ctx))[2] == 0
 
 
 # ---------- amendment 12: resolve_short_id 404 regression ----------

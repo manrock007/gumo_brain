@@ -56,6 +56,7 @@ from .fixer import (
 from .github import GitHub
 from .memory import MemoryReader
 from .prompts import _test_block, build_v1_chat_prompt, build_v1_fastlane_system
+from .textutil import single_line
 from . import transcripts
 
 log = logging.getLogger("brain.engine")
@@ -496,6 +497,10 @@ class Engine:
         # record, NOT gated by the ClickUp field-sync flag (mirror stays
         # best-effort visibility; the row is what the watcher reads)
         self.harvest_metric_lines(job, raw.text)
+        # Epic I5: FRICTION lines become ENGINE data (frictions table) —
+        # deliberately OUTSIDE the clickup_field_sync gate below: the row is
+        # the record, the mirror stays best-effort visibility (Epic B posture)
+        self.harvest_friction_lines(job, stage, raw.text)
         # conveyor mirror: FRICTION -> improvements log, FLAG/METRIC -> launch fields
         await self.sync_run_report_fields(job, stage, raw.text)
 
@@ -1138,6 +1143,18 @@ class Engine:
     METRIC_TARGET_RE = re.compile(r"^METRIC_TARGET:\s*(.+)$", re.MULTILINE)
     METRIC_WINDOW_RE = re.compile(r"^METRIC_WINDOW_DAYS:\s*(\d{1,3})\s*$", re.MULTILINE)
     METRIC_EVENT_RE = re.compile(r"^METRIC_EVENT:\s*(.+)$", re.MULTILINE)
+
+    def harvest_friction_lines(self, job: dict, stage: int, text: str):
+        """Epic I5: every FRICTION: protocol line lands in the frictions
+        table (single-lined, capped) — the proposal lane's raw material.
+        Independent of any ClickUp mirroring."""
+        if (job.get("kind") or "") != "feature":
+            return
+        for m in self.FRICTION_RE.finditer(text or ""):
+            self.store.friction_add(
+                job["issue_id"], job.get("workspace_id"),
+                job.get("project") or "", stage, "run",
+                single_line(m.group(1), 400))
 
     def harvest_metric_lines(self, job: dict, text: str):
         """Harvest the run's metric protocol lines onto the job row (Epic B).

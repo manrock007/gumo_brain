@@ -363,6 +363,104 @@ async def _handle_risk_scan(ctx: RoutineContext):
     return ("ok" if emitted or notes else "quiet"), detail, emitted
 
 
+# ---------- I5: the proposal lane (parked candidate briefs) ----------
+
+
+def _has_live_successor(store: JobStore, feature_id: str) -> bool:
+    """Is the feature being re-lapped, or does an ACTIVE job reference it in
+    related_jobs? Then no iterate proposal — the work is already moving."""
+    feat = store.get(feature_id)
+    if feat and (feat.get("status") or "") in ACTIVE_JOB_STATUSES:
+        return True
+    for j in store.jobs_with_related():
+        if j["issue_id"] == feature_id:
+            continue
+        related = {x.strip() for x in (j.get("related_jobs") or "").split(",")
+                   if x.strip()}
+        if feature_id in related and (j.get("status") or "") in ACTIVE_JOB_STATUSES:
+            return True
+    return False
+
+
+async def _handle_proposal_scan(ctx: RoutineContext):
+    """Parked candidate BRIEFS a human adopts or dismisses — never
+    self-initiated pipelines (adoption via POST /api/inbox/notices/{id}/adopt
+    is the only path to intake). Dismissals are remembered by the dedupe
+    keys; the count-bucketed families additionally honor a source-signature
+    recency guard so a dismissal holds for a full PROPOSAL_WINDOW_DAYS."""
+    from .memory import MemoryReader  # lazy, like memory_upkeep
+
+    ws = ctx.workspace
+    if ws is None:
+        return "skipped", "workspace row missing", 0
+    s = ctx.settings
+    window = s.proposal_window_days * 86400
+    since = ctx.now - window
+    emitted = 0
+
+    def emit_guarded(drafts, recency_guard=True):
+        nonlocal emitted
+        for draft in drafts:
+            if recency_guard and ctx.store.inbox_item_recent_sig(
+                    "proposal", draft.get("source_sig") or "", since):
+                continue
+            emitted += _emit(ctx, draft)
+
+    # 1 — outcome verdicts (flat/regressed, decided, no live successor)
+    outcome_rows = []
+    for row in ctx.store.outcomes_decided():
+        if row.get("workspace_id") != ws["id"]:
+            continue
+        feat = ctx.store.get(row.get("feature_id") or "") or {}
+        outcome_rows.append(row | {"project": feat.get("project") or ""})
+    emit_guarded(signals.outcome_proposals(
+        outcome_rows, lambda fid: _has_live_successor(ctx.store, fid)),
+        recency_guard=False)  # the key already folds verdict+learning
+
+    # 2 — the friction log (recurring process pain)
+    frictions = ctx.store.frictions_since(since, ws["id"])
+    emit_guarded(signals.friction_proposals(
+        frictions, int(s.proposal_friction_min or 0)))
+
+    # 3 — sentry clusters (pure DB; pre-upgrade rows have culprit='' and are
+    # skipped — clusters accumulate from upgrade forward)
+    sentry_rows = [r for r in ctx.store.sentry_jobs_since(since)
+                   if r.get("workspace_id") == ws["id"]]
+    emit_guarded(signals.sentry_cluster_proposals(
+        sentry_rows, int(s.proposal_sentry_cluster_min or 0)))
+
+    # 4 — stale high-traffic memory areas. Needs a configured staleness
+    # threshold (0 = no basis to judge — skipped); proposes only where the
+    # upkeep routine won't act: its weekly bound already spent, or the
+    # routine itself inert/disabled.
+    threshold = int(s.memory_staleness_threshold or 0)
+    if threshold > 0:
+        upkeep = next((r for r in ctx.store.routines_all()
+                       if r.get("workspace_id") == ws["id"]
+                       and r["kind"] == "memory_upkeep"), None)
+        upkeep_active = bool(upkeep and upkeep.get("enabled")
+                             and s.routines_enabled)
+        cooldown = s.memory_upkeep_cooldown_days * 86400
+        reader = MemoryReader(s)
+        staleness_map = {}
+        for repo in ctx.store.workspace_repos_for(ws["id"]):
+            slug = repo["slug"]
+            cached = reader.cached(slug) or {}
+            staleness = (cached.get("meta") or {}).get("staleness_commits")
+            if staleness is None:
+                continue
+            mem = ctx.store.get(f"mem-{slug}")
+            bound_spent = bool(mem and float(mem.get("updated_at") or 0)
+                               > ctx.now - cooldown)
+            if upkeep_active and not bound_spent:
+                continue  # I3 will act on this repo itself
+            staleness_map[slug] = int(staleness)
+        emit_guarded(signals.memory_proposals(
+            staleness_map, ctx.store.jobs_count_by_project(since), threshold))
+
+    return ("ok" if emitted else "quiet"), f"{emitted} new proposal(s)", emitted
+
+
 # ---------- I2: the daily standup digest ----------
 
 
@@ -406,6 +504,7 @@ REGISTRY: dict = {
     "standup_digest": _handle_standup,
     "memory_upkeep": _handle_memory_upkeep,
     "risk_scan": _handle_risk_scan,
+    "proposal_scan": _handle_proposal_scan,
 }
 
 

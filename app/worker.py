@@ -406,6 +406,9 @@ class Worker:
             title=issue.get("title", "unknown")[:300],
             project=project_slug,
             issue_url=issue.get("permalink", ""),
+            # Epic I5: the cluster substrate — single-lined + capped at write.
+            # Pre-upgrade rows keep culprit='' (clusters accumulate forward).
+            culprit=_single_line(issue.get("culprit") or "", 300),
         )
         # webhook intake has no project yet — stamp the workspace the moment
         # the slug is known (before any skip path), or webhook-sourced jobs
@@ -875,6 +878,13 @@ class Worker:
             self._register_decision(job, target_stage, f"P{target_stage} redo",
                                     text, via, gid=gid)
             self.store.stage_run_gate_answered(job_id, stage, "redo")
+            # Epic I5: a human redo IS friction — recorded as ENGINE data
+            # unconditionally (independent of the ClickUp field-sync flag;
+            # the row is the record, the mirror below stays visibility)
+            if text:
+                self.store.friction_add(job_id, job.get("workspace_id"),
+                                        job.get("project") or "",
+                                        target_stage, "redo", text)
             await self._sync_decision_field(task_id, target_stage, " (redo)", text)
             if (self.settings.clickup_field_sync_enabled and text and task_id
                     and self.settings.clickup_friction_field):
