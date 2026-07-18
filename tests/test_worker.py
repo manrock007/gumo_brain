@@ -63,6 +63,18 @@ class TestIntakeGuards:
         worker.store.set_status("feat-1", "pr_opened", pr_url="http://pr")
         assert "shipped" in worker.intake_feature("feat-1", title="F", project="web", request="r")
 
+    def test_reintake_resets_dris_from_the_fresh_submission(self, worker):
+        """Amendment 8 (documented in OPERATIONS.md): a resubmit that omits the
+        DRIs clears previously recorded ones — enforcement turns off with them."""
+        worker.intake_feature("feat-dri", title="F", project="web", request="r",
+                              founder_dri="111", dev_dri="222")
+        row = worker.store.get("feat-dri")
+        assert (row["founder_dri"], row["dev_dri"], row["owner"]) == ("111", "222", "222")
+        worker.store.set_status("feat-dri", "skipped")
+        worker.intake_feature("feat-dri", title="F", project="web", request="r")
+        row = worker.store.get("feat-dri")
+        assert (row["founder_dri"], row["dev_dri"], row["owner"]) == ("", "", "")
+
     def test_skipped_feature_restarts_fresh(self, worker):
         worker.intake_feature("feat-2", title="F", project="web", request="r")
         worker.store.set_fields("feat-2", stage=5)

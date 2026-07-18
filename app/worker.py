@@ -1027,8 +1027,10 @@ class Worker:
                 await self.clickup.comment(
                     parent_task,
                     f"{GATE_PREFIX} Not applied: {e} — only they can `/proceed`/`/redo`/"
-                    "`/skip` this gate. You can still comment, use the dashboard chat, "
-                    "or ask an admin to override from the dashboard.")
+                    "`/skip` this gate. If this IS your gate, link your ClickUp account "
+                    "(Settings → Users) or answer on the dashboard. Otherwise you can "
+                    "still comment, use the dashboard chat, or ask an admin to override "
+                    "from the dashboard.")
                 return True
             except (ValueError, KeyError) as e:
                 await self.clickup.comment(parent_task,
