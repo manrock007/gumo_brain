@@ -271,7 +271,10 @@ class ClickUp:
             log.exception("ClickUp comment failed for task %s", task_id)
 
     async def comments(self, task_id: str) -> list[dict]:
-        """Newest-last list of {id, text, date} comments (date: epoch seconds)."""
+        """Newest-last list of {id, text, date, user_id, username} comments
+        (date: epoch seconds). The commenter identity feeds answer attribution
+        (Epic A1) — read fail-safe, so an odd payload shape degrades to an
+        anonymous comment, never a crash."""
         if not self.enabled or not task_id:
             return []
         try:
@@ -286,7 +289,11 @@ class ClickUp:
                         date = float(c.get("date", 0)) / 1000.0  # API returns ms
                     except (TypeError, ValueError):
                         date = 0.0
-                    out.append({"id": str(c["id"]), "text": c.get("comment_text", ""), "date": date})
+                    u = c.get("user") or {}
+                    out.append({"id": str(c["id"]), "text": c.get("comment_text", ""),
+                                "date": date,
+                                "user_id": str(u.get("id") or ""),
+                                "username": (u.get("username") or "").strip()})
                 return out
         except Exception:
             log.exception("ClickUp comments fetch failed for task %s", task_id)

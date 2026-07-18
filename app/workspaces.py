@@ -19,7 +19,8 @@ import logging
 import re
 import sqlite3
 
-from .config import DEFAULT_PRODUCT_NAME, Settings, validate_repo_map
+from . import roles
+from .config import DEFAULT_PRODUCT_NAME, Settings, validate_repo_map, validate_stage_role_map
 from .db import JobStore
 
 log = logging.getLogger("brain.workspaces")
@@ -28,7 +29,8 @@ SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 
 WORKSPACE_FIELDS = ("name", "product_name", "workspace_context", "canonical_project",
                     "clickup_list_id", "clickup_enabled", "slack_webhook_url",
-                    "gate_mode_default")
+                    "gate_mode_default", "require_attributed_answers",
+                    "stage_role_map", "gate_sla_hours")
 
 WORKSPACE_CONTEXT_CAP = 4000
 
@@ -254,6 +256,35 @@ class WorkspaceService:
                 if value not in ("full", "light"):
                     raise WorkspaceError("gate_mode_default must be 'full' or 'light'")
                 clean[key] = value
+            elif key == "require_attributed_answers":
+                value = str(value).strip().lower()
+                if value not in ("auto", "on", "off"):
+                    raise WorkspaceError(
+                        "require_attributed_answers must be 'auto', 'on' or 'off'")
+                clean[key] = value
+            elif key == "stage_role_map":
+                # fail closed on the WRITE side: a malformed map is a 400 and
+                # nothing changes; '' clears back to inherit
+                if isinstance(value, str) and not value.strip():
+                    clean[key] = ""
+                    continue
+                try:
+                    mapping = json.loads(value) if isinstance(value, str) else value
+                    clean[key] = json.dumps(validate_stage_role_map(mapping))
+                except (ValueError, TypeError) as e:
+                    raise WorkspaceError(f"stage_role_map: {e}")
+            elif key == "gate_sla_hours":
+                # empty string -> NULL = inherit the instance default
+                if isinstance(value, str) and not value.strip():
+                    clean[key] = None
+                    continue
+                try:
+                    hours = int(value)
+                except (ValueError, TypeError):
+                    raise WorkspaceError("gate_sla_hours must be an integer ≥ 0")
+                if hours < 0:
+                    raise WorkspaceError("gate_sla_hours must be an integer ≥ 0")
+                clean[key] = hours
             else:
                 value = str(value).strip()
                 # name is the one field that must never be blank; the OTHER
@@ -278,6 +309,13 @@ class WorkspaceService:
             "clickup_enabled": bool(ws["clickup_enabled"]),
             "slack_webhook_url": ws["slack_webhook_url"],
             "gate_mode_default": ws["gate_mode_default"],
+            "require_attributed_answers": ws.get("require_attributed_answers") or "auto",
+            "stage_role_map": ws.get("stage_role_map") or "",
+            "gate_sla_hours": ws.get("gate_sla_hours"),
+            # the fully-merged 0–9 ownership ladder, so the UI shows effective
+            # ownership without duplicating the merge logic client-side
+            "stage_roles": {str(i): roles.role_for_stage(self.settings, ws, i)
+                            for i in range(10)},
             "repos": {r["slug"]: {"repo": r["repo"], "base": r["base"],
                                   "setup_cmd": r["setup_cmd"], "test_cmd": r["test_cmd"],
                                   "allow": json.loads(r["allow"] or "[]")}

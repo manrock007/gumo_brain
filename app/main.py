@@ -3,6 +3,7 @@ import html
 import json
 import logging
 import re
+import sqlite3
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -36,7 +37,8 @@ from .feature_prompts import stage_name
 from .fixer import ensure_session_store
 from .memory import MemoryReader
 from .sentry_api import extract_issue_ref, verify_signature
-from .worker import GateConflict, Worker
+from . import roles
+from .worker import GateConflict, GateForbidden, Worker
 from .workspaces import WorkspaceError, WorkspaceNotFound, WorkspaceService
 from . import transcripts
 
@@ -105,6 +107,7 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(worker.reap_forever()),
         asyncio.create_task(worker.prune_sessions_forever()),
         asyncio.create_task(worker.shepherd_forever()),
+        asyncio.create_task(worker.sla_forever()),
     ]
     app.state.store = store
     app.state.worker = worker
@@ -185,12 +188,14 @@ class UserPatchBody(BaseModel):
     role: str | None = None
     disabled: bool | None = None
     password: str | None = None  # admin reset — forces a change at next login
+    clickup_user_id: str | None = None  # Epic A1: '' clears; digits link
 
 
 def _public_user(u: dict) -> dict:
     return {"username": u["username"], "role": u["role"],
             "disabled": bool(u.get("disabled")),
-            "must_change_pw": bool(u.get("must_change_pw"))}
+            "must_change_pw": bool(u.get("must_change_pw")),
+            "clickup_user_id": u.get("clickup_user_id") or ""}
 
 
 @app.post("/api/login")
@@ -296,6 +301,27 @@ async def users_patch(username: str, body: UserPatchBody,
         store.user_set(username, pw_hash=hash_password(body.password), must_change_pw=1,
                        failed_attempts=0, locked_until=None)
         store.auth_sessions_revoke_user(user["id"])
+    if body.clickup_user_id is not None:
+        # Epic A1: link/clear a ClickUp identity. One ClickUp id maps to at
+        # most ONE user (any state) — read-side 409 for a clean message, and
+        # the partial UNIQUE index closes the read-then-write race.
+        cu_id = body.clickup_user_id.strip()
+        if cu_id and not cu_id.isdigit():
+            raise HTTPException(status_code=400,
+                                detail="clickup_user_id must be a numeric ClickUp user id")
+        if cu_id:
+            other = next((u for u in store.user_list()
+                          if u.get("clickup_user_id") == cu_id
+                          and u["username"] != username), None)
+            if other:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"ClickUp id already linked to '{other['username']}'")
+        try:
+            store.user_set(username, clickup_user_id=cu_id)
+        except sqlite3.IntegrityError:
+            raise HTTPException(status_code=409,
+                                detail="ClickUp id already linked to another user")
     return _public_user(store.user_get(username))
 
 
@@ -428,6 +454,55 @@ async def jobs(user: dict = Depends(require_user)):
         if r.get("kind") == "feature":
             r["stage_name"] = stage_name(int(r.get("stage") or 0))
     return rows
+
+
+@app.get("/api/inbox")
+async def inbox(user: dict = Depends(require_user)):
+    """Per-person work queue (Epic A4): every answerable gate the user owns,
+    plus unassigned gates (no enforceable DRI — a solo instance sees
+    everything). Sorted overdue first, then oldest gate first. `counts.mine`
+    (which includes unassigned) is the badge number."""
+    store: JobStore = app.state.store
+    svc = _ws_svc()
+    now = time.time()
+    items = []
+    unassigned_n = 0
+    for job in store.awaiting_gates():
+        if not svc.user_can_access(user, job.get("workspace_id")):
+            continue
+        ws = svc.for_job(job)
+        owner = roles.gate_owner(store, settings, ws, job)
+        stage = int(job.get("stage") or 0)
+        feature = (job.get("kind") or "") == "feature"
+        gate_posted = store.latest_gate_posted(job["issue_id"], stage)
+        sla = ws["gate_sla_hours"] if ws and ws.get("gate_sla_hours") is not None \
+            else settings.gate_sla_hours
+        due_at = (gate_posted + sla * 3600) if (sla and gate_posted) else None
+        overdue = bool(due_at and now > due_at)
+        enforced = owner is not None and owner.enforce
+        is_you = roles.actor_is_owner(owner, user) if enforced else False
+        unassigned = not enforced
+        if not (unassigned or is_you):
+            continue
+        if unassigned:
+            unassigned_n += 1
+        items.append({
+            "issue_id": job["issue_id"], "title": job.get("title") or job["issue_id"],
+            "kind": job.get("kind") or "sentry", "status": job["status"],
+            "project": job.get("project") or "", "workspace_id": job.get("workspace_id"),
+            "stage": stage, "stage_name": stage_name(stage) if feature else "",
+            "question": (job.get("question") or "")[:300],
+            "updated_at": job.get("updated_at"),
+            "gate_owner": ({"role": owner.role, "display": owner.display,
+                            "is_you": is_you} if enforced else None),
+            "unassigned": unassigned,
+            "gate_posted_at": gate_posted, "sla_hours": sla or 0,
+            "overdue": overdue, "due_at": due_at,
+        })
+    items.sort(key=lambda i: (not i["overdue"], i["gate_posted_at"] or 0))
+    return {"items": items,
+            "counts": {"mine": len(items), "unassigned": unassigned_n,
+                       "overdue": sum(1 for i in items if i["overdue"])}}
 
 
 class TriggerBody(BaseModel):
@@ -613,7 +688,9 @@ class SubmitBody(BaseModel):
     clickup: str | None = None  # ClickUp task URL or id — adopt an existing ticket
     title: str | None = None    # ... or create a new ticket from title + summary
     summary: str | None = None
-    owner: str | None = None       # features: ClickUp user id for gate notifications
+    owner: str | None = None       # DEPRECATED alias for dev_dri (applied when dev_dri empty)
+    founder_dri: str | None = None  # features: ClickUp user id or username (Epic A2)
+    dev_dri: str | None = None      # features: same encoding
     related_to: str | None = None  # features: sibling pipeline job id(s), comma-separated
     gate_mode: str | None = None   # features: 'full' (default) | 'light' (checkpoints + guards)
 
@@ -711,7 +788,11 @@ async def submit_feature(body: SubmitBody, user: dict = Depends(require_user)):
     decision = worker.intake_feature(
         t["job_id"], title=t["title"], project=t["project"], request=t["request"],
         clickup_task_id=t["task_id"], clickup_task_url=t["task_url"],
-        cu_list_id=t["list_id"], owner=(body.owner or "").strip(),
+        cu_list_id=t["list_id"],
+        founder_dri=(body.founder_dri or "").strip(),
+        # legacy `owner` = deprecated alias for dev_dri (applied only when
+        # dev_dri is empty); the stored owner column stays a computed alias
+        dev_dri=(body.dev_dri or "").strip() or (body.owner or "").strip(),
         related_jobs=(body.related_to or "").strip(),
         gate_mode=(body.gate_mode or "").strip().lower(),
     )
@@ -731,12 +812,15 @@ async def submit_feature(body: SubmitBody, user: dict = Depends(require_user)):
 class AnswerBody(BaseModel):
     action: str  # proceed | redo | skip
     answer: str = ""
+    override: bool = False  # Epic A3: explicit, audited admin bypass (dashboard-only)
 
 
 @app.post("/api/jobs/{job_id}/answer")
 async def answer_job(job_id: str, body: AnswerBody, user: dict = Depends(require_user)):
     """Answer a parked gate from the dashboard. The decision is recorded on the
-    ClickUp ticket; a lost race against a ClickUp comment answer returns 409."""
+    ClickUp ticket; a lost race against a ClickUp comment answer returns 409;
+    a role-exclusive gate answered by a non-owner returns 403 (Epic A3) unless
+    an admin explicitly sets override (audited in gate_events)."""
     action = body.action.strip().lower()
     if action not in ("proceed", "redo", "skip"):
         raise HTTPException(status_code=400, detail="action must be 'proceed', 'redo' or 'skip'")
@@ -744,9 +828,13 @@ async def answer_job(job_id: str, body: AnswerBody, user: dict = Depends(require
     worker: Worker = app.state.worker
     try:
         status = await worker.answer_job(job_id, action, body.answer.strip(),
-                                         via=f"dashboard:{user['username']}")
+                                         via=f"dashboard:{user['username']}",
+                                         actor=user,
+                                         override=body.override and user["role"] == "admin")
     except KeyError:
         raise HTTPException(status_code=404, detail=f"unknown job '{job_id}'")
+    except GateForbidden as e:  # BEFORE ValueError: 403, never a masked 409
+        raise HTTPException(status_code=403, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e))
     except GateConflict:
@@ -902,6 +990,14 @@ async def session_snapshot(job_id: str, user: dict = Depends(require_user)):
                   "truncated": len(bodies.get(n) or "") > SESSION_ARTIFACT_MAX}
                  for n in names]
     live = job["status"] == "running" or worker.engine.stage_broker.active(job_id)
+    # gate ownership (Epic A3): computed server-side with the acting user so
+    # the UI can disable the answer buttons for non-owners (server enforces)
+    g_owner = roles.gate_owner(store, settings, _ws_svc().for_job(job), job)
+    gate_owner = None
+    if g_owner is not None:
+        gate_owner = {"role": g_owner.role, "display": g_owner.display,
+                      "clickup_id": g_owner.clickup_id, "enforce": g_owner.enforce,
+                      "is_you": roles.actor_is_owner(g_owner, user)}
     return {
         "job": {
             "issue_id": job_id, "title": job.get("title") or job_id,
@@ -909,6 +1005,8 @@ async def session_snapshot(job_id: str, user: dict = Depends(require_user)):
             "stage": stage, "stage_name": stage_name(stage) if feature else "",
             "phase": job.get("phase"), "score": job.get("score"),
             "gate_mode": job.get("gate_mode") or "full", "owner": job.get("owner") or "",
+            "founder_dri": job.get("founder_dri") or "",
+            "dev_dri": job.get("dev_dri") or "",
             "pr_url": job.get("pr_url") or "", "clickup_task_url": job.get("clickup_task_url") or "",
             "issue_url": job.get("issue_url") or "",
             "question": job.get("question") or "", "gate_kind": job.get("gate_kind") or "",
@@ -921,6 +1019,9 @@ async def session_snapshot(job_id: str, user: dict = Depends(require_user)):
         # built from — bodies are fetched per run on expand
         "transcripts": transcripts.list_for_job(settings, job_id),
         "guidance": store.guidance_for(job_id),
+        # Epic A: gate ownership + the refusal/override/escalation timeline
+        "gate_owner": gate_owner,
+        "gate_events": store.gate_events_for(job_id),
         "artifacts": artifacts,
         # every PR this packet opened, with lifecycle state (draft -> ready ->
         # in_review -> changes_requested -> approved -> merged/closed)

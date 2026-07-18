@@ -13,11 +13,14 @@ or any artifact subtask), sweep, stale-run reaper.
 
 import asyncio
 import itertools
+import json
 import logging
 import re
 import time
+import uuid
 from pathlib import Path
 
+from . import roles
 from .clickup import ClickUp
 from .config import ENGINE_NAME, Settings
 from .db import JobStore
@@ -66,6 +69,13 @@ PROJECT_LINE_RE = re.compile(r"^\s*\**project\**\s*[:=]\s*\**\s*([A-Za-z0-9_-]+)
 
 class GateConflict(Exception):
     """The gate was already answered through the other channel."""
+
+
+class GateForbidden(Exception):
+    """The acting user does not own this gate (Epic A3). Deliberately NOT a
+    ValueError subclass: main.py maps ValueError->409 and _scan_verbs catches
+    (ValueError, KeyError) with a generic reply — this must surface as a 403 /
+    ownership refusal, never be swallowed by those handlers."""
 
 
 def extract_questions(analysis: str) -> str:
@@ -132,6 +142,11 @@ class Worker:
             return self.workspaces.product_name_for(ws), self.workspaces.briefing(ws)
         return self.settings.product_name, self.settings.business_context
 
+    def _ws_row(self, job: dict) -> dict | None:
+        """The job's workspace row (attribution/role/SLA config), when the
+        service is injected — mirrors _job_context."""
+        return self.workspaces.for_job(job) if self.workspaces else None
+
     def _stamp_workspace(self, job_id: str, project: str):
         """Record the owning workspace on the job row (slugs are global)."""
         if self.workspaces and project:
@@ -168,8 +183,13 @@ class Worker:
                        clickup_task_id: str | None = None,
                        clickup_task_url: str | None = None,
                        cu_list_id: str = "", owner: str = "",
+                       founder_dri: str = "", dev_dri: str = "",
                        related_jobs: str = "", gate_mode: str = "") -> str:
-        """Enqueue a feature pipeline at P0."""
+        """Enqueue a feature pipeline at P0. Dual DRIs (Epic A2): the legacy
+        `owner` column becomes a computed alias at write time. A re-intake
+        resets ALL of them from the fresh submission (consistent with the
+        atomic pipeline-reset contract) — resubmitting without DRIs clears
+        previously recorded ones and turns role enforcement off."""
         existing = self.store.get(job_id)
         if existing:
             if existing["status"] in ACTIVE_STATUSES:
@@ -185,6 +205,9 @@ class Worker:
             # terminal skipped/no_fix -> fresh restart of the pipeline (atomic below)
 
         mode = gate_mode if gate_mode in ("full", "light") else self.settings.default_gate_mode
+        founder_dri = (founder_dri or "").strip()
+        dev_dri = (dev_dri or "").strip()
+        owner = (owner or "").strip() or dev_dri or founder_dri  # legacy computed alias
         self.store.feature_intake(
             job_id, title=title, project=project,
             request=request,
@@ -207,6 +230,8 @@ class Worker:
             clickup_task_url=clickup_task_url or "",
             cu_list_id=cu_list_id,
             owner=owner,
+            founder_dri=founder_dri,
+            dev_dri=dev_dri,
             related_jobs=related_jobs,
         )
         self._stamp_workspace(job_id, project)
@@ -613,16 +638,22 @@ class Worker:
             raise ValueError("steering is only valid for feature pipelines")
         return self.engine.request_steer(job_id, note, via=via)
 
-    async def answer_job(self, job_id: str, action: str, text: str, via: str) -> str:
+    async def answer_job(self, job_id: str, action: str, text: str, via: str,
+                         actor: dict | None = None, override: bool = False) -> str:
         """Single resolution path for gate answers from BOTH channels.
         Returns the new status. Raises KeyError (unknown), ValueError (invalid
-        action/state), GateConflict (lost the CAS race)."""
+        action/state), GateConflict (lost the CAS race), GateForbidden (the
+        actor does not own a role-exclusive gate — Epic A3). `actor` is the
+        acting user row when resolvable (dashboard: always; ClickUp: via the
+        clickup_user_id mapping); `override` is the audited dashboard-only
+        admin bypass."""
         job = self.store.get(job_id)
         if job is None:
             raise KeyError(job_id)
         kind = job.get("kind") or "sentry"
         if kind == "feature":
-            return await self._answer_feature(job, action, text, via)
+            return await self._answer_feature(job, action, text, via,
+                                              actor=actor, override=override)
         if action == "redo":
             raise ValueError(f"redo is only valid for feature pipelines, not kind '{kind}'")
         return await self._answer_v1(job, action, text, via)
@@ -668,7 +699,34 @@ class Worker:
         await self.clickup.field_append(task_id, "Decisions",
                                         f"P{stage}{label}: {text[:400]}")
 
-    async def _answer_feature(self, job: dict, action: str, text: str, via: str) -> str:
+    async def _answer_feature(self, job: dict, action: str, text: str, via: str,
+                              actor: dict | None = None, override: bool = False) -> str:
+        """Role-exclusive gates (Epic A3), enforced at the single choke point
+        BOTH channels funnel through — before any CAS, never replacing it.
+        Inert when the job records no explicit DRIs (gate_owner enforce=False
+        or None — solo installs and pre-upgrade jobs behave exactly as today).
+        Applies to proceed/redo/skip including ask-gates and redo-from-error;
+        gate chat and plain comments are untouched."""
+        owner = roles.gate_owner(self.store, self.settings, self._ws_row(job), job)
+        admin_override = False
+        if owner is not None and owner.enforce and not roles.actor_is_owner(owner, actor):
+            if actor and actor.get("role") == "admin" and override:
+                admin_override = True  # dashboard-only, explicit, audited below
+            else:
+                raise GateForbidden(f"this is a {owner.role} gate, owned by {owner.display}")
+        result = await self._answer_feature_inner(job, action, text, via)
+        if admin_override:
+            # recorded only AFTER the transition succeeded — a lost CAS raises
+            # GateConflict above and must leave NO override audit row. The ref
+            # is a uuid: an audit record must never be eaten by the dedupe key.
+            self.store.gate_event_add(
+                job["issue_id"], "admin_override", ref=uuid.uuid4().hex,
+                stage=int(job.get("stage") or 0), actor=via,
+                detail=f"{action} on a {owner.role} gate owned by {owner.display}")
+            log.info("admin override: %s %s by %s", job["issue_id"], action, via)
+        return result
+
+    async def _answer_feature_inner(self, job: dict, action: str, text: str, via: str) -> str:
         job_id = job["issue_id"]
         stage = int(job.get("stage") or 0)
         task_id = job.get("clickup_task_id") or ""
@@ -872,10 +930,9 @@ class Worker:
                         break
 
     def _latest_gate_posted(self, job: dict) -> float:
-        runs = self.store.stage_runs_for(job["issue_id"])
-        stamps = [r["gate_posted_at"] for r in runs
-                  if r["stage"] == job.get("stage") and r["gate_posted_at"]]
-        return max(stamps) if stamps else job.get("updated_at") or 0
+        # one implementation, shared with the inbox/SLA readers (JobStore owns
+        # it so main.py never reaches into the worker)
+        return self.store.latest_gate_posted(job["issue_id"], int(job.get("stage") or 0))
 
     async def _scan_verbs(self, job: dict, source_task_id: str, use_marker: bool,
                           after: float = 0.0) -> bool:
@@ -922,12 +979,59 @@ class Worker:
                     )
                     self.store.set_fields(job["issue_id"], comment_marker=c["id"])
                 continue
+            # ---- answer attribution (Epic A1): who is issuing this verb? ----
+            user_id = str(c.get("user_id") or "")
+            actor = self.store.user_for_clickup_id(user_id)
+            parent_task = job.get("clickup_task_id") or ""
+            if actor is None and roles.attribution_required(
+                    self.settings, self._ws_row(job), self.store):
+                # refuse, idempotently per comment id: the UNIQUE(job, kind,
+                # ref) row is what makes subtask-stream refusals (no marker)
+                # reply exactly once. DB writes (event + marker) land BEFORE
+                # the ClickUp reply, and the dedupe-hit path SKIPS the comment
+                # (continue) so a refused comment can never wedge the scan —
+                # the real owner's later verb on the same stream still runs.
+                first = self.store.gate_event_add(
+                    job["issue_id"], "refused_unattributed", ref=c["id"],
+                    stage=job.get("stage"),
+                    actor=f"clickup:{c.get('username') or '?'}#{user_id or '?'}")
+                if use_marker:
+                    self.store.set_fields(job["issue_id"], comment_marker=c["id"])
+                if not first:
+                    continue
+                await self.clickup.comment(
+                    parent_task,
+                    f"{GATE_PREFIX} `{text[:80]}` from @{c.get('username') or 'unknown'} "
+                    "was NOT applied — this ClickUp account isn't linked to a "
+                    f"{ENGINE_NAME} user. An admin can link it in Settings → Users; "
+                    "meanwhile link your ClickUp account or answer on the dashboard.")
+                return True
+            via = (f"clickup:{actor['username']}" if actor
+                   else f"clickup:{c.get('username') or 'unknown'}#{user_id or '?'}")
             try:
-                await self.answer_job(job["issue_id"], action, payload, via="clickup")
+                await self.answer_job(job["issue_id"], action, payload, via=via, actor=actor)
             except GateConflict:
                 pass  # answered elsewhere — fine
+            except GateForbidden as e:
+                # role-exclusive gate (Epic A3): not this person's gate. Same
+                # idempotence/ordering discipline as the attribution refusal;
+                # ClickUp offers NO override path (fail closed) — an admin
+                # overrides from the dashboard.
+                first = self.store.gate_event_add(
+                    job["issue_id"], "refused_wrong_role", ref=c["id"],
+                    stage=job.get("stage"), actor=via, detail=str(e)[:300])
+                if use_marker:
+                    self.store.set_fields(job["issue_id"], comment_marker=c["id"])
+                if not first:
+                    continue
+                await self.clickup.comment(
+                    parent_task,
+                    f"{GATE_PREFIX} Not applied: {e} — only they can `/proceed`/`/redo`/"
+                    "`/skip` this gate. You can still comment, use the dashboard chat, "
+                    "or ask an admin to override from the dashboard.")
+                return True
             except (ValueError, KeyError) as e:
-                await self.clickup.comment(job.get("clickup_task_id") or "",
+                await self.clickup.comment(parent_task,
                                            f"{GATE_PREFIX} could not apply `{text[:80]}`: {e}")
             if use_marker:
                 self.store.set_fields(job["issue_id"], comment_marker=c["id"])
@@ -1038,17 +1142,26 @@ class Worker:
 
         if kind == "feature":
             # the workflow contract: the ticket creator sets the DRI people
-            # fields; gates assign/notify that person (Dev DRI first, Founder
-            # as the fallback approver)
+            # fields (names configured via clickup_dri_field_map — read-side
+            # lookups against the customer's own schema, quiet no-op when the
+            # fields don't exist); BOTH roles are captured independently
+            # (Epic A2) and the legacy `owner` alias is computed at intake
             fields = await self.clickup.task_fields(task_id)
-            dri = fields.get("assigned dev dri") or fields.get("assigned founder dri")
-            owner = ""
-            if isinstance(dri, list) and dri:
-                owner = str((dri[0] or {}).get("id") or "")
+            try:
+                dri_map = json.loads(self.settings.clickup_dri_field_map) or {}
+            except (ValueError, TypeError):
+                dri_map = {}
+
+            def _pid(v):
+                return str((v[0] or {}).get("id") or "") if isinstance(v, list) and v else ""
+
+            founder_dri = _pid(fields.get(str(dri_map.get("founder") or "").lower()))
+            dev_dri = _pid(fields.get(str(dri_map.get("dev") or "").lower()))
             job_id = f"feat-{task_id}"
             decision = self.intake_feature(
                 job_id, title=title, project=project, request=request,
-                clickup_task_id=task_id, clickup_task_url=task_url, owner=owner,
+                clickup_task_id=task_id, clickup_task_url=task_url,
+                founder_dri=founder_dri, dev_dri=dev_dri,
                 cu_list_id=t.get("list_id") or self.settings.clickup_list_id)
             adopted_as = ("FEATURE PIPELINE (P0 Intake → P9 Ship) — each stage posts its "
                           "artifact as a subtask and parks here for your `/proceed`, "
@@ -1329,6 +1442,97 @@ class Worker:
         if job:
             await self.clickup.comment(job.get("clickup_task_id") or "",
                                        f"{GATE_PREFIX} 🐑 {message}")
+
+    # ---------- gate SLA & escalation (Epic A5) ----------
+
+    async def sla_forever(self):
+        """Escalate overdue gates: nudge the owner → notify the other DRI
+        (visibility, never authority) → flag for the standup surface. Pure
+        visibility — no job state changes, no CAS involvement."""
+        while True:
+            await asyncio.sleep(self.settings.sla_check_interval_seconds)
+            try:
+                await self._sla_once()
+            except Exception:
+                log.exception("sla sweep failed")
+
+    async def _sla_once(self):
+        now = time.time()
+        for job in self.store.by_status(["awaiting_input"]):
+            if (job.get("kind") or "") != "feature":
+                continue  # v1 items have no DRIs; the inbox overdue flag covers them
+            ws = self._ws_row(job)
+            sla = ws["gate_sla_hours"] if ws and ws.get("gate_sla_hours") is not None \
+                else self.settings.gate_sla_hours
+            if not sla:
+                continue  # 0 disables escalation
+            owner = roles.gate_owner(self.store, self.settings, ws, job)
+            if owner is None or not owner.enforce:
+                # inert without explicit DRIs: solo installs (and pre-upgrade
+                # legacy-owner jobs) get NO new noise — exactly as today
+                continue
+            stage = int(job.get("stage") or 0)
+            # the ladder keys on the gated RUN's id: globally unique, so a
+            # /redo re-park (new run) re-arms it, and a restarted pipeline's
+            # fresh gates can never collide with a dead pipeline's rows
+            runs = [r for r in self.store.stage_runs_for(job["issue_id"])
+                    if r["stage"] == stage and r["gate_posted_at"]]
+            if not runs:
+                continue
+            run = runs[-1]
+            waited = now - run["gate_posted_at"]
+            if waited < sla * 3600:
+                continue
+            await self._sla_escalate(job, ws, owner, stage, run, waited, sla)
+
+    async def _sla_escalate(self, job, ws, owner, stage, run, waited, sla):
+        """One overdue gate's escalation ladder. Each step records its
+        gate_event BEFORE any send (crash = under-notify, never double-fire);
+        UNIQUE(job, kind, ref) makes every step fire exactly once per gate."""
+        job_id = job["issue_id"]
+        task_id = job.get("clickup_task_id") or ""
+        h = int(waited // 3600)
+        title = job.get("title") or job_id
+        # step 1 (≥ 1.0×SLA): re-nudge the owning DRI
+        if self.store.gate_event_add(job_id, "sla_nudge", ref=f"run{run['id']}-step1",
+                                     stage=stage, actor="engine",
+                                     detail=f"waited {h}h of {sla}h SLA"):
+            if owner.clickup_id:
+                await self.clickup.set_assignee(task_id, owner.clickup_id)
+            await self.clickup.comment(
+                task_id, f"{GATE_PREFIX} ⏰ this P{stage} gate has waited {h}h "
+                         f"(SLA {sla}h) — {owner.display}, it needs your `/proceed`, "
+                         "`/redo` or `/skip`.")
+            if self.workspaces:
+                await self.workspaces.notify_gate(
+                    job, f"⏰ {title} — P{stage} gate over SLA ({h}h > {sla}h), "
+                         f"waiting on {owner.display}.")
+        # step 2 (≥ 1.5×SLA): notify the OTHER DRI — visibility, not authority
+        other = roles.other_dri(job, owner.role)
+        if other and waited >= 1.5 * sla * 3600:
+            if self.store.gate_event_add(job_id, "sla_second_dri",
+                                         ref=f"run{run['id']}-step2", stage=stage,
+                                         actor="engine",
+                                         detail=f"waited {h}h of {sla}h SLA"):
+                other_name = roles.dri_display(self.store, other)
+                await self.clickup.comment(
+                    task_id, f"{GATE_PREFIX} ⏰ {other_name}: this P{stage} "
+                             f"{owner.role} gate has waited {h}h (SLA {sla}h) and "
+                             f"{owner.display} hasn't answered. You can't answer this "
+                             f"{owner.role} gate, but they may need a nudge — or an "
+                             "admin can override from the dashboard.")
+                if self.workspaces:
+                    await self.workspaces.notify_gate(
+                        job, f"⏰ {title} — P{stage} gate still unanswered at {h}h; "
+                             f"{other_name}, {owner.display} may need a nudge "
+                             "(visibility only).")
+        # step 3 (≥ 2.0×SLA): record for the standup surface — no more sends
+        if waited >= 2.0 * sla * 3600:
+            self.store.gate_event_add(job_id, "sla_standup_flag",
+                                      ref=f"run{run['id']}-step3", stage=stage,
+                                      actor="engine",
+                                      detail=f"escalation exhausted at {h}h "
+                                             f"of {sla}h SLA")
 
     async def reap_forever(self):
         """A 'running' row older than any plausible live run means the process

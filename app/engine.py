@@ -26,6 +26,7 @@ from .config import (  # noqa: F401 — ENGINE_COMMENT_PREFIXES/GATE_PREFIX re-e
 )
 from .db import JobStore
 from . import fastlane
+from . import roles
 from .feature_prompts import (
     STAGES,
     build_bootstrap_prompt,
@@ -609,6 +610,15 @@ class Engine:
             warnings += ("\n\n⚠️ This stage keeps asking — consider `/redo` with clearer "
                          "guidance or a sharper plan.")
 
+        # gate ownership (Epic A3): who this gate belongs to — drives the
+        # ClickUp assignment, the comment header and the Slack nudge. The
+        # ownership CLAIM in text appears only when enforcement is real
+        # (explicit DRIs); a legacy `owner` value still gets the assignment.
+        gate_owner = roles.gate_owner(
+            self.store, self.settings,
+            self.workspaces.for_job(job) if self.workspaces else None, job)
+        owned = gate_owner is not None and gate_owner.enforce
+
         question = extract_questions_last(payload)
         comments = await self.clickup.comments(job.get("clickup_task_id") or "")
         marker = comments[-1]["id"] if comments else ""
@@ -633,17 +643,22 @@ class Engine:
         self.store.stage_run_gate_posted(run_id)
         await self.clickup.set_status(job.get("clickup_task_id") or "", "awaiting_input")
 
+        owned_note = f" Owned by {gate_owner.display} ({gate_owner.role} gate)." if owned else ""
         if is_ask:
-            header = f"**Question: P{stage} {stage_name(stage)} — work paused, resumes in place.**"
+            header = (f"**Question: P{stage} {stage_name(stage)} — work paused, resumes in "
+                      f"place.{owned_note}**")
             actions = (f"Reply `/proceed <your answer>` — the stage picks up exactly where it "
                        f"stopped. `/redo <notes>` restarts the stage fresh; `/skip` aborts. "
                        f"Here, on any artifact subtask, or on the dashboard.")
         else:
             header = (f"**Gate: P{stage} {stage_name(stage)} — "
-                      f"{'attempt ' + str(job.get('stage_attempts')) if int(job.get('stage_attempts') or 0) > 1 else 'complete'}.**")
+                      f"{'attempt ' + str(job.get('stage_attempts')) if int(job.get('stage_attempts') or 0) > 1 else 'complete'}.{owned_note}**")
             actions = (f"Reply `/proceed <guidance>` to continue to P{min(stage + 1, 9)}, "
                        f"`/redo <notes>` to re-run this stage (or `/redo P<k> <notes>` for an earlier one), "
                        f"or `/skip` to abort — here, on any artifact subtask, or on the dashboard.")
+        if owned:
+            actions += (f" Only {gate_owner.display} (or an admin override from the "
+                        f"dashboard) can answer this gate.")
         gate_body = (
             f"{GATE_PREFIX} {header}\n\n"
             f"{payload[:6000]}\n"
@@ -651,12 +666,16 @@ class Engine:
         )
         await self._comment(job, gate_body, raw=True)
         if self.workspaces:
+            waiting = (f"waiting for {gate_owner.display} ({gate_owner.role} gate)."
+                       if owned else "waiting for a decision.")
             await self.workspaces.notify_gate(
                 job, f"\u23f8\ufe0f {job.get('title') or job['issue_id']} — parked at the "
-                     f"P{stage} {stage_name(stage)} gate, waiting for a decision.")
-        owner = (job.get("owner") or "").strip()
-        if owner:
-            await self.clickup.set_assignee(job.get("clickup_task_id") or "", owner)
+                     f"P{stage} {stage_name(stage)} gate, {waiting}")
+        task_id = job.get("clickup_task_id") or ""
+        if gate_owner and gate_owner.clickup_id:
+            await self.clickup.set_assignee(task_id, gate_owner.clickup_id)
+        elif (job.get("owner") or "").strip():  # legacy fallback, unchanged behavior
+            await self.clickup.set_assignee(task_id, job["owner"])
         # conveyor mirror: doc/folder fields point at the editable artifacts
         await self.sync_doc_fields(job, ns=engine_dir(workspace))
         log.info("job %s parked at P%s gate", job_id, stage)
