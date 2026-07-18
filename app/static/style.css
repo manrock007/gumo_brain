@@ -69,6 +69,12 @@
   .fchip { font-size:11px; font-weight:600; padding:3px 10px; border-radius:99px; background:var(--surface-3);
     color:var(--muted); cursor:pointer; border:0; font-family:inherit; }
   .fchip.on { background:var(--accent-weak); color:var(--accent); }
+  /* per-person queue badge on "Awaiting you" (Epic A4) */
+  .fbadge { display:inline-block; min-width:14px; text-align:center; font-size:10px;
+    font-weight:700; padding:0 4px; border-radius:99px; background:var(--warn);
+    color:var(--bg-2); margin-left:2px; }
+  .me-chip.has-due::after { content:""; display:inline-block; width:6px; height:6px;
+    border-radius:50%; background:var(--warn); margin-left:6px; vertical-align:middle; }
   #inbox-list { flex:1; }
   .row { display:flex; gap:11px; padding:12px 16px; border-bottom:1px solid var(--line); cursor:pointer;
     border-left:3px solid transparent; }
@@ -106,6 +112,7 @@
   .badge.error, .badge.timeout { color:var(--err); background:var(--err-weak); }
   .badge.queued, .badge.received { color:var(--info); background:var(--info-weak); }
   .badge.no_fix, .badge.skipped { color:var(--muted); background:var(--surface-3); }
+  .badge.overdue { color:var(--err); background:var(--err-weak); }
   .badge.kind { background:transparent; color:var(--muted); border:1px solid var(--line-2); font-weight:550; }
   .badge.kind::before { display:none; }
   .chip { display:inline-flex; align-items:center; font-size:10.5px; font-weight:600; padding:1px 8px;
@@ -176,6 +183,10 @@
 
   .gate { border:1px solid var(--warn); border-radius:var(--r); background:var(--surface); padding:12px 14px; }
   .gate .g-h { font-size:11.5px; font-weight:650; color:var(--warn); text-transform:uppercase; letter-spacing:.06em; margin-bottom:8px; }
+  /* gate ownership (Epic A3) */
+  .gate .g-owner { font-size:12px; color:var(--fg-2); margin:-4px 0 8px; }
+  .gate .ovr { display:block; font-size:12px; color:var(--err); margin-top:8px; cursor:pointer; }
+  .gate .btns button[disabled] { opacity:.45; cursor:not-allowed; }
   .q { white-space:pre-wrap; font-size:12.5px; line-height:1.55; background:var(--bg-2); border:1px solid var(--line);
     border-radius:var(--r-sm); padding:9px 11px; max-height:190px; overflow:auto; }
   details.sub { margin-top:8px; font-size:12px; }

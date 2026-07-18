@@ -41,7 +41,7 @@
       <div class="filters">
         <button class="fchip on" data-f="all" onclick="setFilter('all')">All</button>
         <button class="fchip" data-f="active" onclick="setFilter('active')">Active</button>
-        <button class="fchip" data-f="await" onclick="setFilter('await')">Awaiting you</button>
+        <button class="fchip" data-f="await" onclick="setFilter('await')">Awaiting you <span class="fbadge" id="await-badge" style="display:none"></span></button>
       </div>
     </div>
     <div id="inbox-list"><div class="empty">loading&hellip;</div></div>
@@ -79,7 +79,8 @@
             <div class="hint">&hellip;or describe the feature and a ClickUp ticket is created:</div>
             <input id="feat-title" placeholder="Title">
             <textarea id="feat-summary" placeholder="What should be built? Goal, users, constraints, links&hellip;"></textarea>
-            <input id="feat-owner" placeholder="Owner — ClickUp user id (optional, gets gate notifications)">
+            <input id="feat-founder-dri" placeholder="Founder DRI — ClickUp user id or CtrlLoop username (owns P0/P1/P9 gates)">
+            <input id="feat-dev-dri" placeholder="Dev DRI — ClickUp user id or CtrlLoop username (owns P2–P8 gates)">
             <select id="feat-gatemode">
               <option value="full" selected>full &mdash; pause at every stage (default)</option>
               <option value="light">light &mdash; pause at P0/P1/P3/P9 + questions</option>

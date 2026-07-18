@@ -72,11 +72,14 @@ function rowMini(j) {
 
 function row(j) {
   const stageTxt = j.kind === 'feature' ? ` &middot; P${Number(j.stage) || 0} ${esc(j.stage_name || STAGE_NAMES[Number(j.stage) || 0] || '')}` : ` &middot; ${esc(KIND_LABEL[j.kind] || j.kind)}`;
+  // inbox items (Epic A4) carry ownership + SLA state
+  const overdue = j.overdue ? '<span class="badge overdue">overdue</span>' : '';
+  const owner = j.gate_owner ? ` &middot; ${esc(j.gate_owner.display)}${j.gate_owner.is_you ? ' (you)' : ''}` : '';
   return `<div class="row${j.issue_id === sel ? ' sel' : ''}" data-status="${esc(j.status)}" onclick="openItem('${esc(j.issue_id)}')">
     <span class="rail"></span>
     <div class="body">
       <div class="t">${esc(j.title || j.issue_id)}</div>
-      <div class="m"><span class="badge ${esc(j.status)}">${esc(STATUS_LABEL[j.status] || j.status)}</span>${esc(j.project)}${stageTxt}</div>
+      <div class="m"><span class="badge ${esc(j.status)}">${esc(STATUS_LABEL[j.status] || j.status)}</span>${overdue}${esc(j.project)}${stageTxt}${owner}</div>
       ${j.kind === 'feature' ? rowMini(j) : ''}
     </div>
     <span class="when">${fmtAgo(j.updated_at)}</span>
@@ -84,10 +87,16 @@ function row(j) {
 }
 
 function renderInbox() {
-  let items = jobsCache.slice().sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0));
-  items = items.filter(jobInActiveWs);
-  if (filter === 'active') items = items.filter(j => LIVE.includes(j.status));
-  if (filter === 'await') items = items.filter(j => j.status === 'awaiting_input');
+  let items;
+  if (filter === 'await' && inboxCache && inboxCache.items) {
+    // the server-ordered personal queue: overdue first, then oldest gate first
+    items = inboxCache.items.filter(jobInActiveWs);
+  } else {
+    items = jobsCache.slice().sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0));
+    items = items.filter(jobInActiveWs);
+    if (filter === 'active') items = items.filter(j => LIVE.includes(j.status));
+    if (filter === 'await') items = items.filter(j => j.status === 'awaiting_input');
+  }
   // an unassigned member sees an empty instance by design (fail-closed
   // membership) — say why, instead of a bare "nothing here"
   const empty = (ME && ME.role === 'member' && WORKSPACES && !WORKSPACES.length)
@@ -106,6 +115,28 @@ async function refresh(force) {
     const sig = JSON.stringify(jobs);
     if (force || sig !== lastJobs) { lastJobs = sig; jobsCache = jobs; renderInbox(); }
   } catch (e) { document.getElementById('msg').textContent = 'refresh failed: ' + e; }
+  refreshInbox();
+}
+
+// ---------- per-person queue (Epic A4: api/inbox) ----------
+
+let inboxCache = null;
+let lastInbox = '';
+async function refreshInbox() {
+  try {
+    const r = await fetch('api/inbox');
+    if (!r.ok) return;
+    const data = await r.json();
+    const sig = JSON.stringify(data);
+    if (sig === lastInbox) return;
+    lastInbox = sig; inboxCache = data;
+    const n = (data.counts && data.counts.mine) || 0;
+    const b = document.getElementById('await-badge');
+    if (b) { b.textContent = String(n); b.style.display = n ? '' : 'none'; }
+    const chip = document.getElementById('me-chip');
+    if (chip) chip.classList.toggle('has-due', n > 0);
+    if (filter === 'await') renderInbox();
+  } catch (e) { /* advisory — the jobs list still renders */ }
 }
 
 // ---------- selection / routing ----------
@@ -311,33 +342,49 @@ function gatePacket(data) {
   const feature = j.kind === 'feature';
   if (j.status !== 'awaiting_input' && j.status !== 'error' && j.status !== 'timeout') return '';
   const id = esc(j.issue_id);
+  // role-exclusive gates (Epic A3): the server enforces; the UI mirrors it —
+  // non-owners see disabled buttons, admins get an explicit audited override
+  const owner = data.gate_owner;
+  const locked = !!(feature && owner && owner.enforce && !owner.is_you);
+  const isAdmin = ME && ME.role === 'admin';
+  const dis = locked ? ` disabled title="Owned by ${esc(owner.display)} — only they (or an admin override) can answer"` : '';
+  const ownerLine = feature && owner && owner.enforce
+    ? `<div class="g-owner">Owned by <b>${esc(owner.display)}</b> &middot; ${esc(owner.role)} gate${owner.is_you ? ' &mdash; you' : ''}</div>` : '';
+  const ovrBox = locked && isAdmin
+    ? `<label class="ovr"><input type="checkbox" id="ovr-${id}" onchange="armOverride(this.checked)"> answer anyway (admin override &mdash; audited)</label>` : '';
   if (j.status !== 'awaiting_input') {
     // re-kick (redo) exists only for feature pipelines
     if (!feature) return `<div class="gate"><div class="g-h">${esc(j.status)}</div>
       <div class="q">${esc((j.detail || '(no detail)').slice(0, 600))}</div></div>`;
     return `<div class="gate"><div class="g-h">Stage ${j.status} — re-kick</div>
-      <div class="answer"><div class="btns">
-      <button class="redo" onclick="answer('${id}','redo',this)">Re-kick (redo)</button></div></div></div>`;
+      ${ownerLine}<div class="answer"><div class="btns">
+      <button class="redo" onclick="answer('${id}','redo',this)"${dis}>Re-kick (redo)</button></div>${ovrBox}</div></div>`;
   }
   const isAsk = feature && j.gate_kind === 'ask';
   const goLabel = isAsk ? 'Answer' : 'Proceed';
   const head = isAsk ? 'The engine asks — resumes in place'
     : (feature ? 'Gate — P' + j.stage + ' ' + esc(j.stage_name || '') : 'Needs your input');
   const btns = feature
-    ? `<button class="go" onclick="answer('${id}','proceed',this)">${goLabel}</button>
-       <button class="redo" onclick="answer('${id}','redo',this)">Redo</button>
-       <button class="no" onclick="answer('${id}','skip',this)">Skip</button>`
+    ? `<button class="go" onclick="answer('${id}','proceed',this)"${dis}>${goLabel}</button>
+       <button class="redo" onclick="answer('${id}','redo',this)"${dis}>Redo</button>
+       <button class="no" onclick="answer('${id}','skip',this)"${dis}>Skip</button>`
     : `<button class="go" onclick="answer('${id}','proceed',this)">Proceed</button>
        <button class="no" onclick="answer('${id}','skip',this)">Skip</button>`;
   const hint = feature
     ? `<div class="hint">Redo re-runs this stage with your notes as corrections &mdash; optionally prefix 'P3 ' to redo an earlier stage.</div>`
     : '';
   return `<div class="gate"><div class="g-h">${head}</div>
+    ${ownerLine}
     <div class="q">${esc(j.question || (j.detail || '(see analysis)').slice(0, 500))}</div>
     ${j.evidence ? `<details class="sub" data-key="g-ev"><summary>evidence</summary><pre>${linkify(j.evidence)}</pre></details>` : ''}
     ${j.analysis ? `<details class="sub" data-key="g-an"><summary>full analysis</summary><pre>${esc(j.analysis)}</pre></details>` : ''}
     <div class="answer"><textarea id="ans-${id}" data-draft="gb-draft-${id}" placeholder="Your answer / guidance&hellip;"></textarea>
-    ${hint}<div class="btns">${btns}</div></div></div>`;
+    ${hint}<div class="btns">${btns}</div>${ovrBox}</div></div>`;
+}
+
+// arm/disarm the gate buttons when the admin toggles the override checkbox
+function armOverride(on) {
+  for (const b of document.querySelectorAll('#d-thread .gate .btns button')) b.disabled = !on;
 }
 
 function renderDetail(data) {
@@ -677,11 +724,12 @@ async function answer(id, action, btn) {
   const box = document.getElementById('ans-' + id);
   const text = box ? box.value.trim() : '';
   if (action === 'skip' && !confirm('Abort this job? (feature branches are left intact)')) return;
+  const ovr = document.getElementById('ovr-' + id);
   btn.disabled = true; msg.textContent = 'Recording decision…';
   try {
     const r = await fetch('api/jobs/' + encodeURIComponent(id) + '/answer', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({action, answer: text}),
+      body: JSON.stringify({action, answer: text, override: !!(ovr && ovr.checked)}),
     });
     const data = await r.json();
     if (r.ok) {
@@ -928,7 +976,8 @@ async function submitFeature(ev) {
     clickup: document.getElementById('feat-clickup').value.trim(),
     title: document.getElementById('feat-title').value.trim(),
     summary: document.getElementById('feat-summary').value.trim(),
-    owner: document.getElementById('feat-owner').value.trim(),
+    founder_dri: document.getElementById('feat-founder-dri').value.trim(),
+    dev_dri: document.getElementById('feat-dev-dri').value.trim(),
     gate_mode: document.getElementById('feat-gatemode').value,
     related_to: document.getElementById('feat-related').value.trim(),
   };
@@ -945,7 +994,8 @@ async function submitFeature(ev) {
       ? `Pipeline started for <b>${esc(data.title)}</b>` + (data.clickup_task_url ? ` &mdash; <a href="${esc(data.clickup_task_url)}" target="_blank">ClickUp ticket</a>` : '')
       : 'Error: ' + esc(data.detail || r.status);
     if (r.ok) {
-      for (const id of ['feat-clickup', 'feat-title', 'feat-summary', 'feat-owner', 'feat-related'])
+      for (const id of ['feat-clickup', 'feat-title', 'feat-summary',
+                        'feat-founder-dri', 'feat-dev-dri', 'feat-related'])
         document.getElementById(id).value = '';
       refresh(true);
     }
@@ -1100,10 +1150,13 @@ async function loadUsers() {
       const flags = [u.disabled ? 'disabled' : '', u.must_change_pw ? 'temp pw' : '']
         .filter(Boolean).join(' · ');
       const self = ME && u.username === ME.username;
+      const cu = u.clickup_user_id
+        ? esc(u.clickup_user_id) : '<span class="hint" style="margin:0">not linked</span>';
       // no self-reset: the admin reset ARMS the temp-pw flag (it hands out a
       // new temporary credential) — resetting yourself just loops the forced
       // change forever. Your own password changes live in Account below.
-      return `<tr><td>${name}</td><td>${esc(u.role)}</td><td>${esc(flags)}</td><td>
+      return `<tr><td>${name}</td><td>${esc(u.role)}</td><td>${cu}</td><td>${esc(flags)}</td><td>
+        <button onclick="linkClickUp('${esc(u.username)}')">${u.clickup_user_id ? 'Edit' : 'Link'} ClickUp id</button>
         ${self ? '<span class="hint" style="margin:0">you &mdash; change your password in Account below</span>'
                : `<button onclick="resetUserPw('${esc(u.username)}')">Reset password</button>
         <button onclick="toggleUser('${esc(u.username)}', ${u.disabled ? 'false' : 'true'})">${u.disabled ? 'Enable' : 'Disable'}</button>
@@ -1111,7 +1164,7 @@ async function loadUsers() {
       </td></tr>`;
     }).join('');
     document.getElementById('users-list').innerHTML =
-      `<table><tr><th>user</th><th>role</th><th>flags</th><th></th></tr>${rows}</table>`;
+      `<table><tr><th>user</th><th>role</th><th>ClickUp id</th><th>flags</th><th></th></tr>${rows}</table>`;
   } catch (e) {}
 }
 
@@ -1124,6 +1177,16 @@ async function patchUser(username, body, okMsg) {
     uiMsg(r.ok ? okMsg : 'Error: ' + (data.detail || r.status));
     if (r.ok) loadUsers();
   } catch (e) { uiMsg('Error: ' + e); }
+}
+
+function linkClickUp(username) {
+  // Epic A1: ClickUp identity ↔ CtrlLoop user — gate verbs by comment are
+  // attributed (and refused when strictness demands a mapped commenter)
+  const cu = prompt('ClickUp user id for ' + username
+    + ' (numeric — see the member profile in ClickUp; empty clears the link):');
+  if (cu === null) return;
+  patchUser(username, { clickup_user_id: cu.trim() },
+            'ClickUp link updated for ' + username + '.');
 }
 
 function resetUserPw(username) {
