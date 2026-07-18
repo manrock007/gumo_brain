@@ -22,7 +22,11 @@ The container needs outbound HTTPS to GitHub, Anthropic, and (if enabled)
 Sentry, ClickUp, and Slack webhooks. Inbound: the dashboard/API port and the
 `/webhooks/sentry` endpoint.
 
-## 2. Install (fresh instance)
+## 2. Install (fresh instance) — the from-zero walkthrough
+
+Every code default is neutral: a fresh instance knows nothing about any
+product until you tell it. **No Gumo value — or any other customer value — is
+involved at any point** (the example appendix below is documentation only).
 
 1. Run the image with a persistent volume mounted at `DATA_DIR` and these
    minimum env vars:
@@ -37,10 +41,30 @@ Sentry, ClickUp, and Slack webhooks. Inbound: the dashboard/API port and the
    SESSION_COOKIE_SECURE=true         # behind any TLS-terminating proxy
    ```
 
+   First boot creates one admin user and one empty workspace named
+   "Default" (no repos, no product name — the instance context applies until
+   you set one).
+
 2. Sign in as the admin. The dashboard greets you with the **first-run
-   checklist** (ENGINE.md §14): set your business context, point a workspace
-   at your repositories, bootstrap product memory, invite your team. Every
-   step auto-detects; dismiss the card when you're done.
+   checklist** (ENGINE.md §14) with every step unticked:
+   - **Business context** — Project context panel (or `PUT /api/context`):
+     set your product name and paste your business context (the textarea
+     ships a fill-in template).
+   - **Repositories** — Settings → Workspaces (or
+     `PATCH /api/workspaces/{id}` with
+     `{"repos": [{"slug": "api", "repo": "you/api", "base": "main"}], "canonical_project": "api"}`):
+     add your first repo; the slug immediately appears in the intake pickers
+     (`GET /api/projects`).
+   - **Memory** — Product brain panel: bootstrap each repo's engine memory
+     (a draft PR you review).
+   - **Team** — Settings → Users: add members, assign them to workspaces.
+
+3. Submit your first feature (project + title on the dashboard, or
+   `POST /api/features {"project": "api", "title": "…"}`) — it queues at P0
+   even with no ClickUp configured (ClickUp is best-effort visibility,
+   never required). Dismiss the checklist card when you're done.
+
+   This whole path is pinned by `tests/test_install_from_zero.py`.
 
 3. Optional integrations, per workspace once configured globally:
    - **Sentry intake**: `SENTRY_CLIENT_SECRET`, `SENTRY_AUTH_TOKEN`,

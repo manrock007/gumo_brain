@@ -26,6 +26,7 @@ from .fixer import (
     BASE_ALLOWED_TOOLS,
     TRANSIENT_ERROR_RE,
     BranchLostError,
+    engine_dir,
     prepare_feature_workspace,
     prepare_workspace,
     run_claude,
@@ -397,22 +398,27 @@ class Worker:
             pname, brief = self._job_context(row)
             async with self.locks.for_repo(target.repo):  # workspace toucher
                 emit("status", "preparing the repository workspace")
+                # workspace FIRST: the prompt's memory-write paths resolve the
+                # repo's engine namespace from the actual clone, so legacy
+                # `.gumo/` repos keep feeding memory (ENGINE.md §4)
                 if phase == 2:
+                    workspace = await prepare_workspace(self.settings, target, branch, keep_branch=True)
                     prompt = build_phase2_prompt(
                         target=target, branch=branch, issue=issue_info, stacktrace=stacktrace,
                         clickup_task_id=task_id,
                         analysis=row.get("analysis") or "(analysis missing)",
                         guidance=row.get("guidance") or "(no guidance recorded)",
                         product_name=pname, business_context=brief,
+                        ns=engine_dir(workspace),
                     )
-                    workspace = await prepare_workspace(self.settings, target, branch, keep_branch=True)
                 else:
+                    workspace = await prepare_workspace(self.settings, target, branch)
                     prompt = build_fix_prompt(
                         target=target, branch=branch, issue=issue_info, stacktrace=stacktrace,
                         clickup_task_id=task_id,
                         product_name=pname, business_context=brief,
+                        ns=engine_dir(workspace),
                     )
-                    workspace = await prepare_workspace(self.settings, target, branch)
 
                 log.info("running claude for issue %s phase %s (%s)", issue_id, phase, target.repo)
                 result = await run_claude(
@@ -499,22 +505,25 @@ class Worker:
         try:
             pname, brief = self._job_context(row)
             emit("status", "preparing the repository workspace")
+            # workspace FIRST — see _process_sentry: prompt memory paths follow
+            # the clone's actual engine namespace
             if phase == 2:
+                workspace = await prepare_workspace(self.settings, target, branch, keep_branch=True)
                 prompt = build_task_implement_prompt(
                     target=target, branch=branch, task=task_info, request=request_text,
                     clickup_task_id=task_id or None,
                     analysis=row.get("analysis") or "(analysis missing)",
                     guidance=row.get("guidance") or "(no guidance recorded)",
                     product_name=pname, business_context=brief,
+                    ns=engine_dir(workspace),
                 )
-                workspace = await prepare_workspace(self.settings, target, branch, keep_branch=True)
             else:
+                workspace = await prepare_workspace(self.settings, target, branch)
                 prompt = build_task_plan_prompt(
                     target=target, branch=branch, task=task_info, request=request_text,
                     clickup_task_id=task_id or None,
                     product_name=pname, business_context=brief,
                 )
-                workspace = await prepare_workspace(self.settings, target, branch)
 
             log.info("running claude for request %s phase %s (%s)", job_id, phase, target.repo)
             result = await run_claude(

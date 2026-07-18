@@ -5,7 +5,7 @@ business_context, docs/ENGINE.md §10) as keyword args with the historical
 defaults, so the engine works for any product — call sites pass the values
 from Settings."""
 
-from .config import DEFAULT_PRODUCT_NAME, RepoTarget
+from .config import DEFAULT_PRODUCT_NAME, ENGINE_DIR, RepoTarget
 
 BUSINESS_CONTEXT_CAP = 8000  # fits business + workspace layers without crowding the work
 
@@ -71,22 +71,19 @@ Post an update at each milestone: (1) root cause identified — explain it, \
 (4) done — summary + PR link. Short, information-dense updates."""
 
 
-def _memory_write_block() -> str:
-    # Deliberately namespace-AGNOSTIC: sentry/task prompts are built before the
-    # workspace is cloned, so the run itself resolves which engine dir the repo
-    # carries. Naming only one dir here would silently stop memory writes on
-    # repos using the other one — and bulk traffic must feed memory or it
-    # decays (docs/ENGINE.md §4).
-    return """
+def _memory_write_block(ns: str = ENGINE_DIR) -> str:
+    # `ns` is the engine namespace RESOLVED FROM THE ACTUAL CLONE — worker
+    # flows prepare the workspace before building these prompts, so legacy
+    # `.gumo/` repos keep feeding memory (bulk traffic must feed memory or it
+    # decays, docs/ENGINE.md §4) and fresh repos see only `.ctrlloop/`.
+    return f"""
 
 ## Product memory (include in the same commit/PR)
 
-This repo's engine memory directory is `.ctrlloop/memory/` — or `.gumo/memory/`
-on repos that still carry the legacy tree (use whichever EXISTS; never create
-the other). If one exists: add a one-entry changelog file
-`<memory dir>/changelog/<YYYY-MM-DD>-<short-slug>.md` (2-4 lines: what changed,
-why, PR link placeholder), and update any `map.md` / `architecture.md` section
-your change makes inaccurate. If neither directory exists, skip this."""
+If `{ns}/memory/` exists in this repo: add a one-entry changelog file
+`{ns}/memory/changelog/<YYYY-MM-DD>-<short-slug>.md` (2-4 lines: what changed, why,
+PR link placeholder), and update any `{ns}/memory/map.md` / `architecture.md`
+section your change makes inaccurate. If `{ns}/memory/` does not exist, skip this."""
 
 
 def _test_block(target: RepoTarget) -> str:
@@ -111,8 +108,9 @@ bug when the suite makes that natural. Report test results in the PR body and th
 def build_fix_prompt(*, target: RepoTarget, branch: str, issue: dict, stacktrace: str,
                      clickup_task_id: str | None,
                      product_name: str = DEFAULT_PRODUCT_NAME,
-                     business_context: str = "") -> str:
-    return f"""{_common_header(target, branch, issue, stacktrace, product_name, business_context)}{_ticket_block(clickup_task_id)}{_test_block(target)}{_memory_write_block()}
+                     business_context: str = "",
+                     ns: str = ENGINE_DIR) -> str:
+    return f"""{_common_header(target, branch, issue, stacktrace, product_name, business_context)}{_ticket_block(clickup_task_id)}{_test_block(target)}{_memory_write_block(ns)}
 
 ## Your task
 
@@ -142,8 +140,9 @@ this repository — print `NO_FIX:` followed by a 2-3 sentence explanation inste
 def build_phase2_prompt(*, target: RepoTarget, branch: str, issue: dict, stacktrace: str,
                         clickup_task_id: str | None, analysis: str, guidance: str,
                         product_name: str = DEFAULT_PRODUCT_NAME,
-                        business_context: str = "") -> str:
-    return f"""{_common_header(target, branch, issue, stacktrace, product_name, business_context)}{_ticket_block(clickup_task_id)}{_test_block(target)}{_memory_write_block()}
+                        business_context: str = "",
+                        ns: str = ENGINE_DIR) -> str:
+    return f"""{_common_header(target, branch, issue, stacktrace, product_name, business_context)}{_ticket_block(clickup_task_id)}{_test_block(target)}{_memory_write_block(ns)}
 
 ## Prior analysis (from your earlier investigation)
 
@@ -228,8 +227,9 @@ followed by a 2-3 sentence explanation that says what information is missing.
 def build_task_implement_prompt(*, target: RepoTarget, branch: str, task: dict, request: str,
                                 clickup_task_id: str | None, analysis: str, guidance: str,
                                 product_name: str = DEFAULT_PRODUCT_NAME,
-                                business_context: str = "") -> str:
-    return f"""{_task_header(target, branch, task, request, product_name, business_context)}{_ticket_block(clickup_task_id)}{_test_block(target)}{_memory_write_block()}
+                                business_context: str = "",
+                                ns: str = ENGINE_DIR) -> str:
+    return f"""{_task_header(target, branch, task, request, product_name, business_context)}{_ticket_block(clickup_task_id)}{_test_block(target)}{_memory_write_block(ns)}
 
 ## Prior analysis (from your earlier investigation)
 
