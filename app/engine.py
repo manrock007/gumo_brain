@@ -25,7 +25,9 @@ from .config import (  # noqa: F401 — ENGINE_COMMENT_PREFIXES/GATE_PREFIX re-e
     Settings,
 )
 from .db import JobStore
+from . import audit
 from . import autonomy
+from . import budgets
 from . import fastlane
 from . import people
 from . import roles
@@ -271,6 +273,42 @@ class Engine:
         if target is None:
             self.store.set_status(job_id, "skipped", detail=f"no repo mapped for '{job.get('project')}'")
             return
+        # Epic G4 (blocker 4): budget block at the feature-stage dispatch, BEFORE
+        # a run is opened — so pipeline state (stage/artifacts/gate answer) is
+        # never discarded. A non-forced stage at >=100% parks as 'error' with a
+        # budget reason (re-kickable from the dashboard with override, which sets
+        # forced and audits BUDGET_OVERRIDE below). Budget 0 is inert.
+        forced = bool(job.get("forced"))
+        blocked, bstatus = budgets.should_block(
+            self.store, self.settings,
+            self.store.workspace_get(job["workspace_id"]) if job.get("workspace_id") else None,
+            forced)
+        if blocked:
+            reason = (f"budget block at P{stage}: ${bstatus['spent']:.2f} of "
+                      f"${bstatus['budget']:.2f} ({bstatus['pct']}%) this month — "
+                      f"re-kick with override to continue the pipeline")
+            self.store.set_status(job_id, "error", detail=reason)
+            try:
+                self.store.inbox_item_add(
+                    "budget_block", f"budget:{job_id}",
+                    title=f"Budget block — {job.get('title') or job_id}",
+                    body=reason, workspace_id=job.get("workspace_id"),
+                    source="budget", source_sig=f"budget:{job_id}")
+            except Exception:
+                log.debug("budget-block inbox add failed", exc_info=True)
+            audit.record(self.store, audit.BUDGET_BLOCK, actor="engine", actor_kind="system",
+                         scope="workspace", workspace_id=job.get("workspace_id"), job_id=job_id,
+                         detail={"stage": stage, "spent": bstatus["spent"],
+                                 "budget": bstatus["budget"], "pct": bstatus["pct"]})
+            log.info("feature %s P%s budget-blocked (%s%%)", job_id, stage, bstatus["pct"])
+            return
+        if forced and bstatus["state"] == "block":
+            # an explicit over-budget override re-kick — the run proceeds, audited.
+            audit.record(self.store, audit.BUDGET_OVERRIDE, actor="engine",
+                         actor_kind="system", scope="workspace",
+                         workspace_id=job.get("workspace_id"), job_id=job_id,
+                         detail={"stage": stage, "spent": bstatus["spent"],
+                                 "budget": bstatus["budget"], "forced": True})
         branch = self._branch(job)
         # conveyor mirror: slide the ticket's Stage card + link the live view
         await self.sync_stage_field(job, str(stage))

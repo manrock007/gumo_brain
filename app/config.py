@@ -301,6 +301,11 @@ class Settings(BaseSettings):
     # Instance fallback for the per-workspace budget column; 0 = no budget
     # (spend pacing alerts + digest budget section stay inert).
     budget_monthly_usd: float = 0
+    # Epic G4: budget ladder. warn at >= this pct of budget; block non-forced
+    # Claude runs at >= 100%. block_enabled=False = warn-only (never blocks —
+    # neutral/safe). budget 0 stays inert (state always 'ok').
+    budget_warn_pct: int = 80
+    budget_block_enabled: bool = True
     # Proposal lane (I5) windows/thresholds.
     proposal_window_days: int = 30
     proposal_friction_min: int = 3

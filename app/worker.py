@@ -20,7 +20,7 @@ import time
 import uuid
 from pathlib import Path
 
-from . import analytics, audit, autonomy, outcome, people, roles
+from . import analytics, audit, autonomy, budgets, outcome, people, roles
 from .clickup import ClickUp
 from .config import ENGINE_NAME, Settings
 from .db import JobStore
@@ -428,6 +428,13 @@ class Worker:
                 issue_id, "skipped",
                 detail=f"daily cap of {self.settings.max_runs_per_day} Claude runs reached",
             )
+            return
+
+        # Epic G4: budget block BEFORE a Claude run is dispatched. Mirrors the
+        # daily-cap posture exactly — forced (live-sentry webhook / manual)
+        # runs are exempt, matching runs_today above (never stricter than the
+        # existing cap for the sentry lane).
+        if self._budget_block(self.store.get(issue_id), forced):
             return
 
         target = self.settings.repo_for_project(project_slug)
@@ -1884,6 +1891,38 @@ class Worker:
             if picked >= self.settings.sweep_top_n:
                 break
         log.info("sweep done: %d candidates enqueued (grading decides the rest)", picked)
+
+    def _budget_block(self, job: dict | None, forced: bool) -> bool:
+        """Epic G4: park a job when its workspace is at/over 100% of budget and
+        the run is not forced. Returns True when it parked the job (caller
+        returns without dispatching). Fail-closed to NOT blocking when budget is
+        inert (0). Never blocks a forced run (the admin override affordance)."""
+        if job is None:
+            return False
+        ws = None
+        ws_id = job.get("workspace_id")
+        if ws_id is not None:
+            ws = self.store.workspace_get(ws_id)
+        blocked, status = budgets.should_block(self.store, self.settings, ws, forced)
+        if not blocked:
+            return False
+        reason = (f"budget block: ${status['spent']:.2f} of ${status['budget']:.2f} "
+                  f"({status['pct']}%) this month — re-kick with override to run anyway")
+        self.store.set_status(job["issue_id"], "error", detail=reason)
+        try:
+            self.store.inbox_item_add(
+                "budget_block", f"budget:{job['issue_id']}",
+                title=f"Budget block — {job.get('title') or job['issue_id']}",
+                body=reason, workspace_id=ws_id,
+                source="budget", source_sig=f"budget:{job['issue_id']}")
+        except Exception:
+            log.debug("budget-block inbox add failed", exc_info=True)
+        audit.record(self.store, audit.BUDGET_BLOCK, actor="engine", actor_kind="system",
+                     scope="workspace", workspace_id=ws_id, job_id=job["issue_id"],
+                     detail={"spent": status["spent"], "budget": status["budget"],
+                             "pct": status["pct"]})
+        log.info("job %s budget-blocked (%s%% of budget)", job["issue_id"], status["pct"])
+        return True
 
     def _janitor_once(self):
         """Daily janitor body (now driven by the routine scheduler): prune run

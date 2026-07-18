@@ -717,6 +717,24 @@ async def workspaces_member(workspace_id: int, body: MemberBody):
     return _ws_svc().public(store.workspace_get(workspace_id))
 
 
+@app.get("/api/budgets")
+async def budgets_view(user: dict = Depends(require_user)):
+    """Per accessible workspace spend vs budget (Epic G4). Membership-scoped:
+    admins see all, members see their workspaces."""
+    from . import budgets as budgets_mod
+    store: JobStore = app.state.store
+    is_admin = (user.get("role") or "") in ("admin", "instance_admin")
+    my_ws = None if is_admin else store.workspace_ids_for_user(user["id"])
+    out = []
+    for ws in store.workspace_list():
+        if my_ws is not None and ws["id"] not in my_ws:
+            continue
+        st = budgets_mod.budget_status(store, settings, ws)
+        out.append({"workspace_id": ws["id"], "slug": ws.get("slug"),
+                    "name": ws.get("name") or ws.get("slug"), **st})
+    return {"budgets": out, "block_enabled": settings.budget_block_enabled}
+
+
 @app.get("/api/jobs")
 async def jobs(user: dict = Depends(require_user)):
     store: JobStore = app.state.store
