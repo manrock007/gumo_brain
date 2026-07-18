@@ -102,9 +102,9 @@ def bootstrap_admin(store: JobStore, settings: Settings):
         log.warning("no users and no CTRLLOOP_ADMIN_PASSWORD/DASHBOARD_PASSWORD set — "
                     "dashboard and API are unusable until one is provided")
         return
-    store.user_create(username, hash_password(password), role="admin",
+    store.user_create(username, hash_password(password), role="instance_admin",
                       must_change_pw=False)
-    log.info("bootstrapped admin user '%s'", username)
+    log.info("bootstrapped instance_admin user '%s'", username)
 
 
 def verify_login(store: JobStore, settings: Settings,
@@ -289,7 +289,13 @@ def require_user(request: Request) -> dict:
 
 
 def require_admin(request: Request) -> dict:
+    """Deprecated alias for require_instance_admin (Epic E3) — kept to limit
+    churn at existing call sites."""
+    return require_instance_admin(request)
+
+
+def require_instance_admin(request: Request) -> dict:
     user = require_user(request)
-    if user.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="admin role required")
+    if not _is_instance_admin(user):
+        raise HTTPException(status_code=403, detail="instance admin role required")
     return user

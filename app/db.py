@@ -9,6 +9,20 @@ from contextlib import contextmanager
 # owner/name + number out of a GitHub PR url (kept escape-simple on purpose)
 PR_URL_PARTS_RE = re.compile(r"github\.com/([\w.-]+/[\w.-]+)/pull/(\d+)")
 
+
+def normalize_role(role: str) -> str:
+    """Epic E3: legacy 'admin' reads as 'instance_admin'. A read-side shim so
+    the ~14 call sites reading users.role directly all see the new vocabulary
+    even for a row the one-shot migration somehow missed."""
+    return "instance_admin" if role == "admin" else role
+
+
+def _norm_user(row) -> dict:
+    d = dict(row)
+    if "role" in d:
+        d["role"] = normalize_role(d["role"])
+    return d
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
     issue_id TEXT PRIMARY KEY,       -- Sentry issue id, or 'task-/feat-/mem-<id>' for other kinds
@@ -540,6 +554,11 @@ MIGRATIONS = {  # table -> columns added after that table first shipped (in-plac
         "resumed": "INTEGER NOT NULL DEFAULT 0",
         "transcript": "TEXT DEFAULT ''",
     },
+    "workspace_members": {
+        # Epic E3 RBAC v2: workspace-scoped role + per-member repo restriction.
+        "role": "TEXT NOT NULL DEFAULT 'member'",   # admin | member | viewer
+        "repos": "TEXT NOT NULL DEFAULT '[]'",       # JSON slug list; [] = all repos in ws
+    },
     "gate_chat": {
         "cost_usd": "REAL",
         "num_turns": "INTEGER",
@@ -607,6 +626,11 @@ class JobStore:
             # external_id rows, i.e. every local account, are exempt).
             c.execute("""CREATE UNIQUE INDEX IF NOT EXISTS idx_users_external_id
                          ON users(auth_provider, external_id) WHERE external_id != ''""")
+            # Epic E3 RBAC v2: instance-role vocabulary becomes
+            # instance_admin | member. One-shot rewrite of legacy 'admin' rows
+            # (idempotent — a second boot matches nothing). A read-side shim
+            # (normalize_role) additionally covers any row that slips through.
+            c.execute("UPDATE users SET role='instance_admin' WHERE role='admin'")
             # Epic D4: the memory-retrieval index lives beside the data it
             # mirrors. SQLite built without FTS5 (exotic) degrades to ABSENT
             # retrieval — fail-open ONLY for a read enhancement: no control
@@ -868,6 +892,27 @@ class JobStore:
                 c.execute("DELETE FROM workspace_members WHERE workspace_id = ? AND user_id = ?",
                           (workspace_id, user_id))
 
+    def workspace_member_row(self, workspace_id: int, user_id: int) -> dict | None:
+        """The membership row (Epic E3: role + repos), or None when not a member."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM workspace_members WHERE workspace_id = ? AND user_id = ?",
+                (int(workspace_id), int(user_id))).fetchone()
+            return dict(row) if row else None
+
+    def workspace_member_set_role(self, workspace_id: int, user_id: int,
+                                  role: str = "member", repos: list | None = None):
+        """Upsert a member with an explicit workspace role + repo allow-list."""
+        role = role if role in ("admin", "member", "viewer") else "member"
+        repos_json = json.dumps(repos or [])
+        with self._conn() as c:
+            c.execute(
+                """INSERT INTO workspace_members (workspace_id, user_id, role, repos)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(workspace_id, user_id) DO UPDATE SET
+                     role = excluded.role, repos = excluded.repos""",
+                (int(workspace_id), int(user_id), role, repos_json))
+
     def workspace_ids_for_user(self, user_id: int) -> set[int]:
         with self._conn() as c:
             rows = c.execute("SELECT workspace_id FROM workspace_members WHERE user_id = ?",
@@ -915,7 +960,7 @@ class JobStore:
         with self._conn() as c:
             row = c.execute("SELECT * FROM users WHERE username = ?",
                             ((username or "").strip(),)).fetchone()
-            return dict(row) if row else None
+            return _norm_user(row) if row else None
 
     def user_count(self) -> int:
         with self._conn() as c:
@@ -934,7 +979,7 @@ class JobStore:
             rows = c.execute(
                 "SELECT id, username, role, clickup_user_id, disabled, must_change_pw, "
                 "created_at, updated_at FROM users ORDER BY username").fetchall()
-            return [dict(r) for r in rows]
+            return [_norm_user(r) for r in rows]
 
     def user_for_clickup_id(self, cu_id: str) -> dict | None:
         """The ENABLED user a ClickUp identity maps to. Fails closed on
@@ -947,7 +992,7 @@ class JobStore:
             rows = c.execute(
                 "SELECT * FROM users WHERE clickup_user_id = ? AND disabled = 0 LIMIT 2",
                 (cu_id,)).fetchall()
-            return dict(rows[0]) if len(rows) == 1 else None
+            return _norm_user(rows[0]) if len(rows) == 1 else None
 
     def user_by_external_id(self, provider: str, external_id: str) -> dict | None:
         """The user an IdP identity maps to (Epic E1). Keyed on
@@ -959,7 +1004,7 @@ class JobStore:
             row = c.execute(
                 "SELECT * FROM users WHERE auth_provider = ? AND external_id = ? LIMIT 1",
                 (provider, external_id)).fetchone()
-            return dict(row) if row else None
+            return _norm_user(row) if row else None
 
     def instance_admin_count(self, enabled_only: bool = True) -> int:
         """Instance admins (Epic E1/E3 — accept both legacy 'admin' and
@@ -1091,7 +1136,7 @@ class JobStore:
                 return None
             c.execute("UPDATE auth_sessions SET last_seen = ? WHERE token_hash = ?",
                       (now, token_hash))
-            return dict(row)
+            return _norm_user(row)
 
     def auth_session_delete(self, token_hash: str):
         with self._conn() as c:

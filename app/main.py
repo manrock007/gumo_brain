@@ -222,6 +222,16 @@ class UserPatchBody(BaseModel):
     person_notes: str | None = None
 
 
+def _normalize_instance_role(role) -> str | None:
+    """Epic E3: instance-role vocabulary is {instance_admin, member}. Legacy
+    'admin' is accepted as an alias (normalized) so older clients never lock
+    themselves out; anything else is invalid (returns None)."""
+    role = (role or "").strip()
+    if role == "admin":
+        return "instance_admin"
+    return role if role in ("instance_admin", "member") else None
+
+
 def _public_user(u: dict) -> dict:
     return {"username": u["username"], "role": u["role"],
             "disabled": bool(u.get("disabled")),
@@ -493,7 +503,7 @@ async def people_list(user: dict = Depends(require_user)):
     org's structure never leaks (same 404-posture as workspaces)."""
     store: JobStore = app.state.store
     rows = store.people_all()
-    if user.get("role") == "admin":
+    if user.get("role") in ("admin", "instance_admin"):
         return [{"username": p["username"],
                  "person_role": p.get("person_role") or "",
                  "areas": people._areas_of(p),
@@ -526,13 +536,15 @@ async def users_create(body: UserCreateBody):
     if not USERNAME_RE.match(username):
         raise HTTPException(status_code=400,
                             detail="username: 2-32 chars, letters/digits/._- , starting alphanumeric")
-    if body.role not in ("admin", "member"):
-        raise HTTPException(status_code=400, detail="role must be 'admin' or 'member'")
+    role = _normalize_instance_role(body.role)
+    if role is None:
+        raise HTTPException(status_code=400,
+                            detail="role must be 'instance_admin' or 'member'")
     if len(body.password) < 8:
         raise HTTPException(status_code=400, detail="password must be at least 8 characters")
     if store.user_get(username):
         raise HTTPException(status_code=409, detail=f"user '{username}' already exists")
-    user = store.user_create(username, hash_password(body.password), role=body.role,
+    user = store.user_create(username, hash_password(body.password), role=role,
                              must_change_pw=True)
     return _public_user(user)
 
@@ -545,11 +557,18 @@ async def users_patch(username: str, body: UserPatchBody,
     if user is None:
         raise HTTPException(status_code=404, detail=f"unknown user '{username}'")
     if body.role is not None:
-        if body.role not in ("admin", "member"):
-            raise HTTPException(status_code=400, detail="role must be 'admin' or 'member'")
-        if user["username"] == admin["username"] and body.role != "admin":
+        role = _normalize_instance_role(body.role)
+        if role is None:
+            raise HTTPException(status_code=400,
+                                detail="role must be 'instance_admin' or 'member'")
+        if user["username"] == admin["username"] and role != "instance_admin":
             raise HTTPException(status_code=400, detail="you cannot demote yourself")
-        store.user_set(username, role=body.role)
+        # never demote the last enabled instance admin (fail closed)
+        if role != "instance_admin" and user.get("role") == "instance_admin" \
+                and store.instance_admin_count(enabled_only=True) <= 1:
+            raise HTTPException(status_code=400,
+                                detail="cannot demote the last instance admin")
+        store.user_set(username, role=role)
     if body.disabled is not None:
         if user["username"] == admin["username"] and body.disabled:
             raise HTTPException(status_code=400, detail="you cannot disable yourself")
@@ -698,6 +717,8 @@ class WorkspacePatchBody(WorkspaceCreateBody):
 class MemberBody(BaseModel):
     username: str
     member: bool
+    role: str | None = None       # Epic E3: admin | member | viewer
+    repos: list | None = None     # per-member repo allow-list ([] = all)
 
 
 def _ws_svc() -> WorkspaceService:
@@ -789,6 +810,11 @@ async def workspaces_member(workspace_id: int, body: MemberBody):
     if target is None:
         raise HTTPException(status_code=404, detail=f"unknown user '{body.username}'")
     store.workspace_member_set(workspace_id, target["id"], body.member)
+    # Epic E3: set the workspace role + per-member repo restriction when the
+    # member is being added/kept (only meaningful for a present member).
+    if body.member and (body.role is not None or body.repos is not None):
+        role = body.role if body.role in ("admin", "member", "viewer") else "member"
+        store.workspace_member_set_role(workspace_id, target["id"], role, body.repos)
     return _ws_svc().public(store.workspace_get(workspace_id))
 
 
@@ -867,7 +893,7 @@ async def inbox(user: dict = Depends(require_user)):
     # human confirm/dismiss, membership-scoped, oldest first. Additive keys
     # only: items and counts.mine keep their exact pre-D3 semantics (the
     # badge number never includes candidates).
-    ws_ids = None if user.get("role") == "admin" \
+    ws_ids = None if user.get("role") in ("admin", "instance_admin") \
         else sorted(store.workspace_ids_for_user(user["id"]))
     candidates = [_decision_public(d) for d in store.decision_candidates(ws_ids, 50)]
     # Epic I0: durable routine outputs — open notices, membership-scoped
@@ -967,7 +993,7 @@ async def notice_adopt(item_id: int, body: NoticeAdoptBody,
     project = (body.project or "").strip() or str(refs.get("project") or "").strip()
     if not project or settings.repo_for_project(project) is None:
         raise HTTPException(status_code=400, detail=f"unknown project '{project}'")
-    if user["role"] != "admin":
+    if user["role"] not in ("admin", "instance_admin"):
         _require_project_access(project, user)
     if body.metric_window_days is not None and not 1 <= body.metric_window_days <= 365:
         raise HTTPException(status_code=400,
@@ -1066,7 +1092,7 @@ def _validate_decision_fields(scope: str | None, text: str | None,
             raise HTTPException(status_code=400,
                                 detail="scope must be one of: "
                                        + ", ".join(DECISION_SCOPES))
-        if scope == "org" and user.get("role") != "admin":
+        if scope == "org" and user.get("role") not in ("admin", "instance_admin"):
             # org-scope rows reach EVERY member's prompts and registry view —
             # creating/confirming one is an admin action (ENGINE.md §16)
             raise HTTPException(status_code=403,
@@ -1108,7 +1134,7 @@ def _decision_scoped(decision_id: int, user: dict) -> dict:
     row = app.state.store.decision_get(decision_id)
     if row is None:
         raise HTTPException(status_code=404, detail="unknown decision")
-    if user.get("role") != "admin" and row.get("scope") != "org" \
+    if user.get("role") not in ("admin", "instance_admin") and row.get("scope") != "org" \
             and not _ws_svc().user_can_access(user, row.get("workspace_id")):
         raise HTTPException(status_code=404, detail="unknown decision")
     return row
@@ -1158,7 +1184,7 @@ async def decisions_list(q: str = "", scope: str = "", status: str = "",
     if status and status not in ("active", "superseded", "candidate", "dismissed"):
         raise HTTPException(status_code=400, detail="unknown status")
     store: JobStore = app.state.store
-    ws_ids = None if user.get("role") == "admin" \
+    ws_ids = None if user.get("role") in ("admin", "instance_admin") \
         else sorted(store.workspace_ids_for_user(user["id"]))
     rows = store.decisions_query(
         q=q, scope=scope, status=status, project=project, source=source,
@@ -1172,7 +1198,7 @@ async def decisions_patch(decision_id: int, body: DecisionPatchBody,
                           user: dict = Depends(require_user)):
     store: JobStore = app.state.store
     row = _decision_scoped(decision_id, user)
-    if row.get("scope") == "org" and user.get("role") != "admin":
+    if row.get("scope") == "org" and user.get("role") not in ("admin", "instance_admin"):
         raise HTTPException(status_code=403,
                             detail="org-scope decisions are admin-only")
     action = body.action.strip().lower()
@@ -1399,7 +1425,7 @@ async def routines_list(user: dict = Depends(require_user)):
     out = []
     for r in store.routines_all():
         if r.get("workspace_id") is None:
-            if user.get("role") != "admin":
+            if user.get("role") not in ("admin", "instance_admin"):
                 continue
         elif not svc.user_can_access(user, r["workspace_id"]):
             continue
@@ -1519,7 +1545,7 @@ async def trigger(body: TriggerBody, user: dict = Depends(require_user)):
 
     title = issue.get("title", "unknown")
     project = (issue.get("project") or {}).get("slug", "")
-    if user["role"] != "admin":
+    if user["role"] not in ("admin", "instance_admin"):
         _require_project_access(project, user)
     decision = worker.intake(issue_id, source="manual", forced=True, title=title, project=project)
     if "queued" not in decision:
@@ -1748,7 +1774,7 @@ async def _prepare_ticket(worker: Worker, body: SubmitBody, prefix: str,
 async def submit_task(body: SubmitBody, user: dict = Depends(require_user)):
     """Manually reported request (bug fix / change request) — 2-phase HITL flow."""
     worker: Worker = app.state.worker
-    if user["role"] != "admin":
+    if user["role"] not in ("admin", "instance_admin"):
         _require_project_access(body.project.strip(), user)
     t = await _prepare_ticket(worker, body, "task", f"**Manual request via the {ENGINE_NAME} dashboard**")
     decision = worker.intake_task(
@@ -1771,7 +1797,7 @@ async def submit_task(body: SubmitBody, user: dict = Depends(require_user)):
 async def submit_feature(body: SubmitBody, user: dict = Depends(require_user)):
     """Feature pipeline: P0-P9 with a human gate after every stage (docs/ENGINE.md)."""
     worker: Worker = app.state.worker
-    if user["role"] != "admin":
+    if user["role"] not in ("admin", "instance_admin"):
         _require_project_access(body.project.strip(), user)
     # Epic B1: validate BEFORE any side effect (ticket creation/adoption) —
     # a bad window is a 400 with nothing queued and nothing created
@@ -1827,7 +1853,7 @@ async def answer_job(job_id: str, body: AnswerBody, user: dict = Depends(require
         status = await worker.answer_job(job_id, action, body.answer.strip(),
                                          via=f"dashboard:{user['username']}",
                                          actor=user,
-                                         override=body.override and user["role"] == "admin")
+                                         override=body.override and user["role"] in ("admin", "instance_admin"))
     except KeyError:
         raise HTTPException(status_code=404, detail=f"unknown job '{job_id}'")
     except GateForbidden as e:  # BEFORE ValueError: 403, never a masked 409

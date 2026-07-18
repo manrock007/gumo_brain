@@ -476,7 +476,7 @@ function gatePacket(data) {
   // non-owners see disabled buttons, admins get an explicit audited override
   const owner = data.gate_owner;
   const locked = !!(feature && owner && owner.enforce && !owner.is_you);
-  const isAdmin = ME && ME.role === 'admin';
+  const isAdmin = ME && (ME.role === 'admin' || ME.role === 'instance_admin');
   const dis = locked ? ` disabled title="Owned by ${esc(owner.display)} — only they (or an admin override) can answer"` : '';
   const ownerLine = feature && owner && owner.enforce
     ? `<div class="g-owner">Owned by <b>${esc(owner.display)}</b> &middot; ${esc(owner.role)} gate${owner.is_you ? ' &mdash; you' : ''}</div>` : '';
@@ -1137,7 +1137,7 @@ function renderAutonomy() {
     el.innerHTML = '<div class="empty">autonomy is disabled on this instance (AUTONOMY_ENABLED=false)</div>';
     return;
   }
-  const isAdmin = ME && ME.role === 'admin';
+  const isAdmin = ME && (ME.role === 'admin' || ME.role === 'instance_admin');
   const optin = d.auto_level
     ? 'Computed levels auto-advance at L' + d.auto_level + '+ (AUTONOMY_AUTO_LEVEL).'
     : 'Computed levels are advisory for now &mdash; AUTONOMY_AUTO_LEVEL=0; set 1&ndash;3 to let earned trust auto-advance.';
@@ -1464,7 +1464,7 @@ async function loadRoutines() {
     const sig = JSON.stringify(data);
     if (sig === lastRoutines) return;
     lastRoutines = sig;
-    const isAdmin = ME && ME.role === 'admin';
+    const isAdmin = ME && (ME.role === 'admin' || ME.role === 'instance_admin');
     if (!data.routines.length) { box.innerHTML = '<div class="empty">no routines visible</div>'; return; }
     const wsName = (id) => {
       if (id == null) return 'instance';
@@ -1537,7 +1537,7 @@ async function loadMe() {
     if (!r.ok) return;
     ME = await r.json();
     document.getElementById('me-chip').textContent = ME.username + ' · ' + ME.role;
-    if (ME.role === 'admin') {
+    if (ME.role === 'admin' || ME.role === 'instance_admin') {
       document.getElementById('nav-settings').style.display = '';
       document.getElementById('sp-users').style.display = '';
       document.getElementById('sp-workspaces').style.display = '';
@@ -1618,7 +1618,7 @@ function openSettings() {
   document.getElementById('shell').style.display = 'none';
   document.getElementById('settings-pane').style.display = '';
   document.getElementById('sp-title').textContent = forced ? 'Set your password' : 'Settings';
-  if (ME && ME.role === 'admin') { loadUsers(); renderWorkspacesAdmin(); }
+  if (ME && (ME.role === 'admin' || ME.role === 'instance_admin')) { loadUsers(); renderWorkspacesAdmin(); }
 }
 function openAccount() {
   openSettings();
@@ -1646,7 +1646,7 @@ function closeSettings() {
   if (ME && ME.must_change_pw) return;
   document.getElementById('settings-pane').style.display = 'none';
   document.getElementById('shell').style.display = '';
-  if (ME && ME.role === 'admin') loadSetup();  // refresh ticks after settings work
+  if (ME && (ME.role === 'admin' || ME.role === 'instance_admin')) loadSetup();  // refresh ticks after settings work
 }
 
 async function loadUsers() {
@@ -1675,7 +1675,7 @@ async function loadUsers() {
         ${self ? '<span class="hint" style="margin:0">you &mdash; change your password in Account below</span>'
                : `<button onclick="resetUserPw('${esc(u.username)}')">Reset password</button>
         <button onclick="toggleUser('${esc(u.username)}', ${u.disabled ? 'false' : 'true'})">${u.disabled ? 'Enable' : 'Disable'}</button>
-        <button onclick="setUserRole('${esc(u.username)}', '${u.role === 'admin' ? 'member' : 'admin'}')">Make ${u.role === 'admin' ? 'member' : 'admin'}</button>`}
+        <button onclick="setUserRole('${esc(u.username)}', '${(u.role === 'admin' || u.role === 'instance_admin') ? 'member' : 'instance_admin'}')">Make ${(u.role === 'admin' || u.role === 'instance_admin') ? 'member' : 'admin'}</button>`}
       </td></tr>`;
     }).join('');
     document.getElementById('users-list').innerHTML =
@@ -1818,7 +1818,7 @@ async function loadWorkspaces() {
         `<option value="${w.id}" ${w.id === activeWs ? 'selected' : ''}>${esc(w.name)}</option>`).join('');
     sw.style.display = '';
     scopeProjectPickers();
-    if (ME && ME.role === 'admin') renderWorkspacesAdmin();
+    if (ME && (ME.role === 'admin' || ME.role === 'instance_admin')) renderWorkspacesAdmin();
   } catch (e) {}
 }
 

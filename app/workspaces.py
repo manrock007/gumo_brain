@@ -121,7 +121,7 @@ class WorkspaceService:
     def user_can_access(self, user: dict, workspace_id: int | None) -> bool:
         """Admins see everything; members only assigned workspaces. Jobs with
         no resolvable workspace stay admin-only rather than leaking."""
-        if user.get("role") == "admin":
+        if user.get("role") in ("admin", "instance_admin"):
             return True
         if workspace_id is None:
             return False
@@ -129,7 +129,7 @@ class WorkspaceService:
 
     def user_workspaces(self, user: dict) -> list[dict]:
         all_ws = self.store.workspace_list()
-        if user.get("role") == "admin":
+        if user.get("role") in ("admin", "instance_admin"):
             return all_ws
         allowed = self.store.workspace_ids_for_user(user["id"])
         return [w for w in all_ws if w["id"] in allowed]

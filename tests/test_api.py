@@ -324,7 +324,8 @@ def test_dashboard_shell_is_balanced():
 def test_login_flow_and_roles(client):
     # cookie session end to end
     r = client.post("/api/login", json={"username": "gumo", "password": "test"})
-    assert r.status_code == 200 and r.json()["role"] == "admin"
+    # Epic E3: the bootstrap admin's instance role is now 'instance_admin'
+    assert r.status_code == 200 and r.json()["role"] == "instance_admin"
     assert client.get("/api/me").json()["username"] == "gumo"  # cookie carried
     # wrong password is a generic 401
     bad = client.post("/api/login", json={"username": "gumo", "password": "nope"})

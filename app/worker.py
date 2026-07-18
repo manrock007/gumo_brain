@@ -20,7 +20,7 @@ import time
 import uuid
 from pathlib import Path
 
-from . import analytics, audit, autonomy, budgets, outcome, people, roles
+from . import analytics, audit, autonomy, budgets, outcome, people, rbac, roles
 from .clickup import ClickUp
 from .config import ENGINE_NAME, Settings
 from .db import JobStore
@@ -841,7 +841,11 @@ class Worker:
         owner = roles.gate_owner(self.store, self.settings, self._ws_row(job), job)
         admin_override = False
         if owner is not None and owner.enforce and not roles.actor_is_owner(owner, actor):
-            if actor and actor.get("role") == "admin" and override:
+            # Epic E3: the admin override is a workspace-admin power (instance
+            # admins are admin everywhere) — resolved via rbac, not a string
+            # compare, so a workspace admin can override their workspace's gate.
+            if (actor and override
+                    and rbac.can_configure_workspace(self.store, actor, job.get("workspace_id"))):
                 admin_override = True  # dashboard-only, explicit, audited by caller
             else:
                 raise GateForbidden(f"this is a {owner.role} gate, owned by {owner.display}")
