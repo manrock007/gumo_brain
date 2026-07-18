@@ -216,7 +216,10 @@ async def metrics_endpoint(request: Request):
     token = (app.state.settings.metrics_token or "").strip()
     if token:
         auth = request.headers.get("Authorization", "")
-        if auth != f"Bearer {token}":
+        # constant-time compare of the shared secret (consistent with the OIDC
+        # state / Sentry-signature checks) so /metrics can't be probed for the
+        # token prefix via response timing.
+        if not secrets.compare_digest(auth, f"Bearer {token}"):
             raise HTTPException(status_code=401, detail="metrics token required",
                                 headers={"WWW-Authenticate": "Bearer"})
     else:

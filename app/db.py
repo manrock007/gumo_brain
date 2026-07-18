@@ -931,12 +931,21 @@ class JobStore:
         prio = ("CASE WHEN kind='sentry' AND source='sweep' THEN 2 "
                 "WHEN kind='sentry' THEN 0 ELSE 1 END")
         with self._conn() as c:
+            # NOTE: candidates are matched on status alone, NOT on claimed_by=''.
+            # A received/queued row is by definition not running, so any
+            # claimed_by on it is a stale corpse-marker (a crashed worker whose
+            # release_claim never fired and whose reaper/redo path left the field
+            # set). Requiring claimed_by='' here would make such a row PERMANENTLY
+            # unclaimable — defeating the F2 crash-recovery guarantee — since only
+            # a same-worker boot recovery or release_claim ever clears the field.
+            # The atomic UPDATE→'running' under FOR UPDATE SKIP LOCKED reassigns
+            # claimed_by, so mutual exclusion never depended on this predicate.
             row = c.execute(
                 f"""UPDATE jobs SET status='running', claimed_by=?, claimed_at=?,
                         run_started_at=?, updated_at=?
                     WHERE issue_id = (
                         SELECT issue_id FROM jobs
-                        WHERE status IN ('received','queued') AND claimed_by=''
+                        WHERE status IN ('received','queued')
                         ORDER BY {prio}, updated_at
                         FOR UPDATE SKIP LOCKED
                         LIMIT 1)

@@ -57,6 +57,11 @@ TERMINAL_STATUSES = ("pr_opened", "no_fix", "skipped", "error", "timeout", "done
 # a watch job reads its metric at most ~daily; 22h tolerates loop jitter
 WATCH_READ_THROTTLE_SECONDS = 79200
 
+# F4: on the SQLite path the worker blocks on queue.get(); cap the wait so the
+# loop re-stamps last_tick on an idle system and /health/ready's worker check
+# (900s window) can't flap to false overnight. A real enqueue wakes it sooner.
+IDLE_HEARTBEAT_POLL_SECONDS = 300
+
 # priority classes: live sentry >= answered feature stages / tasks > sweep
 PRIO_SENTRY = 0
 PRIO_HUMAN = 1
@@ -337,7 +342,12 @@ class Worker:
                 await asyncio.sleep(max(1, self.settings.job_poll_interval_seconds))
                 return None
             return job, job.get("claimed_at")
-        _, _, job_id, queued_at = await self.queue.get()
+        try:
+            item = await asyncio.wait_for(self.queue.get(),
+                                          timeout=IDLE_HEARTBEAT_POLL_SECONDS)
+        except asyncio.TimeoutError:
+            return None  # idle poll — caller loops and re-stamps the heartbeat
+        _, _, job_id, queued_at = item
         try:
             job = self.store.get(job_id)
             if job is None or job["status"] not in ("received", "queued"):
@@ -359,7 +369,18 @@ class Worker:
                  self.settings.db_backend)
         while True:
             self.last_tick = time.time()  # F4 heartbeat
-            nxt = await self._next_job()
+            try:
+                nxt = await self._next_job()
+            except Exception:
+                # A transient fetch error (e.g. sqlite3.OperationalError
+                # 'database is locked' past the busy timeout, or a Postgres
+                # claim hiccup) must NOT kill the unsupervised loop — run_forever
+                # is a bare fire-and-forget task with no restarter. Log, brief
+                # backoff, and keep dispatching (matches the pre-F4 per-job
+                # resilience the store.get read used to have inside the try).
+                log.exception("job fetch failed; continuing loop")
+                await asyncio.sleep(1)
+                continue
             if nxt is None:
                 continue
             job, queued_at = nxt
@@ -965,7 +986,11 @@ class Worker:
                                          gate_kind="", resume_session_id="",
                                          resume_stage=None, resume_attempt=None,
                                          resume_head="", resume_answer="", ask_count=0,
-                                         auto_retries=0):
+                                         auto_retries=0,
+                                         # F2: a redo re-queues the job; drop any stale
+                                         # claim so the multi-worker claim loop can pick
+                                         # it up (claimed_by non-empty iff running).
+                                         claimed_by="", claimed_at=None):
                 raise GateConflict("already answered")
             if override:
                 # Epic G4: an explicit admin redo carries a ONE-SHOT budget
@@ -2351,6 +2376,11 @@ class Worker:
                         job["issue_id"], time.time() - (job["run_started_at"] or 0))
             self.store.set_status(job["issue_id"], "error",
                                   detail="reaped: run went stale (process restart?) — redo to resume")
+            # F2: the owning worker is dead (that is what 'stale' means), so its
+            # release_claim will never fire. Drop the claim here or the row stays
+            # claimed_by='<dead worker>' forever and, once a human /redo moves it
+            # back to 'queued', it would be permanently unclaimable.
+            self.store.release_claim(job["issue_id"])
             # visibility on the owning ticket — a silently-reaped job looks
             # identical to a slow one from ClickUp (dogfood-found)
             await self.clickup.comment(

@@ -187,11 +187,23 @@ class ContainerRunner(RunnerBackend):
             kwargs["limit"] = limit
         # the docker client inherits NO ambient env beyond what it needs to talk
         # to the daemon — the CONTAINER's env comes solely from --env-file.
-        proc = await asyncio.create_subprocess_exec(
-            *argv, cwd=cwd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            **kwargs)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv, cwd=cwd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                **kwargs)
+        except Exception:
+            # spawn failed (e.g. docker binary absent -> FileNotFoundError, or
+            # OSError/EMFILE): no _ContainerProcess is returned, so its _unlink_env
+            # cleanup can never run. Unlink the secret-bearing env-file here or a
+            # misconfigured container deployment leaks a 0600 credential file on
+            # every attempt. Mirrors the build_argv guard above.
+            try:
+                os.unlink(env_file)
+            except OSError:
+                pass
+            raise
         return _ContainerProcess(proc, container_name, env_file, self.docker)
 
 
