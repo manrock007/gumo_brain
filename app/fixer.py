@@ -11,6 +11,7 @@ from pathlib import Path
 from .config import ENGINE_DIR, LEGACY_ENGINE_DIRS, RepoTarget, Settings
 from .runner import resolve_runner
 from .secrets import build_subprocess_env
+from .vcs import VCS, vcs_for
 
 log = logging.getLogger("brain.fixer")
 
@@ -151,14 +152,18 @@ async def _run(cmd: list[str], cwd: str | None = None, timeout: int = 300) -> tu
 
 async def prepare_workspace(settings: Settings, target: RepoTarget, branch: str,
                             keep_branch: bool = False,
-                            workspace_root: str | None = None) -> str:
+                            workspace_root: str | None = None,
+                            vcs: VCS | None = None) -> str:
     """Clone (or refresh) the repo and check out a clean branch off the base.
 
     keep_branch=True (phase 2) reuses the existing branch if it exists so the
     fix lands on the same branch the analysis referenced.
     workspace_root overrides the clone location — read-only chat runs use their
     own clone so they never contend with the job holding the main workspace.
+    vcs is the H2 VCS driver used to mint the clone URL; resolved internally so
+    existing callers are unchanged (they never pass it).
     """
+    vcs = vcs or vcs_for(settings)
     root = workspace_root or settings.workspaces_dir
     name = target.repo.split("/")[-1]
     workspace = str(Path(root) / name)
@@ -166,7 +171,7 @@ async def prepare_workspace(settings: Settings, target: RepoTarget, branch: str,
 
     if not Path(workspace, ".git").exists():
         code, out = await _run(
-            ["git", "clone", "--filter=blob:none", f"https://github.com/{target.repo}.git", workspace],
+            ["git", "clone", "--filter=blob:none", vcs.clone_url(target.repo), workspace],
             timeout=900,
         )
         if code != 0:
@@ -208,7 +213,8 @@ async def git(workspace: str, *args: str, timeout: int = 300) -> tuple[int, str]
 
 async def prepare_feature_workspace(settings: Settings, target: RepoTarget,
                                     branch: str, stage: int,
-                                    workspace_root: str | None = None) -> str:
+                                    workspace_root: str | None = None,
+                                    vcs: VCS | None = None) -> str:
     """Feature stages resume from origin/<branch> — never silently rebuild from base.
 
     Stage 0 creates the branch from origin/<base>. Stage > 0 requires
@@ -217,7 +223,10 @@ async def prepare_feature_workspace(settings: Settings, target: RepoTarget,
     Raises BranchLostError in that case.
     workspace_root overrides the clone location — shepherd fix runs use their
     own clone so they never contend with the job holding the main workspace.
+    vcs is the H2 VCS driver used to mint the clone URL; resolved internally so
+    existing callers are unchanged (they never pass it).
     """
+    vcs = vcs or vcs_for(settings)
     root = workspace_root or settings.workspaces_dir
     name = target.repo.split("/")[-1]
     workspace = str(Path(root) / name)
@@ -225,7 +234,7 @@ async def prepare_feature_workspace(settings: Settings, target: RepoTarget,
 
     if not Path(workspace, ".git").exists():
         code, out = await _run(
-            ["git", "clone", "--filter=blob:none", f"https://github.com/{target.repo}.git", workspace],
+            ["git", "clone", "--filter=blob:none", vcs.clone_url(target.repo), workspace],
             timeout=900,
         )
         if code != 0:
@@ -260,14 +269,11 @@ async def prepare_feature_workspace(settings: Settings, target: RepoTarget,
 
 
 async def mint_git_token(settings: Settings, repo: str) -> str | None:
-    """Resolve the GH_TOKEN a run for `repo` should carry (Epic G1). Returns an
-    app installation token when the GitHub App covers the repo, else None so the
-    caller lets the PAT env default apply. Never raises — app errors fall back."""
-    if not getattr(settings, "github_app_enabled", False):
-        return None
-    from .githubapp import effective_git_token
-    token, kind = await effective_git_token(settings, repo)
-    return token if kind == "app" else None
+    """Back-compat shim (Epic H2): the token-minting logic moved onto the VCS
+    driver (``GitHubVCS.mint_git_token``). Delegates through the resolved VCS so
+    every existing importer (engine.py, test_githubapp) keeps working while the
+    seam owns the implementation. Never raises — app errors fall back to PAT."""
+    return await vcs_for(settings).mint_git_token(repo)
 
 
 def _claude_cmd_env(settings: Settings, prompt: str, allowed_tools: list[str],

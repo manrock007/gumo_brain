@@ -49,16 +49,16 @@ from .fixer import (
     BranchLostError,
     engine_dir,
     git,
-    mint_git_token,
     prepare_feature_workspace,
     prepare_workspace,
     run_claude_raw,
     run_claude_stream,
     session_transcript_exists,
 )
-from .github import GitHub
+from .github import GitHub  # noqa: F401 — re-exported for back-compat imports
 from .memory import MemoryReader
 from .tracker import Tracker
+from .vcs import vcs_for
 from .prompts import _test_block, build_v1_chat_prompt, build_v1_fastlane_system
 from .textutil import single_line
 from . import transcripts
@@ -137,7 +137,7 @@ class Engine:
         self.locks = locks or RepoLocks()
         self.sync = ArtifactSync(store, clickup, settings.clickup_mirror_max_chars)
         self.memory = MemoryReader(settings, locks=self.locks, store=store)
-        self.github = GitHub(settings)
+        self.github = vcs_for(settings)
         # live session observation: a stage run streams its tool calls / text here,
         # keyed by job id. A SECOND broker instance (chat has its own) so a gate
         # chat turn and a live stage run never clobber each other's buffer.
@@ -434,7 +434,7 @@ class Engine:
         # G1: mint the run's per-repo installation token once (PAT fallback when
         # the app is off / can't reach the repo). Stage runs push to the feature
         # branch, so they authenticate as the installation when available.
-        git_token = await mint_git_token(self.settings, target.repo)
+        git_token = await self.github.mint_git_token(target.repo)
         ask_answer = (job.get("resume_answer") or "").strip()
         resume_sid = (job.get("resume_session_id") or "").strip()
         resume_kind = job.get("gate_kind")  # 'ask' | 'steer' — captured before the clear
