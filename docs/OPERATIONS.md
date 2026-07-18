@@ -189,9 +189,13 @@ How it fits together:
   `dev_dri`) or via the ClickUp people fields at `[feature]` adoption.
   A job with NO explicit DRIs stays in solo mode — no role enforcement, no
   SLA escalation. **Re-submitting a feature replaces its DRIs from the fresh
-  submission** — a dashboard resubmit that omits both clears previously
-  recorded (e.g. ClickUp-sourced) DRIs and turns enforcement off for that
-  pipeline.
+  submission** — but note the Epic D1 interplay: with
+  `PEOPLE_ROUTING_DEFAULTS=true` (the default) and people profiles covering
+  the repo, an EMPTY slot re-fills from the profiles at intake, so a
+  resubmit that omits both DRIs re-enables enforcement with the profile
+  defaults. There is no per-job "no DRI" once profiles cover a repo —
+  `PEOPLE_ROUTING_DEFAULTS=false` is the opt-out (profiles then feed
+  prompts/display only). See §10.
 - **Fail-closed corner**: `REQUIRE_ATTRIBUTED_ANSWERS=off` with DRIs set
   still refuses unmapped ClickUp commenters on role-owned gates (an
   unresolved commenter can never be the owner) — if a DRI'd feature's gate
@@ -264,6 +268,41 @@ Notes:
   audit table.
 - These settings are env-only (not dashboard-editable context overrides);
   changes apply at the next restart.
+
+## 10. Organizational context (Epic D: people, decisions, retrieval, Slack)
+
+| Env var | Default | Meaning |
+| --- | --- | --- |
+| `PEOPLE_ROUTING_DEFAULTS` | `true` | people profiles fill EMPTY DRI slots at feature intake (exactly-one enabled workspace-member match per role; ambiguity fills nothing). Neutral: inert until profiles exist. `false` = profiles feed prompts/display only — the opt-out documented in §7. |
+| `MEMORY_SEARCH_TOP_K` | `5` | FTS snippets injected into stage prompts. `0` disables the block; any value outside `1..20` also disables it (never clamped toward more context). |
+| `SLACK_INGEST_ENABLED` | `false` | **the D3 flag** — Slack read ingestion of decision candidates. Even when `true` it needs `SLACK_BOT_TOKEN` and a per-workspace channel allowlist. |
+| `SLACK_BOT_TOKEN` | *(empty)* | Slack bot token. Secret: env-only, never stored in a workspace row, never returned by any API, never interpolated into logs/details. |
+| `SLACK_API_BASE` | `https://slack.com/api` | test seam; leave alone in production. |
+| `SLACK_INGEST_INTERVAL_SECONDS` | `600` | ingest loop cadence. |
+| `SLACK_DECISION_EMOJI` | `pushpin` | reaction NAME (no colons) marking a decision message; the `!decision` message prefix is always recognized when the flag is on. |
+
+Per-workspace: `slack_channels` (Settings → Workspaces, or
+`PATCH /api/workspaces/{id}` with a list of channel ids; `""` clears). A
+channel may be allowlisted by exactly ONE workspace — candidates route
+deterministically. When a channel is FIRST allowlisted its read watermark is
+initialized to *now*: ingestion is forward-only, so enabling the flag never
+floods the inbox with historical candidates.
+
+Slack app scopes (read-only by design): `channels:history` covers PUBLIC
+channels only — add `groups:history` for private channels the bot is in, and
+`reactions:read` for the emoji convention. `chat.getPermalink` needs no
+write scope; the engine never posts to Slack from this feature. Known
+limits (documented, by Slack API construction): a reaction added to a
+message older than the ~7-day re-scan overlap is not seen, and thread
+replies are not captured unless broadcast to the channel.
+
+What ingestion produces: decision-registry rows with `status='candidate'`,
+parked in every member's inbox for **confirm** (with optional scope/title/
+text edits; org scope is admin-only) or **dismiss**. Candidates are
+quarantined until confirmed: never indexed for retrieval, never rendered
+into any prompt, excluded from the default `GET /api/decisions` view.
+Dismissals are remembered — the row is kept, so a re-scan can never
+re-propose it.
 
 ## Appendix — Example configuration: the original Gumo instance
 

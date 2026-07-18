@@ -95,7 +95,24 @@ rename/infra checklist.
   docs/ENGINE.md §2) is answered by a non-owner — `override: true` is the audited
   admin bypass
 - `GET /api/inbox` — the per-person "Awaiting you" queue: gates you own +
-  unassigned gates, overdue first (per-workspace `gate_sla_hours` SLA)
+  unassigned gates, overdue first (per-workspace `gate_sla_hours` SLA); plus
+  `candidates` — parked Slack decision candidates awaiting confirm/dismiss
+  (additive; `counts.mine` still counts gates only)
+- `GET /api/people` — who owns what (Epic D1): person role, ownership areas,
+  decision-authority tags. Members see only people covering their own
+  workspaces; profiles are edited by admins via `PATCH /api/users/{u}`
+- `POST /api/decisions` / `GET /api/decisions` — the **decision registry**
+  (Epic D2): substantive gate answers auto-register; manual adds with
+  `{scope: job|repo|product|org, title?, text, project?|workspace_id?,
+  links?}` (org scope is admin-only); the GET filters by
+  `q/scope/status/project/source` and is membership-scoped (org rows are
+  visible to every member — exactly the prompt-admission predicate)
+- `PATCH /api/decisions/{id}` — `{action: supersede|reactivate}`, CAS-guarded
+  (409 on a lost race)
+- `POST /api/decisions/{id}/confirm` / `.../dismiss` — resolve a Slack
+  candidate (D3): confirm may edit scope/title/text (same validation as
+  create; the confirming human becomes `decided_by`, the Slack author stays
+  in `origin_author`); dismissals are remembered and never re-proposed
 - `GET /api/features/{job_id}/stats` — per-stage telemetry (runs, guidance, artifacts)
 - `GET /api/outcomes` — the **outcome ledger**: measured verdicts
   (moved / flat / regressed / unmeasured) per shipped feature + the

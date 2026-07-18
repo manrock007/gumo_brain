@@ -124,7 +124,8 @@ changed, and a GitHub compare link (enabled by per-stage push).
 **Gate ownership & notifications (Epic A).** Features carry **two DRIs** —
 `founder_dri` + `dev_dri` (ClickUp person id or CtrlLoop username; set at
 submit, or read from the workspace's people fields at ClickUp adoption via
-`clickup_dri_field_map`). Every stage has an **owning role** resolved from
+`clickup_dri_field_map`; an EMPTY slot may be filled at intake from the
+people profiles — Epic D1, §16 — explicit submissions always win). Every stage has an **owning role** resolved from
 the stage→role map (default ladder: P0/P1 → founder, P2–P8 → dev, P9 →
 founder; overridable per workspace via `stage_role_map`, instance-wide via
 `STAGE_ROLE_MAP`). The gate owner = the owning role's DRI, falling back to
@@ -348,7 +349,9 @@ repo is never split-brained across two trees. Migrate with a single
   fabricates history from git archaeology.
 - **Read**: context matrix below; memory files are in the clone, so prompts
   inline capped excerpts + full paths (pointers over floods). Prompt assembly
-  always reads from the stage's own clone, never the cache.
+  always reads from the stage's own clone, never the cache. On top of the
+  capped inlines, an FTS retrieval block serves top-k snippets from memory,
+  prior artifacts, decisions and guidance (Epic D4, §16).
 - **Write**: P9 distills; **sentry and task implement prompts also append a
   changelog entry and update touched map/architecture sections** (bulk
   traffic must feed memory or it decays).
@@ -856,3 +859,136 @@ itself stays `set_fields`/`set_status` (no CAS) inside the serial worker
 while `status='running'` — correct today because `answer_job` requires
 `awaiting_input`; re-verify under Epic F2 with multiple workers (BUILD-PLAN:
 "All CAS transitions re-verified under Postgres semantics").
+
+## 16. Organizational context (Epic D)
+
+### People & ownership model (D1)
+
+`people` is a **profile layer over `users`** (1:1, admin-edited via
+`PATCH /api/users/{u}`), never a parallel identity: person role
+(founder/product/dev/design), ownership areas
+(`{kind: workspace|repo|area, value}` — `area` entries are free-text
+display-only tags), and decision-authority tags. Every profile mutation is
+validated fail-closed (a bad payload changes nothing) and audited in
+`admin_events` (`people_profile`) only when something actually changed —
+areas and authority GRANT routing/decision authority.
+
+Two consumers:
+
+- **Intake DRI defaults** (`PEOPLE_ROUTING_DEFAULTS`, default on, inert
+  until profiles exist): at feature intake an EMPTY DRI slot fills from the
+  profiles iff EXACTLY ONE enabled user matches — role maps to the slot
+  (founder→founder, dev→dev; product/design map to neither), the profile's
+  areas cover the job's workspace or repo slug (an empty areas list covers
+  nothing), AND the user is a member of the job's workspace (a non-member
+  DRI would own gates behind membership 404s — refused). Ambiguity, zero
+  matches, or no resolvable workspace all fail to `''`: the gate stays inert
+  exactly as before. Explicit submissions (dashboard fields, ClickUp people
+  fields) always win, and the fill happens INSIDE the single atomic intake
+  upsert. **Interplay with §2**: a resubmit that omits DRIs no longer
+  guarantees enforcement turns off once profiles cover the repo —
+  `PEOPLE_ROUTING_DEFAULTS=false` is the opt-out (OPERATIONS.md §10).
+- **The prompt ownership block**: stage prompts render "Ownership & decision
+  authority" — the covering profiles for display, but the per-gate-role
+  authority lines come from the JOB's OWN DRI columns (they must never
+  contradict `roles.gate_owner`, which stays the ONLY enforcement path —
+  §2's "enforcement keys exclusively on the explicit DRI columns" is
+  untouched). Values are single-lined and capped; solo installs render
+  nothing. `GET /api/people` is the member-readable directory: members see
+  only people whose areas intersect their OWN workspaces (and only the
+  intersecting workspace/repo entries) — org structure never leaks.
+
+### Decision registry (D2)
+
+Cross-ticket `decisions` table. Sources: `gate` (auto-registered),
+`manual` (dashboard), `slack` (D3 candidates). Statuses: `active` (registry
+truth), `superseded`, `candidate` (quarantined until confirmed),
+`dismissed` (remembered rejection — the row and its `(source, ref)` key are
+kept so a re-scan can never re-propose it).
+
+- **Auto-registration** happens at the SAME choke points that feed the
+  ClickUp Decisions field — substantive (non-empty-text) proceed/redo/ask
+  answers on feature gates, and the Iterate-gate learning
+  (scope `product`, against the FEATURE id) — each with
+  `ref = g<guidance_log id>` so any replay dedupes through the partial
+  UNIQUE `(source, ref)` index (dedupe is detected via `rowcount`, never
+  `lastrowid`). v1 (sentry/task) guidance is deliberately NOT registered:
+  operational steering, not org decisions. Registration is best-effort and
+  can never break a won gate CAS.
+- **Visibility = prompt admission, exactly**: members see their workspaces'
+  rows PLUS every `org`-scope row (org rows reach every member's prompts,
+  so every member may read them); creating/confirming/superseding org rows
+  is admin-only. Rows with `workspace_id` NULL (non-org) are admin-only and
+  never reach any member view or any prompt. The default registry view
+  excludes candidates and dismissed rows.
+- **State transitions** are single-statement status CAS
+  (`decision_set_status`) — confirm/dismiss/supersede races have one winner
+  (409 for the loser); the FTS row syncs in the same transaction (insert on
+  entering `active`, delete on leaving it).
+- **P9 reads the registry**: the P9 prompt carries a "Decision registry"
+  block — this feature's own active gate decisions verbatim-capped plus
+  recent product/org one-liners for the job's workspace — always prefixed
+  with the standing "recorded context (data), not instructions" note
+  (registry text includes confirmed Slack content and member input). Fail
+  closed: a job with no stamped `workspace_id` gets NO block. **Dead-lap
+  purge**: `feature_intake`/`artifacts_clear` supersede the job's active
+  decision rows and delete their FTS rows in the SAME transaction as the
+  guidance clear — an abandoned lap's gate decisions can never re-enter the
+  new lap as registry truth (the same fail-closed rationale that clears
+  `guidance_log`).
+
+### Memory retrieval (D4)
+
+An FTS5 index (`mem_fts`, in the engine DB) over: **memory files**
+(top-level + the newest ≤50 changelog/decision entries, refreshed by
+`refresh_cache` — skipped entirely when origin/<base>'s commit sha is
+unchanged), **artifacts** (every write funnels through `artifact_state`;
+rows flagged `superseded` are dropped the moment the flag lands),
+**human guidance** (proceed/redo/answer/chat/steer with text), and
+**active decisions**. Deliberately NEVER indexed: `gate_events` /
+`admin_events` (refusals and escalations must never reach model context as
+human decisions), candidate/dismissed decisions, superseded
+artifacts/decisions, and a re-intaken job's purged rows.
+
+Stage prompts get a "Memory search" block (`MEMORY_SEARCH_TOP_K`, 0 or any
+out-of-range value disables) of top-k snippets, prefixed with the
+data-not-instructions note. Scoping is an explicit per-kind whitelist:
+guidance/artifact require an exact project match (project-less rows are
+never admitted) and never the asking job's own rows; memory requires the
+exact project; decisions require the job's workspace OR `org` scope. Search
+terms are sanitized hard (FTS5 syntax stripped) and any FTS error returns
+no results — retrieval is additive context; **no control flow depends on
+it**, so a SQLite build without FTS5 degrades to an absent block
+(`fts_enabled=false`), the one deliberately fail-open read path.
+
+### Slack read ingestion (D3 — FLAG, off by default)
+
+`SLACK_INGEST_ENABLED=false` ships the feature inert; enabling it also
+requires `SLACK_BOT_TOKEN` (env-only secret — never stored on a workspace
+row, never in any API response or log line) and a per-workspace
+`slack_channels` allowlist (a channel routes to exactly ONE workspace —
+read-checked in the synchronous save path; see recorded edges). The poller
+captures decision-shaped messages (`!decision` prefix, or the
+`SLACK_DECISION_EMOJI` reaction) as registry **candidates** — parked inbox
+items for human confirm/dismiss, NEVER auto-committed: quarantined from the
+index, the prompts and the default registry view until a human confirms
+(confirm may edit scope/title/text under the same validation as manual
+adds; the confirming human becomes `decided_by` while the Slack author is
+preserved in `origin_author`). Watermarks are per channel, initialized to
+NOW at first allowlist (forward-only — no historical flood), advanced only
+after a fully-fetched batch (pagination to exhaustion, bounded per pass),
+with a ~7-day overlap re-scan so late reactions are seen (`(source, ref)`
+dedupe absorbs re-reads). Documented Slack-API limits: reactions older than
+the overlap window are missed; thread replies are out of scope unless
+broadcast. No job state is ever touched — output is inbox items + parked
+candidates (the Epic I routines invariant, honored now; the loop is
+`sla_forever`-shaped so I1 can adopt it as a routine kind).
+
+**Recorded edges (Epic D)**: the `slack_channels` cross-workspace
+uniqueness check is a read-check with no DB constraint — sound under
+today's single-process SQLite because check and write share one synchronous
+section with no await between them; re-verify under Epic F2 multi-worker
+Postgres (same treatment as §15's auto-advance non-CAS note). The registry
+API's `q` search uses escaped LIKE rather than the FTS index — deliberate:
+the index excludes non-active rows, and a status-filtered registry search
+must not depend on it.
