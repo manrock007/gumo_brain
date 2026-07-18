@@ -197,6 +197,39 @@ CREATE TABLE IF NOT EXISTS gate_events (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_gate_events_dedupe ON gate_events(job_id, kind, ref);
 
+CREATE TABLE IF NOT EXISTS metric_readings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL,            -- the watch job (INSERT-only, one row per read)
+    metric TEXT NOT NULL DEFAULT '',
+    metric_event TEXT NOT NULL DEFAULT '',
+    observed REAL,                   -- window-to-date aggregate at read time
+    window_day INTEGER,              -- 1..N day index inside the watch window
+    window_start REAL,               -- the watch_started_at this reading belongs to
+                                     -- (a /redo re-arms a NEW window; verdicts and
+                                     -- gate tables must never mix two windows)
+    detail TEXT NOT NULL DEFAULT '', -- provider note (series summary)
+    at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS outcomes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL UNIQUE,     -- the watch job (watch-<feature id>)
+    feature_id TEXT NOT NULL DEFAULT '',
+    workspace_id INTEGER,
+    metric TEXT NOT NULL DEFAULT '',
+    metric_event TEXT NOT NULL DEFAULT '',
+    target TEXT NOT NULL DEFAULT '',
+    observed REAL,
+    baseline REAL,                   -- pre-merge same-length window aggregate (when queryable)
+    window_days INTEGER,
+    verdict TEXT NOT NULL DEFAULT '',      -- moved | flat | regressed | unmeasured
+    verdict_inputs TEXT NOT NULL DEFAULT '{}',  -- JSON: formula inputs (transparent, auditable)
+    learning TEXT NOT NULL DEFAULT '',     -- filled by the human's /proceed answer
+    decided_by TEXT NOT NULL DEFAULT '',   -- via string, e.g. 'dashboard:manish' / 'clickup:jane'
+    decided_at REAL,
+    created_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS gate_chat (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     job_id TEXT NOT NULL,
@@ -243,6 +276,12 @@ MIGRATIONS = {  # table -> columns added after that table first shipped (in-plac
         "branch": "TEXT NOT NULL DEFAULT ''",  # git branch this job's work lives on (stamped at first use)
         "founder_dri": "TEXT DEFAULT ''",  # Epic A2: ClickUp person id (numeric) or username
         "dev_dri": "TEXT DEFAULT ''",      # Epic A2: same encoding; legacy `owner` = computed alias
+        "success_metric": "TEXT DEFAULT ''",   # Epic B1: metric name/goal captured at intake
+        "metric_target": "TEXT DEFAULT ''",    # Epic B1: target value as text (numeric when parseable)
+        "metric_window_days": "INTEGER",       # Epic B1: NULL = settings default at watch spawn
+        "metric_event": "TEXT DEFAULT ''",     # Epic B2: analytics event, harvested from P9 METRIC_EVENT:
+        "watch_started_at": "REAL",            # Epic B4: watch jobs only
+        "watch_deadline": "REAL",              # Epic B4: persisted so restarts never re-derive the window
     },
     "users": {
         "clickup_user_id": "TEXT NOT NULL DEFAULT ''",  # Epic A1: ClickUp id ↔ CtrlLoop identity
@@ -251,6 +290,9 @@ MIGRATIONS = {  # table -> columns added after that table first shipped (in-plac
         "require_attributed_answers": "TEXT NOT NULL DEFAULT 'auto'",  # Epic A1: auto | on | off
         "stage_role_map": "TEXT NOT NULL DEFAULT ''",                  # Epic A3: JSON; '' = inherit
         "gate_sla_hours": "INTEGER",                                   # Epic A5: NULL = inherit
+        "analytics_provider": "TEXT NOT NULL DEFAULT ''",  # Epic B3: '' = none | 'mixpanel'
+        # SECRET AT REST — never returned by the API (workspaces.public redacts it)
+        "analytics_config": "TEXT NOT NULL DEFAULT '{}'",
     },
     "stage_runs": {
         "session_id": "TEXT DEFAULT ''",
@@ -863,10 +905,19 @@ class JobStore:
     def feature_intake(self, job_id: str, title: str, project: str, **fields):
         """Atomic feature (re-)intake: child-state clears + row upsert + pipeline
         reset in ONE transaction — a crash can never leave status='received' with a
-        stale stage and no stage_state (which would strand the job on restart)."""
+        stale stage and no stage_state (which would strand the job on restart).
+
+        The previous lap's outcome-watch state resets in the SAME transaction
+        (Epic B): a stale `watch-<job>` row would block the fresh lap's spawn
+        forever (idempotent-by-existence), and its readings/ledger row would mix
+        two laps' measurements. The new lap is measured from scratch."""
         now = time.time()
+        watch_id = f"watch-{job_id}"
         with self._conn() as c:
             self._clear_pipeline_state(c, job_id)
+            c.execute("DELETE FROM jobs WHERE issue_id = ? AND kind = 'watch'", (watch_id,))
+            c.execute("DELETE FROM metric_readings WHERE job_id = ?", (watch_id,))
+            c.execute("DELETE FROM outcomes WHERE job_id = ?", (watch_id,))
             c.execute(
                 """INSERT INTO jobs (issue_id, kind, project, title, status, source, forced, attempts, created_at, updated_at)
                    VALUES (?, 'feature', ?, ?, 'received', 'manual', 1, 1, ?, ?)
@@ -885,6 +936,114 @@ class JobStore:
                 f"UPDATE jobs SET {cols}, updated_at = ? WHERE issue_id = ?",
                 (*fields.values(), now, job_id),
             )
+
+    # ---------- outcome watch (Epic B4/B5) ----------
+
+    def watch_insert(self, job_id: str, **fields):
+        """Spawn a watch job in ONE transaction: the row is born kind='watch'
+        AND status='watching' — never insert()+set_status, whose intermediate
+        'received' state would be re-enqueued at boot and dispatched into a
+        Claude run. Raises sqlite3.IntegrityError if the row already exists
+        (callers check store.get first; a race fails loudly, not twice)."""
+        now = time.time()
+        cols = ", ".join(fields)
+        marks = ", ".join("?" for _ in fields)
+        with self._conn() as c:
+            c.execute(
+                f"INSERT INTO jobs (issue_id, kind, status, source, forced, attempts"
+                f"{', ' + cols if cols else ''}, created_at, updated_at) "
+                f"VALUES (?, 'watch', 'watching', 'manual', 1, 1"
+                f"{', ' + marks if marks else ''}, ?, ?)",
+                (job_id, *fields.values(), now, now),
+            )
+
+    def reading_add(self, job_id: str, metric: str, metric_event: str,
+                    observed: float | None, window_day: int | None,
+                    detail: str = "", window_start: float | None = None):
+        """One successful metric read (INSERT-only). window_start stamps which
+        watch window (watch_started_at) the reading belongs to — a /redo arms a
+        new window and must never mix readings with the old one."""
+        with self._conn() as c:
+            c.execute(
+                """INSERT INTO metric_readings
+                     (job_id, metric, metric_event, observed, window_day, window_start, detail, at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (job_id, metric, metric_event, observed, window_day, window_start,
+                 detail, time.time()),
+            )
+
+    def readings_for(self, job_id: str, window_start: float | None = None) -> list[dict]:
+        with self._conn() as c:
+            if window_start is None:
+                rows = c.execute(
+                    "SELECT * FROM metric_readings WHERE job_id = ? ORDER BY id",
+                    (job_id,)).fetchall()
+            else:
+                rows = c.execute(
+                    "SELECT * FROM metric_readings WHERE job_id = ? AND window_start = ? ORDER BY id",
+                    (job_id, window_start)).fetchall()
+            return [dict(r) for r in rows]
+
+    def reading_last_at(self, job_id: str) -> float:
+        """When the last reading landed (any window) — the daily-read throttle."""
+        with self._conn() as c:
+            row = c.execute("SELECT MAX(at) AS t FROM metric_readings WHERE job_id = ?",
+                            (job_id,)).fetchone()
+            return (row["t"] if row and row["t"] else 0) or 0
+
+    # measurement/verdict fields the finish path may (re)write — pinned so a
+    # replayed or post-redo _finish_watch can NEVER clobber the human's
+    # learning/decided_by/decided_at (audit-ledger integrity)
+    OUTCOME_VERDICT_FIELDS = ("metric", "metric_event", "target", "observed",
+                              "baseline", "window_days", "verdict", "verdict_inputs")
+
+    def outcome_add(self, job_id: str, feature_id: str, workspace_id: int | None,
+                    **fields):
+        """UPSERT the ledger row for a finished watch. ONE semantics: verdict/
+        measurement fields update in place (a /redo re-finish records the new
+        verdict), created_at survives, and learning/decided_* are untouchable
+        here — they belong to outcome_set (the human's answer)."""
+        fields = {k: v for k, v in fields.items() if k in self.OUTCOME_VERDICT_FIELDS}
+        cols = ", ".join(fields)
+        marks = ", ".join("?" for _ in fields)
+        sets = ", ".join(f"{k} = excluded.{k}" for k in fields)
+        with self._conn() as c:
+            c.execute(
+                f"INSERT INTO outcomes (job_id, feature_id, workspace_id"
+                f"{', ' + cols if cols else ''}, created_at) "
+                f"VALUES (?, ?, ?{', ' + marks if marks else ''}, ?) "
+                f"ON CONFLICT(job_id) DO UPDATE SET "
+                f"feature_id = excluded.feature_id, workspace_id = excluded.workspace_id"
+                f"{', ' + sets if sets else ''}",
+                (job_id, feature_id, workspace_id, *fields.values(), time.time()),
+            )
+
+    def outcome_set(self, job_id: str, **fields):
+        """The human's side of the ledger row (learning/decided_by/decided_at)."""
+        if not fields:
+            return
+        cols = ", ".join(f"{k} = ?" for k in fields)
+        with self._conn() as c:
+            c.execute(f"UPDATE outcomes SET {cols} WHERE job_id = ?",
+                      (*fields.values(), job_id))
+
+    def outcome_for(self, job_id: str) -> dict | None:
+        with self._conn() as c:
+            row = c.execute("SELECT * FROM outcomes WHERE job_id = ?", (job_id,)).fetchone()
+            return dict(row) if row else None
+
+    def outcome_for_feature(self, feature_id: str) -> dict | None:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM outcomes WHERE feature_id = ? ORDER BY id DESC LIMIT 1",
+                (feature_id,)).fetchone()
+            return dict(row) if row else None
+
+    def outcomes_recent(self, limit: int = 200) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute("SELECT * FROM outcomes ORDER BY id DESC LIMIT ?",
+                             (limit,)).fetchall()
+            return [dict(r) for r in rows]
 
     # ---------- per-stage state ----------
 

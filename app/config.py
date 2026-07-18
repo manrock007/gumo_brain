@@ -216,6 +216,22 @@ class Settings(BaseSettings):
     gate_sla_hours: int = 24            # 0 disables SLA escalation (Epic A5)
     sla_check_interval_seconds: int = 900  # escalation sweep cadence
 
+    # ---- Outcome loop (Epic B) ----
+    # Default measurement window (days) for features submitted without one.
+    metric_window_days_default: int = 14
+    # Post-ship watcher: spawn watch jobs on merge + run the watch loop.
+    watch_enabled: bool = True
+    watch_interval_seconds: int = 3600  # loop cadence; reads throttle to ~daily per job
+    # 'flat' verdict band around the baseline, in percent.
+    outcome_flat_band_pct: int = 10
+    # Write the verdict into product memory via a mechanical draft PR.
+    outcome_memory_prs: bool = True
+    # Instance-level analytics fallback (per-workspace settings win): provider
+    # name ('' = none — the null driver) and its config as a JSON object string
+    # ({project_id, service_account, secret, api_base}). Neutral defaults.
+    analytics_provider: str = ""
+    analytics_config: str = "{}"
+
     # ---- Auth (docs/ENGINE.md §11) ----
     # First-boot admin bootstrap: when the users table is empty, an admin
     # account is created from these. Back-compat: if unset but the legacy
