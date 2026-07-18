@@ -35,10 +35,10 @@ import json
 import logging
 import time as _time
 from dataclasses import dataclass, field
-from datetime import datetime, time as dtime, timedelta
+from datetime import datetime, time as dtime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from . import digests
+from . import digests, outcome, signals
 from .config import Settings
 from .db import JobStore
 
@@ -287,6 +287,82 @@ async def _handle_memory_upkeep(ctx: RoutineContext):
     return status, "; ".join(notes) or "all repos fresh", emitted
 
 
+def _emit(ctx: RoutineContext, draft: dict) -> int:
+    """Persist one scanner draft as an inbox item — attributed to the
+    emitting routine, deduplicated (and dismissal-remembered) by its key.
+    Returns 1 only for a NEW row."""
+    new = ctx.store.inbox_item_add(
+        draft["kind"], draft["dedupe_key"], draft["title"],
+        body=draft.get("body") or "", refs=draft.get("refs") or {},
+        workspace_id=ctx.routine.get("workspace_id"),
+        source=ctx.routine.get("kind") or "",
+        source_sig=draft.get("source_sig") or "")
+    return 1 if new else 0
+
+
+# ---------- I4: risk surfacing ----------
+
+
+async def _handle_risk_scan(ctx: RoutineContext):
+    """Conditions a human should hear about BEFORE asking: Sentry velocity
+    spikes, mid-window regressing watch metrics, repeated redos (trust
+    decay), spend pacing over budget. Each emits one attributed, deduped
+    risk_alert. Scanners inert-by-neutral-thresholds spend nothing."""
+    ws = ctx.workspace
+    if ws is None:
+        return "skipped", "workspace row missing", 0
+    s = ctx.settings
+    emitted = 0
+    notes: list[str] = []
+    slugs = {r["slug"] for r in ctx.store.workspace_repos_for(ws["id"])}
+
+    # 1 — Sentry issue-velocity spikes (whole scanner inert without Sentry
+    # or a configured threshold; absolute 24h counts — v1 limitation)
+    spike_threshold = int(ctx.config.get("sentry_spike_events")
+                          or s.risk_sentry_spike_events or 0)
+    if spike_threshold > 0 and s.sentry_enabled and ctx.worker is not None:
+        try:
+            issues = await ctx.worker.sentry.unresolved_issues("24h", 50)
+            utc_date = datetime.fromtimestamp(ctx.now, timezone.utc).strftime("%Y-%m-%d")
+            for draft in signals.sentry_spikes(issues, slugs, spike_threshold,
+                                               utc_date):
+                emitted += _emit(ctx, draft)
+        except Exception as e:
+            notes.append(f"sentry scan failed: {str(e)[:120]}")
+
+    # 2 — regressing watch metrics mid-window (don't wait for day 14)
+    for job in ctx.store.by_status(["watching"]):
+        if (job.get("kind") or "") != "watch" or job.get("workspace_id") != ws["id"]:
+            continue
+        readings = ctx.store.readings_for(job["issue_id"],
+                                          window_start=job.get("watch_started_at"))
+        trend = outcome.mid_window_trend(
+            readings, job.get("metric_target") or "",
+            int(job.get("metric_window_days") or 0), s.outcome_flat_band_pct)
+        draft = signals.watch_regression_alert(job, trend)
+        if draft:
+            emitted += _emit(ctx, draft)
+
+    # 3 — repeated redos on the same stage (trust decaying)
+    redo_threshold = int(ctx.config.get("redo_threshold")
+                         or s.risk_redo_threshold or 0)
+    redo_rows = [r for r in ctx.store.redo_counts(
+        ctx.now - s.autonomy_window_days * 86400)
+        if r.get("workspace_id") == ws["id"]]
+    for draft in signals.redo_alerts(redo_rows, redo_threshold):
+        emitted += _emit(ctx, draft)
+
+    # 4 — spend pacing above budget (early-month guarded, pct-bucketed key)
+    budget = digests.effective_budget(ws, s)
+    spend = ctx.store.costs_since(digests.month_start(ctx.now)).get(ws["id"], 0.0)
+    draft = signals.spend_alert(ws["id"], spend, budget, ctx.now)
+    if draft:
+        emitted += _emit(ctx, draft)
+
+    detail = "; ".join(notes) if notes else f"{emitted} new alert(s)"
+    return ("ok" if emitted or notes else "quiet"), detail, emitted
+
+
 # ---------- I2: the daily standup digest ----------
 
 
@@ -329,6 +405,7 @@ REGISTRY: dict = {
     "janitor": _handle_janitor,
     "standup_digest": _handle_standup,
     "memory_upkeep": _handle_memory_upkeep,
+    "risk_scan": _handle_risk_scan,
 }
 
 

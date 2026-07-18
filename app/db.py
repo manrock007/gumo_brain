@@ -2167,6 +2167,20 @@ class JobStore:
                    ORDER BY g.id""", (since,)).fetchall()
             return [dict(r) for r in rows]
 
+    def redo_counts(self, since: float) -> list[dict]:
+        """Human redos per (job, TARGET stage) in the window — the Epic I4
+        trust-decay signal. Same attribution rule as autonomy_redo_rows:
+        guidance_log records the stage the human actually rejected."""
+        with self._conn() as c:
+            rows = c.execute(
+                """SELECT g.job_id AS job_id, g.stage AS stage, COUNT(*) AS n,
+                          j.workspace_id AS workspace_id, j.project AS project,
+                          j.title AS title
+                   FROM guidance_log g JOIN jobs j ON j.issue_id = g.job_id
+                   WHERE g.action = 'redo' AND g.stage IS NOT NULL AND g.at >= ?
+                   GROUP BY g.job_id, g.stage""", (since,)).fetchall()
+            return [dict(r) for r in rows]
+
     def shepherd_rounds_by_project(self, since: float) -> dict[str, float]:
         """Avg review rounds per project over feature-job PRs touched in the
         window. kind='feature' is explicit — memory-bootstrap and outcome PRs

@@ -62,32 +62,30 @@ class SentryClient:
             r.raise_for_status()
             return r.json()
 
-    async def top_unresolved_issues(self, limit: int = 25) -> list[dict]:
-        """Most-frequent unresolved issues over the last 14 days (sweep source)."""
+    async def unresolved_issues(self, stats_period: str = "14d",
+                                limit: int = 25) -> list[dict]:
+        """Most-frequent unresolved issues over a stats period. The sweep
+        reads 14d; the risk scan (Epic I4) reads 24h for velocity spikes —
+        `count` reflects the requested period."""
         async with httpx.AsyncClient(timeout=30) as client:
             r = await client.get(
                 f"{self._base}/organizations/{self._org}/issues/",
                 headers=self._headers,
                 params={"query": "is:unresolved", "sort": "freq",
-                        "statsPeriod": "14d", "limit": limit},
+                        "statsPeriod": stats_period, "limit": limit},
             )
             r.raise_for_status()
             return r.json()
 
-    async def resolve_short_id(self, short_id: str) -> str | None:
-        """Resolve a short id like PROJ-1A to a numeric issue id."""
-        try:
-            async with httpx.AsyncClient(timeout=30) as client:
-                r = await client.get(
-                    f"{self._base}/organizations/{self._org}/shortids/{short_id}/",
-                    headers=self._headers,
-                )
-                r.raise_for_status()
-                data = r.json()
-                return str(data.get("groupId") or data.get("group", {}).get("id"))
-        except Exception:
-            log.warning("could not resolve short id %s", short_id)
-            return None
+    async def top_unresolved_issues(self, limit: int = 25) -> list[dict]:
+        """Sweep source — the historical 14d shape, kept as a delegate."""
+        return await self.unresolved_issues("14d", limit)
+
+    # NOTE (Epic I4 cleanup): a duplicate resolve_short_id definition used to
+    # shadow the careful 404-vs-transient version above (later def wins) and
+    # returned None on a definitive 404 — callers are written against the
+    # ''-means-404 contract, so deleting the shadow was a bug fix, guarded by
+    # a regression test against the real client method.
 
     async def post_comment(self, issue_id: str, text: str) -> None:
         """Leave a note on the issue. Best-effort — never fails the job."""
