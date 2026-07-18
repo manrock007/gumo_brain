@@ -28,7 +28,10 @@ CREATE TABLE IF NOT EXISTS jobs (
     question TEXT DEFAULT '',        -- pending questions extracted from the analysis
     evidence TEXT DEFAULT '',        -- harness-captured gate evidence (diffstat etc.)
     guidance TEXT,                   -- latest human guidance (v1 task flow)
-    owner TEXT DEFAULT '',           -- feature owner (ClickUp user id or name)
+    owner TEXT DEFAULT '',           -- feature owner (ClickUp user id or name); legacy
+                                     -- computed alias of the DRI columns (Epic A2)
+    founder_dri TEXT DEFAULT '',     -- founder DRI: ClickUp person id (numeric) or username
+    dev_dri TEXT DEFAULT '',         -- dev DRI: same encoding
     related_jobs TEXT DEFAULT '',    -- comma-separated sibling pipelines (cross-repo)
     mirror_ok INTEGER NOT NULL DEFAULT 1,  -- ClickUp artifact mirror healthy?
     cu_list_id TEXT DEFAULT '',      -- home list of the ClickUp ticket (for subtasks)
@@ -128,6 +131,9 @@ CREATE TABLE IF NOT EXISTS workspaces (
     clickup_enabled INTEGER NOT NULL DEFAULT 0,
     slack_webhook_url TEXT NOT NULL DEFAULT '',  -- gate nudges when ClickUp is off (or always)
     gate_mode_default TEXT NOT NULL DEFAULT 'full',
+    require_attributed_answers TEXT NOT NULL DEFAULT 'auto',  -- Epic A1: auto | on | off
+    stage_role_map TEXT NOT NULL DEFAULT '',     -- Epic A3: JSON overrides; '' = inherit
+    gate_sla_hours INTEGER,                      -- Epic A5: NULL = inherit instance default
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
@@ -155,6 +161,7 @@ CREATE TABLE IF NOT EXISTS users (
     username TEXT NOT NULL UNIQUE,
     pw_hash TEXT NOT NULL,           -- argon2
     role TEXT NOT NULL DEFAULT 'member',  -- admin | member
+    clickup_user_id TEXT NOT NULL DEFAULT '',  -- Epic A1: ClickUp person id ↔ CtrlLoop identity
     disabled INTEGER NOT NULL DEFAULT 0,
     must_change_pw INTEGER NOT NULL DEFAULT 0,
     failed_attempts INTEGER NOT NULL DEFAULT 0,
@@ -176,6 +183,19 @@ CREATE TABLE IF NOT EXISTS app_config (
     value TEXT NOT NULL,             -- JSON-encoded value
     updated_at REAL NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS gate_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL,
+    stage INTEGER,
+    kind TEXT NOT NULL,        -- refused_unattributed | refused_wrong_role | admin_override
+                               -- | sla_nudge | sla_second_dri | sla_standup_flag
+    ref TEXT NOT NULL,         -- idempotence key: comment id, uuid, or 'run<stage_runs.id>-step<k>'
+    detail TEXT DEFAULT '',
+    actor TEXT DEFAULT '',     -- acting/refused identity, e.g. 'clickup:jane#123', 'dashboard:manish'
+    at REAL NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_gate_events_dedupe ON gate_events(job_id, kind, ref);
 
 CREATE TABLE IF NOT EXISTS gate_chat (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -221,6 +241,16 @@ MIGRATIONS = {  # table -> columns added after that table first shipped (in-plac
         "auto_retries": "INTEGER NOT NULL DEFAULT 0",  # transient-error retries spent (max 1; human redo resets)
         "workspace_id": "INTEGER",  # owning workspace (Phase 2); NULL rows adopted by migration
         "branch": "TEXT NOT NULL DEFAULT ''",  # git branch this job's work lives on (stamped at first use)
+        "founder_dri": "TEXT DEFAULT ''",  # Epic A2: ClickUp person id (numeric) or username
+        "dev_dri": "TEXT DEFAULT ''",      # Epic A2: same encoding; legacy `owner` = computed alias
+    },
+    "users": {
+        "clickup_user_id": "TEXT NOT NULL DEFAULT ''",  # Epic A1: ClickUp id ↔ CtrlLoop identity
+    },
+    "workspaces": {
+        "require_attributed_answers": "TEXT NOT NULL DEFAULT 'auto'",  # Epic A1: auto | on | off
+        "stage_role_map": "TEXT NOT NULL DEFAULT ''",                  # Epic A3: JSON; '' = inherit
+        "gate_sla_hours": "INTEGER",                                   # Epic A5: NULL = inherit
     },
     "stage_runs": {
         "session_id": "TEXT DEFAULT ''",
@@ -273,6 +303,12 @@ class JobStore:
                                 WHEN 'sentry'  THEN 'brain/sentry-' || issue_id
                                 ELSE 'brain/' || issue_id END
                                 WHERE branch = ''""")
+            # after the migrations loop so upgraded DBs already carry the column:
+            # one ClickUp identity maps to at most one CtrlLoop user (Epic A1).
+            # Partial (non-empty only) — pre-existing rows are all '', so the
+            # index creation is always safe.
+            c.execute("""CREATE UNIQUE INDEX IF NOT EXISTS idx_users_clickup_id
+                         ON users(clickup_user_id) WHERE clickup_user_id != ''""")
 
     @contextmanager
     def _conn(self):
@@ -552,9 +588,43 @@ class JobStore:
         """All users WITHOUT pw_hash — safe for the admin UI."""
         with self._conn() as c:
             rows = c.execute(
-                "SELECT id, username, role, disabled, must_change_pw, created_at, updated_at "
-                "FROM users ORDER BY username").fetchall()
+                "SELECT id, username, role, clickup_user_id, disabled, must_change_pw, "
+                "created_at, updated_at FROM users ORDER BY username").fetchall()
             return [dict(r) for r in rows]
+
+    def user_for_clickup_id(self, cu_id: str) -> dict | None:
+        """The ENABLED user a ClickUp identity maps to. Fails closed on
+        ambiguity: 0 or >1 matches both return None (the unique partial index
+        prevents duplicates, but a hand-edited DB must not silently pick one)."""
+        cu_id = str(cu_id or "").strip()
+        if not cu_id:
+            return None
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM users WHERE clickup_user_id = ? AND disabled = 0 LIMIT 2",
+                (cu_id,)).fetchall()
+            return dict(rows[0]) if len(rows) == 1 else None
+
+    def any_clickup_mapping(self) -> bool:
+        """Does ANY enabled user carry a ClickUp mapping? Drives the 'auto'
+        strictness of require_attributed_answers (Epic A1)."""
+        with self._conn() as c:
+            return c.execute(
+                "SELECT 1 FROM users WHERE clickup_user_id != '' AND disabled = 0 LIMIT 1"
+            ).fetchone() is not None
+
+    def user_for_dri(self, value: str) -> dict | None:
+        """Resolve a DRI value (ClickUp person id or CtrlLoop username) to a
+        user row. Numeric values are ClickUp ids first; a miss falls back to a
+        username lookup so a digits-only username stays reachable."""
+        value = str(value or "").strip()
+        if not value:
+            return None
+        if value.isdigit():
+            user = self.user_for_clickup_id(value)
+            if user is not None:
+                return user
+        return self.user_get(value)
 
     def user_create(self, username: str, pw_hash: str, role: str = "member",
                     must_change_pw: bool = True) -> dict:
@@ -684,6 +754,41 @@ class JobStore:
                 "SELECT * FROM guidance_log WHERE job_id = ? ORDER BY id", (job_id,)
             ).fetchall()
             return [dict(r) for r in rows]
+
+    # ---------- gate events (Epic A: audit substrate + idempotence store) ----------
+    # NOT guidance_log: guidance renders into stage prompts, and refusals /
+    # escalations must never leak into model context as "human decisions".
+
+    def gate_event_add(self, job_id: str, kind: str, ref: str, stage: int | None = None,
+                       detail: str = "", actor: str = "") -> bool:
+        """Record a gate event, idempotently keyed on (job_id, kind, ref).
+        Returns True only when the row is NEW — callers key one-time actions
+        (refusal replies, escalation sends) off that. An empty ref would make
+        any two same-kind events silently dedupe — refused loudly."""
+        ref = str(ref or "").strip()
+        if not ref:
+            raise ValueError("gate_event_add requires a non-empty ref")
+        with self._conn() as c:
+            cur = c.execute(
+                """INSERT OR IGNORE INTO gate_events (job_id, stage, kind, ref, detail, actor, at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (job_id, stage, kind, ref, detail, actor, time.time()),
+            )
+            return cur.rowcount == 1
+
+    def gate_events_for(self, job_id: str) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM gate_events WHERE job_id = ? ORDER BY id", (job_id,)
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def awaiting_gates(self) -> list[dict]:
+        """Everything answerable right now: parked gates (all kinds) plus
+        feature jobs in error/timeout (redo is a valid answer there)."""
+        rows = self.by_status(["awaiting_input", "error", "timeout"])
+        return [r for r in rows
+                if r["status"] == "awaiting_input" or (r.get("kind") or "") == "feature"]
 
     # ---------- artifact sync state (row per artifact) ----------
 
@@ -856,6 +961,22 @@ class JobStore:
                     "UPDATE stage_runs SET gate_answered_at = ?, gate_action = ? WHERE id = ?",
                     (time.time(), action, row["id"]),
                 )
+
+    def latest_gate_posted(self, job_id: str, stage: int) -> float:
+        """When the current gate was posted — the SLA / inbox-age clock. Falls
+        back to the job's updated_at (error/timeout parks may never have posted
+        a gate; 'overdue since epoch' must be impossible)."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT MAX(gate_posted_at) AS t FROM stage_runs "
+                "WHERE job_id = ? AND stage = ? AND gate_posted_at IS NOT NULL",
+                (job_id, stage),
+            ).fetchone()
+            if row and row["t"]:
+                return row["t"]
+            jrow = c.execute("SELECT updated_at FROM jobs WHERE issue_id = ?",
+                             (job_id,)).fetchone()
+            return (jrow["updated_at"] if jrow else 0) or 0
 
     def stage_runs_for(self, job_id: str) -> list[dict]:
         with self._conn() as c:

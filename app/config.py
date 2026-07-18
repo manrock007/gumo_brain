@@ -64,6 +64,30 @@ DEFAULT_BUSINESS_CONTEXT = ""
 RUNTIME_CONTEXT_KEYS = ("product_name", "business_context", "repo_map",
                         "memory_canonical_project")
 
+# Epic A3: built-in stage→role ownership. Every stage overridable per
+# workspace (stage_role_map) or instance-wide (STAGE_ROLE_MAP env).
+DEFAULT_STAGE_ROLE_MAP = {"0": "founder", "1": "founder", "2": "dev", "3": "dev",
+                          "4": "dev", "5": "dev", "6": "dev", "7": "dev",
+                          "8": "dev", "9": "founder"}
+
+
+def validate_stage_role_map(mapping) -> dict:
+    """Validate a stage→role override map. Keys must be '0'..'9', values
+    'founder' | 'dev'. Partial maps are allowed (missing stages fall back to
+    the default ladder). Raises ValueError; returns the cleaned mapping."""
+    if not isinstance(mapping, dict):
+        raise ValueError("stage_role_map must be an object of {stage: role}")
+    cleaned: dict = {}
+    for stage, role in mapping.items():
+        stage = str(stage).strip()
+        if stage not in DEFAULT_STAGE_ROLE_MAP:
+            raise ValueError(f"stage_role_map stage '{stage}' must be '0'..'9'")
+        role = str(role).strip().lower()
+        if role not in ("founder", "dev"):
+            raise ValueError(f"stage_role_map['{stage}'] must be 'founder' or 'dev', got '{role}'")
+        cleaned[stage] = role
+    return cleaned
+
 
 def validate_repo_map(mapping, allow_empty: bool = False) -> dict:
     """Normalize + validate an operator-supplied repo map. Raises ValueError
@@ -176,6 +200,21 @@ class Settings(BaseSettings):
     # P9 launch fields for FLAG_NAME / SUCCESS_METRIC protocol lines — empty = skip
     clickup_flag_field: str = ""
     clickup_metric_field: str = ""
+    # role -> the ClickUp people field feature adoption reads that role's DRI
+    # from (Epic A2). Engine-generic role names addressed by NAME with a quiet
+    # no-op when the workspace lacks them (same posture as Stage/Dashboard/
+    # Decisions — see OPERATIONS.md); '{}' disables the reads entirely.
+    clickup_dri_field_map: str = '{"founder": "Assigned Founder DRI", "dev": "Assigned Dev DRI"}'
+
+    # ---- Team coordination (Epic A) ----
+    # Instance fallback for jobs without a workspace row: auto | on | off.
+    # 'auto' = strict once ANY user carries a ClickUp mapping (Epic A1).
+    require_attributed_answers: str = "auto"
+    # Instance-level stage→role override map (JSON, keys '0'..'9', values
+    # founder|dev); '' = the built-in ladder (P0/P1/P9 founder, P2–P8 dev).
+    stage_role_map: str = ""
+    gate_sla_hours: int = 24            # 0 disables SLA escalation (Epic A5)
+    sla_check_interval_seconds: int = 900  # escalation sweep cadence
 
     # ---- Auth (docs/ENGINE.md §11) ----
     # First-boot admin bootstrap: when the users table is empty, an admin
