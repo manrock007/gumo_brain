@@ -232,6 +232,22 @@ class Settings(BaseSettings):
     analytics_provider: str = ""
     analytics_config: str = "{}"
 
+    # ---- Graduated autonomy (Epic C, docs/ENGINE.md §15) ----
+    # Master switch for the trust ladder: nightly scoring, the autonomy
+    # surface, and workspace pins. False = legacy behavior — only the per-job
+    # gate_mode='light' path auto-advances; pins are ignored. Env-only (not a
+    # RUNTIME_CONTEXT_KEY): flipping it requires a restart.
+    autonomy_enabled: bool = True
+    autonomy_window_days: int = 30      # rolling stage_runs window the scorer reads
+    autonomy_min_runs: int = 5          # cells below this sample stay level 0
+    # Computed level required for a cell to auto-advance. FAIL-CLOSED DEFAULT:
+    # 0 = computed levels NEVER auto-advance (scores/matrix/pins still work —
+    # pins are explicit admin actions). Set 1..3 to opt in (3 = only full
+    # trust). Any value outside 1..3 disables the computed-level rule — it is
+    # never clamped toward permissiveness.
+    autonomy_auto_level: int = 0
+    autonomy_recompute_hours: int = 24  # nightly scorer cadence
+
     # ---- Auth (docs/ENGINE.md §11) ----
     # First-boot admin bootstrap: when the users table is empty, an admin
     # account is created from these. Back-compat: if unset but the legacy

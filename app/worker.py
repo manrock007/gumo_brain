@@ -20,7 +20,7 @@ import time
 import uuid
 from pathlib import Path
 
-from . import analytics, outcome, roles
+from . import analytics, autonomy, outcome, roles
 from .clickup import ClickUp
 from .config import ENGINE_NAME, Settings
 from .db import JobStore
@@ -1573,6 +1573,25 @@ class Worker:
         await self.clickup.comment(
             task_id, f"{GATE_PREFIX} 📥 adopted as a {adopted_as}. ({decision})")
         log.info("clickup intake: %s %s from ticket %s (%s)", kind, job_id, task_id, decision)
+
+    async def autonomy_forever(self):
+        """Nightly autonomy scorer (Epic C1, docs/ENGINE.md §15). The flag is
+        checked once — flipping AUTONOMY_ENABLED requires a restart (env-only,
+        documented in OPERATIONS.md). compute() is synchronous SQLite work, so
+        it runs in a thread — a full 30-day scan must never block gates or
+        webhooks on the event loop."""
+        if not self.settings.autonomy_enabled:
+            log.info("autonomy disabled; scorer not started")
+            return
+        await asyncio.sleep(120)  # settle after deploy, then first pass immediately
+        while True:
+            try:
+                res = await asyncio.to_thread(
+                    autonomy.compute, self.store, self.settings)
+                log.info("autonomy recompute: %(cells)d cells, %(changed)d level changes", res)
+            except Exception:
+                log.exception("autonomy recompute failed")
+            await asyncio.sleep(self.settings.autonomy_recompute_hours * 3600)
 
     async def sweep_forever(self):
         if not self.settings.sweep_enabled:

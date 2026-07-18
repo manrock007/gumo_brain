@@ -37,7 +37,7 @@ from .feature_prompts import stage_name
 from .fixer import ensure_session_store
 from .memory import MemoryReader
 from .sentry_api import extract_issue_ref, verify_signature
-from . import roles
+from . import autonomy, roles
 from .worker import GateConflict, GateForbidden, Worker
 from .workspaces import WorkspaceError, WorkspaceNotFound, WorkspaceService
 from . import transcripts
@@ -109,6 +109,7 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(worker.shepherd_forever()),
         asyncio.create_task(worker.sla_forever()),
         asyncio.create_task(worker.watch_forever()),
+        asyncio.create_task(worker.autonomy_forever()),
     ]
     app.state.store = store
     app.state.worker = worker
@@ -526,6 +527,18 @@ async def outcomes_ledger(user: dict = Depends(require_user)):
         v = r.get("verdict") or "unmeasured"
         verdicts[v] = verdicts.get(v, 0) + 1
     return {"outcomes": rows, "verdicts": verdicts}
+
+
+@app.post("/api/autonomy/recompute", dependencies=[Depends(require_admin)])
+async def autonomy_recompute():
+    """Run the autonomy scorer inline (operator/test convenience — nobody
+    waits for the nightly pass). Same thread-offload as the loop; the two
+    serialize trivially through SQLite's single writer today."""
+    if not settings.autonomy_enabled:
+        raise HTTPException(status_code=400, detail="autonomy is disabled (AUTONOMY_ENABLED)")
+    res = await asyncio.to_thread(
+        autonomy.compute, app.state.store, settings)
+    return res
 
 
 class TriggerBody(BaseModel):

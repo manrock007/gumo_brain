@@ -230,6 +230,41 @@ CREATE TABLE IF NOT EXISTS outcomes (
     created_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS autonomy_scores (
+    workspace_id INTEGER NOT NULL,
+    project TEXT NOT NULL,             -- repo slug (globally unique across workspaces)
+    stage INTEGER NOT NULL,            -- 0..8 (P9 never auto-advances — no cell)
+    level INTEGER NOT NULL DEFAULT 0,  -- 0 = always gate .. 3 = full auto-advance
+    score REAL NOT NULL DEFAULT 0,     -- composite 0..1 the level was derived from
+    inputs TEXT NOT NULL DEFAULT '{}', -- JSON: exact numbers the formula saw (transparency)
+    sample_runs INTEGER NOT NULL DEFAULT 0,
+    clawback_at REAL,                  -- set by clawback; runs before this never count again
+    computed_at REAL NOT NULL,
+    PRIMARY KEY (workspace_id, project, stage)
+);
+
+CREATE TABLE IF NOT EXISTS autonomy_pins (
+    workspace_id INTEGER NOT NULL,
+    stage INTEGER NOT NULL,
+    pin TEXT NOT NULL,                 -- 'always_gate' | 'always_auto'
+    set_by TEXT NOT NULL DEFAULT '',   -- 'dashboard:<username>'
+    set_at REAL NOT NULL,
+    PRIMARY KEY (workspace_id, stage)
+);
+
+CREATE TABLE IF NOT EXISTS autonomy_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id INTEGER,
+    project TEXT DEFAULT '',
+    stage INTEGER,
+    job_id TEXT DEFAULT '',
+    kind TEXT NOT NULL,                -- 'auto_advance' | 'pin_set' | 'pin_clear' | 'clawback' | 'level_change'
+    detail TEXT DEFAULT '',            -- e.g. 'P6 auto-advanced — level 3, 14 clean runs'
+    actor TEXT DEFAULT '',             -- 'engine' | 'dashboard:<username>'
+    at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_autonomy_events_ws_at ON autonomy_events(workspace_id, at);
+
 CREATE TABLE IF NOT EXISTS gate_chat (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     job_id TEXT NOT NULL,
@@ -1142,6 +1177,195 @@ class JobStore:
             rows = c.execute(
                 "SELECT * FROM stage_runs WHERE job_id = ? ORDER BY id", (job_id,)
             ).fetchall()
+            return [dict(r) for r in rows]
+
+    # ---------- autonomy (Epic C: the trust ladder, docs/ENGINE.md §15) ----------
+    # Scores/pins/events are configuration + telemetry, each written in a
+    # single atomic statement — deliberately OUTSIDE the job-state CAS paths.
+
+    def autonomy_run_rows(self, since: float) -> list[dict]:
+        """The scorer's single stage_runs input: feature-job runs started in
+        the window, stamped with their job's workspace/project. Stage 9 rows
+        are excluded at the source (levels cover 0–8 only; P9 is terminal)."""
+        with self._conn() as c:
+            rows = c.execute(
+                """SELECT r.*, j.workspace_id AS workspace_id, j.project AS project
+                   FROM stage_runs r JOIN jobs j ON j.issue_id = r.job_id
+                   WHERE j.kind = 'feature' AND j.workspace_id IS NOT NULL
+                     AND r.stage BETWEEN 0 AND 8 AND r.started_at >= ?
+                   ORDER BY r.id""", (since,)).fetchall()
+            return [dict(r) for r in rows]
+
+    def autonomy_redo_rows(self, since: float) -> list[dict]:
+        """Human redos in the window, attributed to their TARGET stage —
+        guidance_log records the stage the human actually rejected (a
+        retargeted '/redo P<k>' answered at a P<n> gate lands on stage k),
+        while stage_runs.gate_action stamps the parked stage n. The scorer's
+        redo numerator reads THIS, never gate_action (which stays the
+        answered-gate denominator only)."""
+        with self._conn() as c:
+            rows = c.execute(
+                """SELECT g.stage AS stage, g.at AS at,
+                          j.workspace_id AS workspace_id, j.project AS project
+                   FROM guidance_log g JOIN jobs j ON j.issue_id = g.job_id
+                   WHERE g.action = 'redo' AND j.kind = 'feature'
+                     AND j.workspace_id IS NOT NULL AND g.stage IS NOT NULL
+                     AND g.at >= ?
+                   ORDER BY g.id""", (since,)).fetchall()
+            return [dict(r) for r in rows]
+
+    def shepherd_rounds_by_project(self, since: float) -> dict[str, float]:
+        """Avg review rounds per project over feature-job PRs touched in the
+        window. kind='feature' is explicit — memory-bootstrap and outcome PRs
+        are tracked in prs too and must not poison the signal."""
+        with self._conn() as c:
+            rows = c.execute(
+                """SELECT j.project AS project, AVG(p.review_rounds) AS rounds
+                   FROM prs p JOIN jobs j ON j.issue_id = p.job_id
+                   WHERE j.kind = 'feature' AND p.updated_at >= ?
+                   GROUP BY j.project""", (since,)).fetchall()
+            return {r["project"]: float(r["rounds"] or 0) for r in rows}
+
+    def autonomy_score_upsert(self, workspace_id: int, project: str, stage: int,
+                              level: int, score: float, inputs_json: str,
+                              sample_runs: int, computed_started: float) -> dict:
+        """Conditional upsert of one cell. The previous-level read, the write
+        and the post-write re-read share ONE transaction; the DO UPDATE is
+        guarded so a clawback that landed after the compute pass started can
+        never be overwritten (clawback_at itself is never touched here).
+        Theoretical under today's single-threaded sync SQLite; load-bearing
+        under multi-worker Postgres (Epic F2). Returns
+        {prev_level, level (stored after), applied}."""
+        now = time.time()
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT level FROM autonomy_scores WHERE workspace_id = ? AND project = ? AND stage = ?",
+                (workspace_id, project, stage)).fetchone()
+            prev = row["level"] if row else None
+            cur = c.execute(
+                """INSERT INTO autonomy_scores
+                     (workspace_id, project, stage, level, score, inputs, sample_runs, computed_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(workspace_id, project, stage) DO UPDATE SET
+                     level = excluded.level, score = excluded.score,
+                     inputs = excluded.inputs, sample_runs = excluded.sample_runs,
+                     computed_at = excluded.computed_at
+                   WHERE autonomy_scores.clawback_at IS NULL
+                      OR autonomy_scores.clawback_at < ?""",
+                (workspace_id, project, stage, level, score, inputs_json,
+                 sample_runs, now, computed_started))
+            applied = cur.rowcount == 1
+            after = c.execute(
+                "SELECT level FROM autonomy_scores WHERE workspace_id = ? AND project = ? AND stage = ?",
+                (workspace_id, project, stage)).fetchone()
+            return {"prev_level": prev, "level": after["level"] if after else level,
+                    "applied": applied}
+
+    def autonomy_score_get(self, workspace_id: int, project: str, stage: int) -> dict | None:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM autonomy_scores WHERE workspace_id = ? AND project = ? AND stage = ?",
+                (workspace_id, project, stage)).fetchone()
+            return dict(row) if row else None
+
+    def autonomy_scores_for(self, workspace_id: int) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM autonomy_scores WHERE workspace_id = ? ORDER BY project, stage",
+                (workspace_id,)).fetchall()
+            return [dict(r) for r in rows]
+
+    def autonomy_scores_all(self) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM autonomy_scores ORDER BY workspace_id, project, stage").fetchall()
+            return [dict(r) for r in rows]
+
+    def autonomy_clawback(self, workspace_id: int, stage: int,
+                          project: str | None) -> list[str]:
+        """Drop cell(s) to level 0 and stamp clawback_at — re-earning starts
+        from zero (the scorer ignores runs started before the stamp). A
+        workspace-wide clawback (project=None) derives its slug list HERE, in
+        the same transaction: every project that ever earned a score row in
+        this workspace UNION the current repo slugs — a slug since removed
+        from (or moved out of) the workspace keeps its stale cell clawable.
+        Returns the affected project slugs."""
+        now = time.time()
+        with self._conn() as c:
+            if project is None:
+                slugs = {r["project"] for r in c.execute(
+                    "SELECT DISTINCT project FROM autonomy_scores WHERE workspace_id = ?",
+                    (workspace_id,)).fetchall()}
+                slugs |= {r["slug"] for r in c.execute(
+                    "SELECT slug FROM workspace_repos WHERE workspace_id = ?",
+                    (workspace_id,)).fetchall()}
+            else:
+                slugs = {project}
+            for p in sorted(slugs):
+                c.execute(
+                    """INSERT INTO autonomy_scores
+                         (workspace_id, project, stage, level, score, inputs,
+                          sample_runs, clawback_at, computed_at)
+                       VALUES (?, ?, ?, 0, 0, '{}', 0, ?, ?)
+                       ON CONFLICT(workspace_id, project, stage) DO UPDATE SET
+                         level = 0, score = 0,
+                         clawback_at = excluded.clawback_at,
+                         computed_at = excluded.computed_at""",
+                    (workspace_id, p, stage, now, now))
+            return sorted(slugs)
+
+    def autonomy_pin_set(self, workspace_id: int, stage: int, pin: str, set_by: str):
+        with self._conn() as c:
+            c.execute(
+                "INSERT OR REPLACE INTO autonomy_pins (workspace_id, stage, pin, set_by, set_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (workspace_id, stage, pin, set_by, time.time()))
+
+    def autonomy_pin_clear(self, workspace_id: int, stage: int):
+        with self._conn() as c:
+            c.execute("DELETE FROM autonomy_pins WHERE workspace_id = ? AND stage = ?",
+                      (workspace_id, stage))
+
+    def autonomy_pins_for(self, workspace_id: int) -> dict[int, dict]:
+        with self._conn() as c:
+            rows = c.execute("SELECT * FROM autonomy_pins WHERE workspace_id = ? ORDER BY stage",
+                             (workspace_id,)).fetchall()
+            return {r["stage"]: dict(r) for r in rows}
+
+    def autonomy_pins_all(self) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM autonomy_pins ORDER BY workspace_id, stage").fetchall()
+            return [dict(r) for r in rows]
+
+    def autonomy_event_add(self, kind: str, workspace_id: int | None = None,
+                           project: str = "", stage: int | None = None,
+                           job_id: str = "", detail: str = "", actor: str = ""):
+        """INSERT-only audit substrate for every autonomy mutation (Epic E4
+        folds/exports these later; nothing here waits for it)."""
+        with self._conn() as c:
+            c.execute(
+                """INSERT INTO autonomy_events
+                     (workspace_id, project, stage, job_id, kind, detail, actor, at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (workspace_id, project, stage, job_id, kind, detail, actor, time.time()))
+
+    def autonomy_events_recent(self, workspace_ids: list[int] | None,
+                               limit: int = 50) -> list[dict]:
+        """Newest-first event log. None = all workspaces (admins)."""
+        with self._conn() as c:
+            if workspace_ids is None:
+                rows = c.execute(
+                    "SELECT * FROM autonomy_events ORDER BY id DESC LIMIT ?",
+                    (limit,)).fetchall()
+            elif not workspace_ids:
+                rows = []
+            else:
+                marks = ",".join("?" for _ in workspace_ids)
+                rows = c.execute(
+                    f"SELECT * FROM autonomy_events WHERE workspace_id IN ({marks}) "
+                    f"ORDER BY id DESC LIMIT ?",
+                    (*workspace_ids, limit)).fetchall()
             return [dict(r) for r in rows]
 
     # ---------- gate chat (INSERT-only transcript) ----------
