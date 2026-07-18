@@ -202,6 +202,40 @@ How it fits together:
   that are ALREADY over the SLA *and* carry explicit DRIs — a freshly
   upgraded instance (no DRI columns populated yet) sends nothing.
 
+## 8. The outcome loop (Epic B: metric at intake, watcher, ledger)
+
+| Env var | Default | Meaning |
+| --- | --- | --- |
+| `METRIC_WINDOW_DAYS_DEFAULT` | `14` | measurement window (days) for features submitted without one; the API/intake accept 1–365. |
+| `WATCH_ENABLED` | `true` | master switch: spawn watch jobs on merge + run the watch loop. |
+| `WATCH_INTERVAL_SECONDS` | `3600` | watch loop cadence; metric reads are internally throttled to ~one per day per job. |
+| `OUTCOME_FLAT_BAND_PCT` | `10` | ± band around the baseline inside which a verdict is `flat`. |
+| `OUTCOME_MEMORY_PRS` | `true` | on `/proceed` at the Iterate gate, write the verdict into product memory via a mechanical draft PR (no model run). |
+| `ANALYTICS_PROVIDER` | *(empty)* | instance-level analytics fallback: empty = none (verdicts stay `unmeasured`) or `mixpanel`. Per-workspace settings win. |
+| `ANALYTICS_CONFIG` | `{}` | JSON object for the instance provider: `{project_id, service_account, secret, api_base}`. EU Mixpanel projects set `"api_base": "https://eu.mixpanel.com/api"` — never a code default. |
+
+Per-workspace analytics lives in Settings → Workspaces
+(`PATCH /api/workspaces/{id}` with `analytics_provider` +
+`analytics_config`). The config — including the Mixpanel service-account
+secret — is stored in the DB row and **redacted from every API response**;
+the dashboard only ever sees `analytics_configured: true/false`. A malformed
+config or unknown provider degrades to the null driver (outcomes render
+`unmeasured`), and read failures (e.g. a revoked credential's 401) appear as
+detail text on the watch job.
+
+Operational notes:
+
+- Watch jobs (`watch-<feature id>`) never invoke Claude — the loop is pure
+  HTTP + SQLite. A parked Iterate gate does sit in `awaiting_input`, so it
+  counts toward the `runs_today` daily-cap denominator like any other parked
+  gate (accepted; the cap only guards Claude-run statuses transitively).
+- Re-submitting a shipped feature resets the previous lap's watch row,
+  readings, and ledger row inside the atomic re-intake — the new lap is
+  measured from scratch.
+- `/redo <days>` on the Iterate gate re-arms a fresh window (1–365; anything
+  else is refused with the reason) while keeping the ORIGINAL pre-ship
+  baseline.
+
 ## Appendix — Example configuration: the original Gumo instance
 
 The values that used to ship as code defaults, now purely this one customer's

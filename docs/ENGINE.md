@@ -41,6 +41,7 @@ Atomic cross-repo pipelines are deferred.
 | `task`    | dashboard (title or ClickUp URL) | analyse → gate → implement         |
 | `feature` | dashboard (title or ClickUp URL) | **P0–P9 pipeline, gate after every stage** |
 | `memory`  | dashboard, per project           | bootstrap `<ns>/memory/` → draft PR |
+| `watch`   | spawned on a terminal feature's PR merge | metric reads → verdict → **Iterate gate** (§2b) — never a Claude run |
 
 ## 2. The stage ladder (P0–P9)
 
@@ -74,6 +75,17 @@ after it is the payload):
 - `STAGE_DONE:` + the artifact/summary markdown, ending with `## Questions`
   (≥1; minimum "1. Approve and continue to P<n+1>?").
 - `STAGE_FAIL:` + why (blocked, missing info).
+
+**P0/P1 success-metric requirement (Epic B1, fail-closed).** The P0 and P1
+artifact contracts demand a `## Success metric` section (restating the goal
+set at intake — metric, target, window — and HOW it will be measured). A
+P0/P1 `STAGE_DONE` whose payload lacks that heading does NOT close `done`:
+the run closes `missing_metric` and parks flagged, after the artifact commit
+and checkpoint push (the payload is on the branch and the gate), before any
+light-mode auto-advance. `/redo` regenerates; a `/proceed` on the flagged
+park is a **deliberate human override** of the metric requirement — the
+pipeline continues without a stated metric and the outcome watch will be
+skipped at merge unless a metric lands later (P9 protocol lines).
 
 A standalone `PR_URL: <url>` line is honored *in addition* (P5, P9) — a bare
 URL elsewhere in output never changes state. Anything unparseable **fails
@@ -160,6 +172,85 @@ oldest-gate-first, with `counts.mine` as the badge number.
 the poller ignores engine-authored comments (fixed prefix). On restart, parked
 jobs re-scan comments after the stored marker, so answers posted during an
 outage are honored.
+
+## 2b. The outcome loop (Epic B)
+
+Close Review + Accountability: a metric goal goes in at intake, a **measured
+verdict** comes out after ship. The whole loop is HTTP + SQLite — a watch job
+never invokes Claude (a fail-closed branch in the worker returns any queued
+watch to the loop untouched).
+
+**Metric at intake (B1).** `POST /api/features` accepts `success_metric`,
+`metric_target`, `metric_window_days` (validated 1–365, atomically — a bad
+window is a 400 with nothing queued). ClickUp `[feature]` adoption reads
+`metric:` / `target:` / `window:` description lines (bold-tolerant, stripped
+from the request like the `project:` line) with the ticket's `Success metric`
+custom field as fallback. Stage prompts restate the goal in every header.
+
+**Harvest (B1/B2).** Runs may emit `SUCCESS_METRIC:` / `METRIC_TARGET:` /
+`METRIC_WINDOW_DAYS:` / `METRIC_EVENT:` protocol lines (P9's contract names
+them; P8 verifies the instrumentation exists in the diff). They land on the
+job row — NOT gated by the ClickUp field sync (the row is the record, the
+mirror is visibility). **Human intake wins**: the first three fill only when
+empty; `metric_event` is engine-owned and always takes the latest emission.
+
+**Analytics adapter (B3, seam H4).** `app/analytics.py`: an
+`AnalyticsProvider` interface (`query_metric(metric, window_days, event, end)
+-> {status, series, total, detail}`), a Mixpanel driver (per-workspace
+credentials: `analytics_provider` + `analytics_config` — the config is a
+SECRET AT REST, stored on the workspace row and never returned by any API;
+the dashboard sees only `analytics_configured`), and a Null driver for
+instances without analytics. Resolution: workspace row > instance env
+(`ANALYTICS_PROVIDER`/`ANALYTICS_CONFIG`) > null. Unknown provider names and
+malformed config fail closed to the null driver (verdicts become
+`unmeasured`, never a guess); provider errors (401s etc.) surface as visible
+detail on the watch job.
+
+**Post-ship watcher (B4).** When a tracked PR merges AND the feature is
+terminal at `pr_opened`, the shepherd spawns `watch-<feature id>` — a single-
+transaction insert born `kind='watch'`, `status='watching'` (invisible to the
+queue/reaper/requeue by construction), copying the metric fields, workspace,
+ticket, and the founder DRI as owner. A PR merged mid-pipeline spawns nothing;
+the P9-approval path re-checks and spawns then. A feature with no metric and
+no event gets ONE "watch skipped" ticket note (deduped per feature via
+`gate_events`). Spawn does not flip the ticket status (the Stage field just
+went Complete); status changes happen only at park/close.
+
+The watch loop (every `WATCH_INTERVAL_SECONDS`) reads the metric ~daily
+(throttled to one read per ~22h per job) into the INSERT-only
+`metric_readings` table, each row stamped with its window's
+`watch_started_at` so a `/redo` never mixes windows. At `watch_deadline`
+(persisted at spawn — restarts never re-derive it) the finisher takes a final
+read, queries a same-length pre-ship baseline (persisted on first finish —
+a redo re-finish reuses the ORIGINAL baseline), computes the verdict via the
+transparent formula in `app/outcome.py` (direction-aware: decrease-goal
+targets like "under 300ms" judge inverted; ambiguous directions never assert
+a regression; no data → `unmeasured`, fail closed), UPSERTs the `outcomes`
+ledger row (verdict fields only — it can never clobber a recorded learning),
+and parks a founder-owned **Iterate gate**: single CAS
+`watching → awaiting_input` first, ClickUp comment/status/assignee strictly
+after (best-effort). Verbs on the gate:
+
+- `/proceed <learning>` → learning + decider recorded on the ledger row,
+  watch closes `done`; with `OUTCOME_MEMORY_PRS=true` a background MECHANICAL
+  task (no model run) writes a changelog entry (+ ADR when a learning exists)
+  under the repo's engine namespace on a `<prefix>/outcome-<feature>` branch
+  and opens a draft PR — git stays truth: memory changes only via a
+  human-merged PR; the DB row is the record regardless.
+- `/redo <days>` → the watch re-arms with a fresh window (days optional,
+  clamped 1–365 — out-of-range is refused with the reason, never silently
+  accepted). The ledger row stays; the re-finish overwrites verdict fields.
+- `/skip` → closes `skipped` (also valid mid-window to cancel a watch); the
+  verdict stands, no learning.
+
+NOTE: a parked Iterate gate sits in `awaiting_input` and therefore counts
+toward `runs_today`'s daily-cap denominator exactly like feature gates —
+accepted and documented (watch jobs consume no Claude runs themselves).
+
+**Ledger (B5).** `GET /api/outcomes` — membership-scoped rows + the verdict
+distribution; the dashboard's "Outcomes" panel renders it, and the job detail
+pane shows a verdict card (watch and feature views). Status vocabulary:
+`watching` (active watch) and `done` (watch closed with a recorded outcome).
 
 ## 3. Shared artifacts — the sync protocol
 
@@ -307,7 +398,12 @@ guidance > older guidance; superseded guidance is marked.
   atomically (400 changes nothing) and applies live; DELETE reverts to the
   env/code defaults.
 - `POST /api/features` — `{project, clickup? | title+summary, founder_dri?,
-  dev_dri?, related_to?}` (`owner` = deprecated alias for `dev_dri`).
+  dev_dri?, related_to?, success_metric?, metric_target?,
+  metric_window_days?}` (`owner` = deprecated alias for `dev_dri`;
+  the window validates 1–365 atomically).
+- `GET /api/outcomes` — the outcome ledger (§2b): membership-scoped rows
+  (feature, metric, target, observed, verdict, learning, decider) + the
+  verdict distribution.
 - `POST /api/jobs/{id}/answer` — `{action: proceed|redo|skip, answer,
   override?}`, CAS-guarded, 409 on lost race, 403 for a non-owner on a
   role-exclusive gate (`override: true` = the audited admin bypass).

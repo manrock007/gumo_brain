@@ -84,8 +84,11 @@ rename/infra checklist.
 - `POST /api/tasks` — 2-phase request: `{project, clickup? | title+summary}`
 - `POST /api/features` — P0–P9 pipeline: same body + `founder_dri?` / `dev_dri?`
   (ClickUp user id or username — gate ownership + notifications; `owner?` is the
-  deprecated alias for `dev_dri`) and `related_to?` (sibling pipeline ids for
-  cross-repo features)
+  deprecated alias for `dev_dri`), `related_to?` (sibling pipeline ids for
+  cross-repo features), and the outcome-loop goal `success_metric?` /
+  `metric_target?` / `metric_window_days?` (1–365; docs/ENGINE.md §2b — a
+  merged feature is then measured and a verdict parks a founder-owned
+  Iterate gate)
 - `POST /api/jobs/{job_id}/answer` — `{action: proceed|redo|skip, answer, override?}`;
   `redo` accepts a `P<k>` prefix in the answer to re-run an earlier stage; 409 if the
   gate was already answered via ClickUp; 403 if a role-exclusive gate (dual DRIs,
@@ -94,6 +97,9 @@ rename/infra checklist.
 - `GET /api/inbox` — the per-person "Awaiting you" queue: gates you own +
   unassigned gates, overdue first (per-workspace `gate_sla_hours` SLA)
 - `GET /api/features/{job_id}/stats` — per-stage telemetry (runs, guidance, artifacts)
+- `GET /api/outcomes` — the **outcome ledger**: measured verdicts
+  (moved / flat / regressed / unmeasured) per shipped feature + the
+  distribution, membership-scoped
 - `GET /api/memory` / `GET /api/memory/{project}` — cached product-memory state
 - `POST /api/memory/{project}/bootstrap` — queue a memory bootstrap job
 - `GET /api/jobs`, `GET /api/projects` — job list, project→repo map
