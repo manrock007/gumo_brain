@@ -84,6 +84,16 @@ def _clean_metric_value(raw: str) -> str:
     return (raw or "").strip().strip("*").strip()
 
 
+def _single_line(value: str, cap: int = 300) -> str:
+    """Collapse untrusted free text to ONE bounded line (every whitespace run
+    — newlines included — becomes a single space). Metric/target values are
+    interpolated into engine-voiced prompt headers on EVERY stage run: a
+    multiline value could smuggle markdown headings/instructions into the
+    prompt as if the engine had written them, so the stored value is forced
+    single-line and capped at intake (both channels funnel through here)."""
+    return " ".join(str(value or "").split())[:cap].strip()
+
+
 class GateConflict(Exception):
     """The gate was already answered through the other channel."""
 
@@ -259,9 +269,12 @@ class Worker:
             related_jobs=related_jobs,
             # Epic B1: metric goal from the fresh submission (a re-intake
             # overwrites, consistent with the atomic pipeline reset) — and the
-            # previous lap's engine-owned metric/watch state clears with it
-            success_metric=(success_metric or "").strip(),
-            metric_target=(metric_target or "").strip(),
+            # previous lap's engine-owned metric/watch state clears with it.
+            # Single-line + capped: these values render inside engine-voiced
+            # prompt headers (feature_prompts._metric_goal_block) — see
+            # _single_line for why multiline/unbounded values are refused.
+            success_metric=_single_line(success_metric),
+            metric_target=_single_line(metric_target),
             metric_window_days=metric_window_days,
             metric_event="",
             watch_started_at=None,
@@ -699,7 +712,8 @@ class Worker:
                                               actor=actor, override=override)
         if kind == "watch":
             # BEFORE the v1 redo-refusal: the Iterate gate supports /redo <days>
-            return await self._answer_watch(job, action, text, via)
+            return await self._answer_watch(job, action, text, via,
+                                            actor=actor, override=override)
         if action == "redo":
             raise ValueError(f"redo is only valid for feature pipelines, not kind '{kind}'")
         return await self._answer_v1(job, action, text, via)
@@ -745,6 +759,22 @@ class Worker:
         await self.clickup.field_append(task_id, "Decisions",
                                         f"P{stage}{label}: {text[:400]}")
 
+    def _owner_guard(self, job: dict, actor: dict | None,
+                     override: bool) -> tuple["roles.GateOwner | None", bool]:
+        """Role-exclusive enforcement shared by feature gates AND the watch
+        Iterate gate (Epic A3 / ENGINE.md §2b): raises GateForbidden for a
+        non-owner, or returns (owner, admin_override) — True only for the
+        explicit, dashboard-only admin bypass (audited by the caller AFTER a
+        won CAS). Inert when the job records no explicit DRIs."""
+        owner = roles.gate_owner(self.store, self.settings, self._ws_row(job), job)
+        admin_override = False
+        if owner is not None and owner.enforce and not roles.actor_is_owner(owner, actor):
+            if actor and actor.get("role") == "admin" and override:
+                admin_override = True  # dashboard-only, explicit, audited by caller
+            else:
+                raise GateForbidden(f"this is a {owner.role} gate, owned by {owner.display}")
+        return owner, admin_override
+
     async def _answer_feature(self, job: dict, action: str, text: str, via: str,
                               actor: dict | None = None, override: bool = False) -> str:
         """Role-exclusive gates (Epic A3), enforced at the single choke point
@@ -753,13 +783,7 @@ class Worker:
         or None — solo installs and pre-upgrade jobs behave exactly as today).
         Applies to proceed/redo/skip including ask-gates and redo-from-error;
         gate chat and plain comments are untouched."""
-        owner = roles.gate_owner(self.store, self.settings, self._ws_row(job), job)
-        admin_override = False
-        if owner is not None and owner.enforce and not roles.actor_is_owner(owner, actor):
-            if actor and actor.get("role") == "admin" and override:
-                admin_override = True  # dashboard-only, explicit, audited below
-            else:
-                raise GateForbidden(f"this is a {owner.role} gate, owned by {owner.display}")
+        owner, admin_override = self._owner_guard(job, actor, override)
         result = await self._answer_feature_inner(job, action, text, via)
         if admin_override:
             # recorded only AFTER the transition succeeded — a lost CAS raises
@@ -1003,10 +1027,13 @@ class Worker:
             metric_window_days=days,
             watch_started_at=now,
             watch_deadline=now + days * 86400,
-            # founder-owned Iterate gate (assignment/display; watch gates are
-            # not role-enforced — kind != 'feature')
+            # founder-owned Iterate gate: BOTH DRI columns are copied so
+            # roles.gate_owner enforces it exactly like feature gates
+            # (founder slot wins, dev is the fallback owner; legacy `owner`
+            # stays display/assignment only)
             owner=(job.get("founder_dri") or "").strip() or (job.get("owner") or "").strip(),
             founder_dri=(job.get("founder_dri") or "").strip(),
+            dev_dri=(job.get("dev_dri") or "").strip(),
             clickup_task_id=task_id,
             clickup_task_url=job.get("clickup_task_url") or "",
             cu_list_id=job.get("cu_list_id") or "",
@@ -1086,7 +1113,15 @@ class Worker:
             # window ending at the refreshed start would include post-ship data
             baseline = existing["baseline"]
         else:
-            base_res = await provider.query_metric(metric, window, event=event, end=started)
+            # no persisted baseline (first finish, or the first finish's query
+            # failed and stored NULL): the query must END at the ORIGINAL
+            # merge-time spawn, never the current window's start — a /redo
+            # overwrites watch_started_at, and a window ending there would be
+            # entirely post-ship data mislabeled "same-length pre-ship window"
+            # (ENGINE.md §2b). The spawn instant survives as the row's
+            # created_at (watch_insert stamps it in the same transaction).
+            anchor = float(job.get("created_at") or started)
+            base_res = await provider.query_metric(metric, window, event=event, end=anchor)
             baseline = base_res.get("total") if base_res.get("status") == "ok" else None
         readings = self.store.readings_for(job_id, window_start=started)
         verdict, inputs = outcome.compute_verdict(
@@ -1128,9 +1163,29 @@ class Worker:
                      f"'{verdict}'; the Iterate gate is waiting.")
         log.info("watch %s parked at the Iterate gate (verdict %s)", job_id, verdict)
 
-    async def _answer_watch(self, job: dict, action: str, text: str, via: str) -> str:
-        """The Iterate gate's verbs. Every mutation is CAS-guarded and lands in
-        guidance_log (auditable); ClickUp strictly after the CAS, best-effort."""
+    async def _answer_watch(self, job: dict, action: str, text: str, via: str,
+                            actor: dict | None = None, override: bool = False) -> str:
+        """The Iterate gate's verbs. Founder-owned and role-enforced exactly
+        like feature gates (ENGINE.md §2b — gate_owner handles kind='watch');
+        inert without explicit DRIs on the row. Every mutation is CAS-guarded
+        and lands in guidance_log (auditable); ClickUp strictly after the CAS,
+        best-effort."""
+        owner, admin_override = self._owner_guard(job, actor, override)
+        result = await self._answer_watch_inner(job, action, text, via)
+        if admin_override:
+            # recorded only AFTER the transition succeeded (a lost CAS raises
+            # GateConflict and must leave NO override row); uuid ref so the
+            # dedupe key can never eat an audit record — same discipline as
+            # the feature-gate override
+            self.store.gate_event_add(
+                job["issue_id"], "admin_override", ref=uuid.uuid4().hex,
+                stage=None, actor=via,
+                detail=f"{action} on the {owner.role}-owned Iterate gate "
+                       f"owned by {owner.display}")
+            log.info("admin override: %s %s by %s", job["issue_id"], action, via)
+        return result
+
+    async def _answer_watch_inner(self, job: dict, action: str, text: str, via: str) -> str:
         job_id = job["issue_id"]
         task_id = job.get("clickup_task_id") or ""
         now = time.time()
@@ -1548,7 +1603,10 @@ class Worker:
             if not success_metric:
                 cu_metric = fields.get("success metric")
                 if isinstance(cu_metric, str) and cu_metric.strip():
-                    success_metric = cu_metric.strip()[:300]
+                    # unlike the METRIC_LINE_RE path (single-line by
+                    # construction), a custom-field value can span lines —
+                    # collapse it, same bound as everywhere else
+                    success_metric = _single_line(cu_metric)
             for rx in (METRIC_LINE_RE, TARGET_LINE_RE, WINDOW_LINE_RE):
                 request = rx.sub("", request)
             request = request.strip() or title
@@ -1674,6 +1732,13 @@ class Worker:
     SHEPHERD_VERDICT_RE = re.compile(
         r"^FINDING\s+(\d+):\s*(FIXED|REBUT)\s*[—:-]*\s*(.*)$", re.MULTILINE)
     SHEPHERD_STATES = ("ready", "in_review", "changes_requested")
+    # States the review loop never drives, but whose merge/close MUST still be
+    # detected (Epic B4): the mainline flow parks a PR at 'approved' ("ready
+    # to merge") before the human merges it on GitHub — without re-polling,
+    # prs.state never becomes 'merged', the outcome watch never spawns, and
+    # the P9-approval fallback reads the same stale state. 'stalled' (round
+    # cap) and 'draft' (pr_auto_ready off) PRs get merged by humans too.
+    MERGE_SCAN_STATES = ("approved", "stalled", "draft")
 
     async def shepherd_forever(self):
         """Drive every tracked PR through Sentry review autonomously: verify
@@ -1690,7 +1755,7 @@ class Worker:
     async def _shepherd_pass(self):
         if not (self.settings.shepherd_enabled and self.engine.github.enabled):
             return
-        for pr in self.store.prs_in_state(self.SHEPHERD_STATES):
+        for pr in self.store.prs_in_state(self.SHEPHERD_STATES + self.MERGE_SCAN_STATES):
             try:
                 await self._shepherd_pr(pr)
             except Exception:
@@ -1720,6 +1785,12 @@ class Worker:
             return
         if info.get("state") == "closed":
             self.store.pr_set(url, state="closed", detail="closed without merge")
+            return
+        if (pr.get("state") or "") in self.MERGE_SCAN_STATES:
+            # merge/close detection ONLY for approved/stalled/draft rows: the
+            # review loop stays terminal for 'approved' (post-approval pushes
+            # re-kick via record_prs), handed off for 'stalled', and off by
+            # operator choice for 'draft' — never resume driving from here
             return
         if info.get("draft"):
             # the kickoff's un-draft failed earlier — retry before anything else
@@ -1927,8 +1998,14 @@ class Worker:
                 await self.workspaces.notify_gate(
                     job, f"⏰ {title} — P{stage} gate over SLA ({h}h > {sla}h), "
                          f"waiting on {owner.display}.")
-        # step 2 (≥ 1.5×SLA): notify the OTHER DRI — visibility, not authority
+        # step 2 (≥ 1.5×SLA): notify the OTHER DRI — visibility, not authority.
+        # When the owning role's DRI slot is empty, gate_owner already fell
+        # back to the other role's DRI as the EFFECTIVE owner — the "other"
+        # person IS the owner (step 1 nudged them), and telling them they
+        # "can't answer" their own gate would be false. Suppress the step.
         other = roles.other_dri(job, owner.role)
+        if other == owner.value:
+            other = ""
         if other and waited >= 1.5 * sla * 3600:
             if self.store.gate_event_add(job_id, "sla_second_dri",
                                          ref=f"run{run['id']}-step2", stage=stage,

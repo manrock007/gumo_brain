@@ -80,6 +80,24 @@ class TestSlaLadder:
         asyncio.run(worker._sla_once())
         assert _kinds(worker, "feat-sla1") == ["sla_nudge"]
 
+    def test_step2_suppressed_when_fallback_owner_is_the_other_dri(self, worker):
+        """Founder-role gate with an EMPTY founder slot: gate_owner falls back
+        to the dev DRI as the effective owner — step 2 must not tell that same
+        person they 'can't answer' their own gate (they can, and step 1
+        already nudged them)."""
+        worker.clickup = FakeCU()
+        _gate(worker, stage=0, hours_ago=37, dev_dri="222")  # founder gate, dev owns
+        asyncio.run(worker._sla_once())
+        assert _kinds(worker, "feat-sla1") == ["sla_nudge"]  # no sla_second_dri
+        assert not any("can't answer" in t for _, t in worker.clickup.posted)
+
+    def test_step2_suppressed_when_both_dris_are_the_same_person(self, worker):
+        worker.clickup = FakeCU()
+        _gate(worker, hours_ago=37, founder_dri="222", dev_dri="222")
+        asyncio.run(worker._sla_once())
+        assert _kinds(worker, "feat-sla1") == ["sla_nudge"]
+        assert not any("can't answer" in t for _, t in worker.clickup.posted)
+
     def test_step3_records_the_standup_flag(self, worker):
         worker.clickup = FakeCU()
         rid = _gate(worker, hours_ago=49, founder_dri="111", dev_dri="222")

@@ -217,7 +217,11 @@ detail on the watch job.
 terminal at `pr_opened`, the shepherd spawns `watch-<feature id>` — a single-
 transaction insert born `kind='watch'`, `status='watching'` (invisible to the
 queue/reaper/requeue by construction), copying the metric fields, workspace,
-ticket, and the founder DRI as owner. A PR merged mid-pipeline spawns nothing;
+ticket, and BOTH DRIs (the founder DRI as owner). Merge detection covers the
+mainline flow: the shepherd's scan includes `approved`, `stalled` and `draft`
+PRs for merge/close detection ONLY (the review loop is never resumed for
+them) — an approved PR the human merges on GitHub still flips to `merged`
+and spawns the watch. A PR merged mid-pipeline spawns nothing;
 the P9-approval path re-checks and spawns then. A feature with no metric and
 no event gets ONE "watch skipped" ticket note (deduped per feature via
 `gate_events`). Spawn does not flip the ticket status (the Stage field just
@@ -229,14 +233,23 @@ The watch loop (every `WATCH_INTERVAL_SECONDS`) reads the metric ~daily
 `watch_started_at` so a `/redo` never mixes windows. At `watch_deadline`
 (persisted at spawn — restarts never re-derive it) the finisher takes a final
 read, queries a same-length pre-ship baseline (persisted on first finish —
-a redo re-finish reuses the ORIGINAL baseline), computes the verdict via the
+a redo re-finish reuses the ORIGINAL baseline; when none is persisted, e.g.
+the first finish's query errored, the re-query ends at the ORIGINAL
+merge-time spawn — the watch row's `created_at` — never at the current
+window's `/redo`-refreshed start, which would be post-ship data), computes
+the verdict via the
 transparent formula in `app/outcome.py` (direction-aware: decrease-goal
 targets like "under 300ms" judge inverted; ambiguous directions never assert
 a regression; no data → `unmeasured`, fail closed), UPSERTs the `outcomes`
 ledger row (verdict fields only — it can never clobber a recorded learning),
 and parks a founder-owned **Iterate gate**: single CAS
 `watching → awaiting_input` first, ClickUp comment/status/assignee strictly
-after (best-effort). Verbs on the gate:
+after (best-effort). The Iterate gate is **role-enforced exactly like feature
+gates** (§2): the founder DRI owns it (the dev DRI is the fallback owner when
+the founder slot is empty — both DRIs are copied onto the watch row at
+spawn), a non-owner's verb is refused on both channels, the only bypass is
+the audited dashboard admin override, and a watch without explicit DRIs is
+inert (solo mode, exactly as for features). Verbs on the gate:
 
 - `/proceed <learning>` → learning + decider recorded on the ledger row,
   watch closes `done`; with `OUTCOME_MEMORY_PRS=true` a background MECHANICAL
@@ -378,6 +391,13 @@ guidance > older guidance; superseded guidance is marked.
     escalation steps (ref = `run<stage_runs.id>-step<k>`). Deliberately NOT
     `guidance_log` — refusals and escalations must never render into stage
     prompts as "human decisions".
+  - `admin_events(kind, target, detail, actor, at)` — append-only audit of
+    admin/config mutations that grant or move authority: user↔ClickUp
+    identity links (`clickup_link` — the mapping decides whose ClickUp
+    comments answer role-owned gates) and workspace security config
+    (`workspace_config`/`workspace_create` — `stage_role_map`,
+    `require_attributed_answers`, …; secret values redacted before write).
+    The minimal substrate until Epic E4's full audit_log folds/exports it.
   - `artifact_state(job_id, artifact, subtask_id, synced_hash, flags)`
   - `stage_state(job_id, stage, base_sha, attempts)`
   - `stage_runs(job_id, stage, attempt, queued_at, started_at, ended_at,
@@ -527,7 +547,10 @@ note. Memory-bootstrap PRs are tracked but never kicked off (doc drafts).
 
 **The shepherd** (`shepherd_forever`, every `shepherd_interval_seconds`)
 autonomously drives each tracked `ready`/`in_review`/`changes_requested` PR:
-merged/closed detection first; a 🎉 on the engine's latest `@sentry review`
+merged/closed detection first — and for `approved`/`stalled`/`draft` rows it
+runs merge/close detection ONLY (never resuming the review loop), so a
+human-merged approved PR still reaches `merged` and fires the outcome watch
+(§2b); a 🎉 on the engine's latest `@sentry review`
 trigger = clean pass → `approved` + a ClickUp note on the owning job. Open
 findings (`BUG_PREDICTION` comments the bot has not edited to `*Resolved in*`)
 that lack an engine reply get one verify-first headless fix run on the PR

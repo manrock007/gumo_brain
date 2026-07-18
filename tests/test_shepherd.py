@@ -381,6 +381,73 @@ class TestShepherdPass:
         assert "error" in row["detail"]
 
 
+class TestMergeScanStates:
+    """Epic B4 mainline: the shepherd's scan includes approved/stalled/draft
+    rows for merge/close detection ONLY — the normal lifecycle parks a PR at
+    'approved' ("ready to merge") before the human merges it on GitHub, and
+    without re-polling those rows prs.state never becomes 'merged' and the
+    outcome watch never spawns. The review loop is never resumed for them."""
+
+    MERGED = {"state": "closed", "merged": True}
+
+    def _terminal_feature(self, store, url="https://github.com/acme/demo/pull/5",
+                          state="approved"):
+        store.feature_intake("feat-s1", title="F", project="web", stage=9,
+                             success_metric="signups")
+        store.set_status("feat-s1", "pr_opened")
+        store.pr_add("feat-s1", url)
+        store.pr_set(url, state=state, review_rounds=1)
+        return url
+
+    def test_approved_pr_merge_detected_via_pass_and_watch_spawns(self, store, tmp_path):
+        w = _worker(store, tmp_path)
+        url = self._terminal_feature(store, state="approved")
+        w.engine.github = GH(pr=self.MERGED)
+        asyncio.run(w._shepherd_pass())  # the PASS must scan approved rows
+        assert store.pr_get(url)["state"] == "merged"
+        row = store.get("watch-feat-s1")
+        assert row is not None and row["status"] == "watching"
+
+    @pytest.mark.parametrize("state", ["stalled", "draft"])
+    def test_stalled_and_draft_pr_merges_detected(self, store, tmp_path, state):
+        w = _worker(store, tmp_path)
+        url = self._terminal_feature(store, state=state)
+        w.engine.github = GH(pr=self.MERGED)
+        asyncio.run(w._shepherd_pass())
+        assert store.pr_get(url)["state"] == "merged"
+        assert store.get("watch-feat-s1") is not None
+
+    def test_open_approved_pr_is_never_redriven(self, store, tmp_path, monkeypatch):
+        """An approved-but-open PR with lingering findings: merge scan only —
+        no re-trigger, no fix run, state stays approved (post-approval pushes
+        re-kick via engine.record_prs, not here)."""
+        w = _worker(store, tmp_path)
+        url = self._terminal_feature(store, state="approved")
+        gh = GH(pr=OPEN_PR, comments=[],
+                reviews=[{"id": 42, "body": FINDING_BODY}])
+        w.engine.github = gh
+
+        async def boom(*a, **k):
+            raise AssertionError("merge-scan states must never reach the fix loop")
+
+        monkeypatch.setattr(w, "_shepherd_fix", boom)
+        asyncio.run(w._shepherd_pass())
+        assert gh.posted == [] and gh.replies == []
+        assert store.pr_get(url)["state"] == "approved"
+
+    def test_open_draft_pr_is_not_marked_ready(self, store, tmp_path):
+        """pr_auto_ready=false keeps PRs 'draft' by operator choice — the
+        merge scan must not un-draft or trigger reviews on them."""
+        w = _worker(store, tmp_path)
+        url = self._terminal_feature(store, state="draft")
+        gh = GH(pr={"state": "open", "draft": True, "merged": False,
+                    "head": {"ref": "brain/feat-s1"}})
+        w.engine.github = gh
+        asyncio.run(w._shepherd_pass())
+        assert gh.posted == []
+        assert store.pr_get(url)["state"] == "draft"
+
+
 class TestWatchSpawn:
     """Epic B4: a merged PR on a TERMINAL (pr_opened) feature with a metric
     spawns the outcome watch — idempotently, guarded, never mid-pipeline."""
@@ -420,6 +487,8 @@ class TestWatchSpawn:
         assert row["related_jobs"] == "feat-s1"
         assert row["workspace_id"] == 7
         assert row["owner"] == "111"  # founder-owned Iterate gate
+        # both DRIs ride along so roles.gate_owner enforces the gate
+        assert row["founder_dri"] == "111" and row["dev_dri"] == "222"
         assert row["clickup_task_id"] == "cu1"
         assert abs((row["watch_deadline"] - row["watch_started_at"]) - 7 * 86400) < 5
 

@@ -8,7 +8,7 @@ import time
 import pytest
 
 from app.outcome import build_gate_packet, compute_verdict, parse_direction
-from app.worker import GateConflict
+from app.worker import GateConflict, GateForbidden
 
 
 class ScriptedProvider:
@@ -265,6 +265,45 @@ class TestWatchPass:
         assert worker.store.outcome_for("watch-feat-t7")["baseline"] == 80.0
         assert len([c for c in provider.calls if c["end"] is not None]) == baseline_calls
 
+    def test_refinish_after_failed_baseline_queries_preship_anchor(self, worker, monkeypatch):
+        """ENGINE.md §2b: when the first finish stored NO baseline (its query
+        errored), the /redo re-finish must query a window ending at the
+        ORIGINAL merge-time spawn (the row's created_at) — never at the
+        refreshed watch_started_at, which would be entirely post-ship data."""
+
+        class P:
+            def __init__(self):
+                self.baseline_ends = []
+                self.fail_baseline = True
+
+            async def query_metric(self, metric, window_days, *, event="", end=None):
+                if end is not None:
+                    self.baseline_ends.append(end)
+                    if self.fail_baseline:
+                        return {"status": "error", "series": [], "total": None,
+                                "detail": "mixpanel HTTP 401"}
+                    return {"status": "ok", "series": [], "total": 80.0,
+                            "detail": "baseline"}
+                return {"status": "ok", "series": [], "total": 120.0, "detail": ""}
+
+        provider = P()
+        monkeypatch.setattr(worker, "_analytics_provider_for", lambda job: provider)
+        _watch(worker, "watch-feat-b1", deadline_offset=-60,
+               started_offset=-7 * 86400)
+        asyncio.run(worker._watch_pass())
+        assert worker.store.get("watch-feat-b1")["status"] == "awaiting_input"
+        assert worker.store.outcome_for("watch-feat-b1")["baseline"] is None
+        # analytics credentials fixed; the founder re-arms the watch
+        provider.fail_baseline = False
+        asyncio.run(worker.answer_job("watch-feat-b1", "redo", "3", via="dashboard:m"))
+        worker.store.set_fields("watch-feat-b1", watch_deadline=time.time() - 30)
+        asyncio.run(worker._watch_pass())
+        row = worker.store.get("watch-feat-b1")
+        assert len(provider.baseline_ends) == 2
+        assert provider.baseline_ends[1] == pytest.approx(row["created_at"], abs=5)
+        assert provider.baseline_ends[1] < row["watch_started_at"]  # pre-ship, not post-redo
+        assert worker.store.outcome_for("watch-feat-b1")["baseline"] == 80.0
+
     def test_watch_disabled_is_a_noop(self, worker, monkeypatch):
         worker.settings.watch_enabled = False
         called = []
@@ -395,8 +434,95 @@ class TestAnswerWatch:
         asyncio.run(go())
         assert ran == [job_id]
 
+    def test_finish_assignment_and_verbs_stay_inert_without_dris(self, worker):
+        """Solo mode (legacy owner only, no DRI columns): anyone answers —
+        exactly the pre-Epic-A posture; covered here so the ownership tests
+        below can't silently regress it."""
+        worker.settings.outcome_memory_prs = False
+        job_id = self._parked(worker, job_id="watch-feat-a2")
+        status = asyncio.run(worker.answer_job(
+            job_id, "proceed", "x", via="dashboard:anyone",
+            actor={"username": "anyone", "clickup_user_id": "", "role": "member"}))
+        assert status == "done"
+
     def test_redo_still_refused_for_v1_kinds(self, worker):
         worker.intake_task("task-wr", title="T", project="web", request="r")
         worker.store.set_status("task-wr", "awaiting_input")
         with pytest.raises(ValueError):
             asyncio.run(worker.answer_job("task-wr", "redo", "", via="dashboard"))
+
+
+class TestWatchOwnership:
+    """ENGINE.md §2b: the Iterate gate is founder-owned and role-enforced
+    exactly like feature gates — refusal for non-owners on both channels,
+    audited admin override only, inert without explicit DRIs."""
+
+    def _owned(self, worker, job_id="watch-feat-own1", founder="111", dev="222"):
+        _watch(worker, job_id, deadline_offset=-60)
+        worker.store.set_fields(job_id, founder_dri=founder, dev_dri=dev)
+        worker.store.outcome_add(job_id, job_id.removeprefix("watch-"), None,
+                                 metric="m", verdict="flat", observed=5.0)
+        worker.store.set_status(job_id, "awaiting_input")
+        return job_id
+
+    def test_non_owner_is_refused(self, worker):
+        job_id = self._owned(worker)
+        dev = {"username": "devi", "clickup_user_id": "222", "role": "member"}
+        with pytest.raises(GateForbidden) as e:
+            asyncio.run(worker.answer_job(job_id, "proceed", "self-serving learning",
+                                          via="dashboard:devi", actor=dev))
+        assert "founder gate" in str(e.value)
+        row = worker.store.get(job_id)
+        assert row["status"] == "awaiting_input"  # nothing moved
+        assert worker.store.outcome_for(job_id)["learning"] == ""
+
+    def test_owner_answers(self, worker):
+        worker.settings.outcome_memory_prs = False
+        job_id = self._owned(worker)
+        founder = {"username": "founda", "clickup_user_id": "111", "role": "member"}
+        status = asyncio.run(worker.answer_job(job_id, "proceed", "learned",
+                                               via="dashboard:founda", actor=founder))
+        assert status == "done"
+        assert worker.store.outcome_for(job_id)["learning"] == "learned"
+
+    def test_admin_override_is_audited(self, worker):
+        worker.settings.outcome_memory_prs = False
+        job_id = self._owned(worker, job_id="watch-feat-own2")
+        boss = {"username": "boss", "clickup_user_id": "", "role": "admin"}
+        with pytest.raises(GateForbidden):  # no override flag -> refused too
+            asyncio.run(worker.answer_job(job_id, "proceed", "", via="dashboard:boss",
+                                          actor=boss))
+        status = asyncio.run(worker.answer_job(job_id, "proceed", "",
+                                               via="dashboard:boss", actor=boss,
+                                               override=True))
+        assert status == "done"
+        events = worker.store.gate_events_for(job_id)
+        assert [e["kind"] for e in events] == ["admin_override"]
+        assert events[0]["actor"] == "dashboard:boss"
+        assert "Iterate" in events[0]["detail"]
+
+    def test_dev_fallback_owns_when_founder_slot_empty(self, worker):
+        job_id = self._owned(worker, job_id="watch-feat-own3", founder="", dev="222")
+        outsider = {"username": "outsider", "clickup_user_id": "999", "role": "member"}
+        with pytest.raises(GateForbidden):
+            asyncio.run(worker.answer_job(job_id, "redo", "3",
+                                          via="dashboard:outsider", actor=outsider))
+        dev = {"username": "devi", "clickup_user_id": "222", "role": "member"}
+        status = asyncio.run(worker.answer_job(job_id, "redo", "3",
+                                               via="dashboard:devi", actor=dev))
+        assert status == "watching"
+
+    def test_lost_cas_leaves_no_override_audit_row(self, worker):
+        """The override event is recorded only AFTER a won CAS — a conflict
+        must leave zero audit rows (same discipline as feature gates)."""
+        worker.settings.outcome_memory_prs = False
+        job_id = self._owned(worker, job_id="watch-feat-own4")
+        founder = {"username": "founda", "clickup_user_id": "111", "role": "member"}
+        asyncio.run(worker.answer_job(job_id, "proceed", "first",
+                                      via="dashboard:founda", actor=founder))
+        boss = {"username": "boss", "clickup_user_id": "", "role": "admin"}
+        with pytest.raises(GateConflict):
+            asyncio.run(worker.answer_job(job_id, "proceed", "late",
+                                          via="dashboard:boss", actor=boss,
+                                          override=True))
+        assert worker.store.gate_events_for(job_id) == []

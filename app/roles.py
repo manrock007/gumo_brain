@@ -60,13 +60,20 @@ def role_for_stage(settings: Settings, ws: dict | None, stage: int) -> str:
 
 def gate_owner(store, settings: Settings, ws: dict | None, job: dict) -> GateOwner | None:
     """Resolve who owns the job's CURRENT gate. None = no DRI of any kind is
-    recorded (solo mode — enforcement N/A) or not a feature job. The role's
-    own DRI slot wins; the other DRI is the fallback, then the legacy `owner`
-    column (which resolves display/assignment only — enforce=False)."""
-    if (job.get("kind") or "") != "feature":
+    recorded (solo mode — enforcement N/A) or a kind without owned gates.
+    The role's own DRI slot wins; the other DRI is the fallback, then the
+    legacy `owner` column (which resolves display/assignment only —
+    enforce=False). Watch jobs (Epic B4): the Iterate gate is founder-owned
+    (ENGINE.md §2b) — same enforcement posture as feature gates, keyed on the
+    DRI columns copied from the feature at spawn."""
+    kind = job.get("kind") or ""
+    if kind == "watch":
+        role = "founder"
+    elif kind == "feature":
+        stage = int(job.get("stage") or 0)
+        role = role_for_stage(settings, ws, stage)
+    else:
         return None
-    stage = int(job.get("stage") or 0)
-    role = role_for_stage(settings, ws, stage)
     founder = (job.get("founder_dri") or "").strip()
     dev = (job.get("dev_dri") or "").strip()
     legacy = (job.get("owner") or "").strip()
