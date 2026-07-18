@@ -9,9 +9,23 @@ import re
 from pathlib import Path
 
 from .config import ENGINE_DIR, LEGACY_ENGINE_DIRS, RepoTarget, Settings
+from .runner import resolve_runner
 from .secrets import build_subprocess_env
 
 log = logging.getLogger("brain.fixer")
+
+# Epic F3: the run sandbox. Resolved once per (backend) — LocalRunner by default
+# (byte-for-byte today's exec); ContainerRunner when runner_backend=container.
+_RUNNER_CACHE: dict = {}
+
+
+def _runner(settings: Settings):
+    key = getattr(settings, "runner_backend", "local") or "local"
+    cached = _RUNNER_CACHE.get(key)
+    if cached is None:
+        cached = resolve_runner(settings)
+        _RUNNER_CACHE[key] = cached
+    return cached
 
 
 def engine_dir(workspace: str) -> str:
@@ -330,13 +344,7 @@ async def run_claude_raw(settings: Settings, workspace: str, prompt: str,
                                disallowed_tools, session_id, fork_session, config_dir,
                                git_token=git_token)
 
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        cwd=workspace,
-        env=env,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+    proc = await _runner(settings).spawn(cmd, cwd=workspace, env=env)
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
@@ -424,14 +432,8 @@ async def run_claude_stream(settings: Settings, workspace: str, prompt: str,
                                config_dir, output_format="stream-json",
                                git_token=git_token)
 
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        cwd=workspace,
-        env=env,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        limit=2 ** 20,  # stream-json lines can carry whole documents; 64KB default is too small
-    )
+    # stream-json lines can carry whole documents; 64KB default is too small
+    proc = await _runner(settings).spawn(cmd, cwd=workspace, env=env, limit=2 ** 20)
 
     result_env: dict | None = None
     saw_event = False

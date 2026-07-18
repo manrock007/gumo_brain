@@ -520,6 +520,18 @@ class Settings(BaseSettings):
     worker_id: str = ""
     job_poll_interval_seconds: int = 2
 
+    # Epic F3: sandboxed container runner (FLAG, off). runner_backend='local'
+    # (default) runs Claude as today's direct subprocess — byte-for-byte. Set
+    # 'container' to sandbox each run in a disposable `docker run --rm` with the
+    # clone bind-mounted, only the G2 allow-listed env (via a 0600 --env-file),
+    # and an operator-provided egress-allowlist network. An empty network fails
+    # closed. The image must carry claude + git + gh. See OPERATIONS.md §20.3.
+    runner_backend: str = "local"
+    runner_container_cmd: str = "docker"
+    runner_container_image: str = ""
+    runner_container_network: str = ""
+    runner_container_extra_args: str = ""
+
     @property
     def multi_worker(self) -> bool:
         """The DB-claim loop + advisory locks engage only on Postgres. SQLite
