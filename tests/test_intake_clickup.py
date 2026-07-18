@@ -285,3 +285,60 @@ class TestSentryIntakeUnconfigured:
         assert "not configured" in pinned["detail"]
         asyncio.run(worker._poll_intake())  # second scan: silent
         assert len(worker.clickup.comments_posted) == 1
+
+
+class TestMetricGoalAdoption:
+    """Epic B1: 'metric:'/'target:'/'window:' lines in a [feature] description
+    are captured onto the job row AND stripped from the request; the ticket's
+    `Success metric` custom field is the fallback."""
+
+    def _adopt(self, worker, body, fields=None):
+        fake = FakeClickUp(tasks=[_cu_task("tb1", "[feature] measured feature")],
+                           bodies={"tb1": body})
+        if fields is not None:
+            fake.fields = {"tb1": fields}
+        worker.clickup = fake
+        asyncio.run(worker._poll_intake())
+        return worker.store.get("feat-tb1")
+
+    def test_metric_lines_captured_and_stripped(self, worker):
+        job = self._adopt(worker, "project: web\n"
+                                  "metric: weekly signups\n"
+                                  "target: >= 100\n"
+                                  "window: 21\n\n"
+                                  "Agents need CSV export.")
+        assert job["success_metric"] == "weekly signups"
+        assert job["metric_target"] == ">= 100"
+        assert job["metric_window_days"] == 21
+        req = (job["request"] or "").lower()
+        assert "csv export" in req
+        assert "metric:" not in req and "target:" not in req and "window:" not in req
+
+    def test_bold_labels_parse(self, worker):
+        job = self._adopt(worker, "**project:** web\n"
+                                  "**metric:** activation rate\n"
+                                  "**target:** under 2%\n"
+                                  "**window:** 7\nbody")
+        assert job["success_metric"] == "activation rate"
+        assert job["metric_target"] == "under 2%"
+        assert job["metric_window_days"] == 7
+
+    def test_out_of_range_window_line_is_ignored(self, worker):
+        job = self._adopt(worker, "project: web\nwindow: 999\nbody")
+        assert job["metric_window_days"] is None
+
+    def test_success_metric_field_fallback(self, worker):
+        job = self._adopt(worker, "project: web\nbody",
+                          fields={"success metric": "ops MTTR on imports"})
+        assert job["success_metric"] == "ops MTTR on imports"
+
+    def test_metric_line_wins_over_the_field(self, worker):
+        job = self._adopt(worker, "project: web\nmetric: signups\nbody",
+                          fields={"success metric": "something else"})
+        assert job["success_metric"] == "signups"
+
+    def test_absent_lines_leave_fields_empty(self, worker):
+        job = self._adopt(worker, "project: web\njust a description")
+        assert job["success_metric"] == ""
+        assert job["metric_target"] == ""
+        assert job["metric_window_days"] is None

@@ -20,7 +20,7 @@ import time
 import uuid
 from pathlib import Path
 
-from . import roles
+from . import analytics, outcome, roles
 from .clickup import ClickUp
 from .config import ENGINE_NAME, Settings
 from .db import JobStore
@@ -30,6 +30,7 @@ from .fixer import (
     TRANSIENT_ERROR_RE,
     BranchLostError,
     engine_dir,
+    git,
     prepare_feature_workspace,
     prepare_workspace,
     run_claude,
@@ -49,7 +50,10 @@ from . import transcripts
 log = logging.getLogger("brain.worker")
 
 ACTIVE_STATUSES = ("received", "queued", "running")
-TERMINAL_STATUSES = ("pr_opened", "no_fix", "skipped", "error", "timeout")
+TERMINAL_STATUSES = ("pr_opened", "no_fix", "skipped", "error", "timeout", "done")
+
+# a watch job reads its metric at most ~daily; 22h tolerates loop jitter
+WATCH_READ_THROTTLE_SECONDS = 79200
 
 # priority classes: live sentry >= answered feature stages / tasks > sweep
 PRIO_SENTRY = 0
@@ -65,6 +69,19 @@ INTAKE_RE = re.compile(r"^\s*\[\s*(fix|task|bug|feature|sentry|memory)(?:\s+([A-
                        re.IGNORECASE)
 PROJECT_LINE_RE = re.compile(r"^\s*\**project\**\s*[:=]\s*\**\s*([A-Za-z0-9_-]+)\**\s*$",
                              re.IGNORECASE | re.MULTILINE)
+# Epic B1: metric goal lines in a [feature] ticket description, the same
+# bold-tolerant shape as the project line; matched lines strip from `request`
+METRIC_LINE_RE = re.compile(r"^\s*\**metric\**\s*[:=]\s*(.+)$",
+                            re.IGNORECASE | re.MULTILINE)
+TARGET_LINE_RE = re.compile(r"^\s*\**target\**\s*[:=]\s*(.+)$",
+                            re.IGNORECASE | re.MULTILINE)
+WINDOW_LINE_RE = re.compile(r"^\s*\**window\**\s*[:=]\s*\**\s*(\d{1,3})\**\s*$",
+                            re.IGNORECASE | re.MULTILINE)
+
+
+def _clean_metric_value(raw: str) -> str:
+    """Strip ClickUp's bold markers and whitespace off a captured line value."""
+    return (raw or "").strip().strip("*").strip()
 
 
 class GateConflict(Exception):
@@ -102,6 +119,9 @@ class Worker:
         self.locks = RepoLocks()
         self.engine = Engine(settings, store, self.clickup, locks=self.locks)
         self.workspaces = None  # WorkspaceService, injected at startup (main.lifespan)
+        # strong refs for fire-and-forget background tasks (outcome memory PRs) —
+        # bare create_task results can be GC'd mid-flight (same as main._chat_tasks)
+        self._bg_tasks: set = set()
 
     def _enqueue(self, job_id: str, priority: int):
         self.queue.put_nowait((priority, next(self._seq), job_id, time.time()))
@@ -184,7 +204,9 @@ class Worker:
                        clickup_task_url: str | None = None,
                        cu_list_id: str = "", owner: str = "",
                        founder_dri: str = "", dev_dri: str = "",
-                       related_jobs: str = "", gate_mode: str = "") -> str:
+                       related_jobs: str = "", gate_mode: str = "",
+                       success_metric: str = "", metric_target: str = "",
+                       metric_window_days: int | None = None) -> str:
         """Enqueue a feature pipeline at P0. Dual DRIs (Epic A2): the legacy
         `owner` column becomes a computed alias at write time. A re-intake
         resets ALL of them from the fresh submission (consistent with the
@@ -205,6 +227,8 @@ class Worker:
             # terminal skipped/no_fix -> fresh restart of the pipeline (atomic below)
 
         mode = gate_mode if gate_mode in ("full", "light") else self.settings.default_gate_mode
+        if metric_window_days is not None and not 1 <= int(metric_window_days) <= 365:
+            metric_window_days = None  # fail closed: never store a nonsense window
         founder_dri = (founder_dri or "").strip()
         dev_dri = (dev_dri or "").strip()
         owner = (owner or "").strip() or dev_dri or founder_dri  # legacy computed alias
@@ -233,6 +257,15 @@ class Worker:
             founder_dri=founder_dri,
             dev_dri=dev_dri,
             related_jobs=related_jobs,
+            # Epic B1: metric goal from the fresh submission (a re-intake
+            # overwrites, consistent with the atomic pipeline reset) — and the
+            # previous lap's engine-owned metric/watch state clears with it
+            success_metric=(success_metric or "").strip(),
+            metric_target=(metric_target or "").strip(),
+            metric_window_days=metric_window_days,
+            metric_event="",
+            watch_started_at=None,
+            watch_deadline=None,
         )
         self._stamp_workspace(job_id, project)
         self._enqueue(job_id, PRIO_HUMAN)
@@ -299,6 +332,16 @@ class Worker:
         """Every workspace toucher runs under its repo's lock (chat runs and the
         canonical product-scope reads take the same locks — see Engine.RepoLocks)."""
         kind = job.get("kind") or "sentry"
+        if kind == "watch":
+            # fail closed, forever: a watch job must NEVER reach a Claude run —
+            # the watch loop owns its whole lifecycle. Any path that queues one
+            # (stale wakeup, future bug) lands here and is handed back.
+            log.warning("watch job %s reached the run queue — returning it to the "
+                        "watch loop, no Claude run", job["issue_id"])
+            self.store.set_status(job["issue_id"], "watching",
+                                  detail="watch jobs never run Claude — returned to "
+                                         "the watch loop")
+            return
         if kind == "sentry":
             # a fresh sentry job's project isn't known until the issue is fetched;
             # _process_sentry acquires the repo lock itself once it is
@@ -654,6 +697,9 @@ class Worker:
         if kind == "feature":
             return await self._answer_feature(job, action, text, via,
                                               actor=actor, override=override)
+        if kind == "watch":
+            # BEFORE the v1 redo-refusal: the Iterate gate supports /redo <days>
+            return await self._answer_watch(job, action, text, via)
         if action == "redo":
             raise ValueError(f"redo is only valid for feature pipelines, not kind '{kind}'")
         return await self._answer_v1(job, action, text, via)
@@ -824,6 +870,14 @@ class Worker:
             # conveyor mirror: the shipped feature sits in Dogfood until its PR
             # merges (the shepherd then slides it to Complete)
             await self.engine.sync_stage_field(job, "shipped")
+            # outcome loop (Epic B4), early-merge case: a human merged the PR
+            # before P9 approval — the shepherd's merged branch fired while the
+            # pipeline was live and the spawn guard refused. Now the feature is
+            # terminal: spawn if a tracked PR is already merged.
+            if final == "pr_opened" and any(
+                    (p.get("state") or "") == "merged"
+                    for p in self.store.prs_for(job_id)):
+                await self._maybe_spawn_watch(self.store.get(job_id) or job)
             return final
 
         if not self.store.cas_status(job_id, ["awaiting_input"], "queued",
@@ -891,6 +945,322 @@ class Worker:
             f"_Automated fix attempt by {ENGINE_NAME}. Claude posts progress below. "
             "If it asks for input, reply `/proceed <guidance>` or `/skip`._"
         )
+
+    # ---------- the outcome loop (Epic B4/B5) ----------
+
+    WATCH_REDO_RE = re.compile(r"^\s*(\d{1,4})\b\s*")
+
+    def _analytics_provider_for(self, job: dict):
+        """The job's analytics driver. Guards the bare-Worker shape (tests
+        construct Worker without the workspace service) — NullAnalytics-or-
+        instance-env instead of an AttributeError."""
+        if self.workspaces:
+            return self.workspaces.analytics_for(self.workspaces.for_job(job))
+        return analytics.provider_for(self.settings, None)
+
+    async def _maybe_spawn_watch(self, job: dict):
+        """Spawn the post-ship watch for a merged feature. Idempotent by the
+        `watch-<feature id>` row; fires ONLY when the feature pipeline is
+        terminal at 'pr_opened' — a PR merged mid-pipeline must never put a
+        second gate on the same ticket while feature gates are still live
+        (the P9-approval path re-checks and spawns then)."""
+        if not self.settings.watch_enabled:
+            return
+        if (job.get("kind") or "") != "feature":
+            return
+        if (job.get("status") or "") != "pr_opened":
+            return
+        job_id = job["issue_id"]
+        watch_id = f"watch-{job_id}"
+        if self.store.get(watch_id):
+            return  # already spawned (this lap; re-intake resets the row)
+        metric = (job.get("success_metric") or "").strip()
+        event = (job.get("metric_event") or "").strip()
+        task_id = job.get("clickup_task_id") or ""
+        if not metric and not event:
+            # one note per FEATURE, not per merged PR (multi-PR features hit
+            # the shepherd's merged branch once per PR) — gate_events dedupe
+            if self.store.gate_event_add(
+                    job_id, "watch_skipped", ref="no-metric", actor="engine",
+                    detail="no success metric recorded — outcome watch skipped"):
+                await self.clickup.comment(
+                    task_id, f"{GATE_PREFIX} no success metric recorded — outcome "
+                             "watch skipped. Add a metric at intake (or a P9 "
+                             "SUCCESS_METRIC/METRIC_EVENT line) next time.")
+            return
+        days = job.get("metric_window_days") or self.settings.metric_window_days_default
+        days = max(1, min(365, int(days)))
+        now = time.time()
+        self.store.watch_insert(
+            watch_id,
+            title=f"watch: {job.get('title') or job_id}"[:300],
+            project=job.get("project") or "",
+            workspace_id=job.get("workspace_id"),
+            related_jobs=job_id,
+            success_metric=metric,
+            metric_target=(job.get("metric_target") or "").strip(),
+            metric_event=event,
+            metric_window_days=days,
+            watch_started_at=now,
+            watch_deadline=now + days * 86400,
+            # founder-owned Iterate gate (assignment/display; watch gates are
+            # not role-enforced — kind != 'feature')
+            owner=(job.get("founder_dri") or "").strip() or (job.get("owner") or "").strip(),
+            founder_dri=(job.get("founder_dri") or "").strip(),
+            clickup_task_id=task_id,
+            clickup_task_url=job.get("clickup_task_url") or "",
+            cu_list_id=job.get("cu_list_id") or "",
+        )
+        # deliberately NO clickup.set_status here: the shepherd just slid the
+        # Stage field to Complete — the ticket status flips only at park/close
+        await self.clickup.comment(
+            task_id, f"{GATE_PREFIX} 📈 outcome watch started: "
+                     f"'{metric or event}' for {days} day(s). The Iterate gate "
+                     "parks here when the window closes.")
+        log.info("watch %s spawned for %s (%d days)", watch_id, job_id, days)
+
+    async def watch_forever(self):
+        """The post-ship watch loop: pure HTTP metric reads (no repo locks, no
+        Claude tokens), a verdict + founder-owned Iterate gate at deadline."""
+        while True:
+            await asyncio.sleep(self.settings.watch_interval_seconds)
+            try:
+                await self._watch_pass()
+            except Exception:
+                log.exception("watch pass failed")
+
+    async def _watch_pass(self):
+        if not self.settings.watch_enabled:
+            return
+        now = time.time()
+        for job in self.store.by_status(["watching"]):
+            if (job.get("kind") or "") != "watch":
+                continue
+            try:
+                provider = self._analytics_provider_for(job)
+                if now >= float(job.get("watch_deadline") or 0):
+                    await self._finish_watch(job, provider)
+                elif self.store.reading_last_at(job["issue_id"]) < now - WATCH_READ_THROTTLE_SECONDS:
+                    await self._watch_read(job, provider, now)
+            except Exception:
+                log.exception("watch %s pass failed", job["issue_id"])
+
+    async def _watch_read(self, job: dict, provider, now: float):
+        """One daily window-to-date read. Failures leave a visible detail on
+        the job — never a fake reading row."""
+        job_id = job["issue_id"]
+        started = float(job.get("watch_started_at") or now)
+        window = int(job.get("metric_window_days") or self.settings.metric_window_days_default)
+        day = min(window, int((now - started) // 86400) + 1)
+        metric = job.get("success_metric") or ""
+        event = job.get("metric_event") or ""
+        res = await provider.query_metric(metric, day, event=event)
+        if res.get("status") == "ok":
+            self.store.reading_add(job_id, metric, event, observed=res.get("total"),
+                                   window_day=day, detail=(res.get("detail") or "")[:400],
+                                   window_start=started)
+            self.store.set_fields(job_id, detail=f"day {day}/{window}: "
+                                                 f"window-to-date {res.get('total')}")
+        else:
+            self.store.set_fields(
+                job_id, detail=f"metric read {res.get('status')}: "
+                               f"{(res.get('detail') or '')[:300]}")
+
+    async def _finish_watch(self, job: dict, provider):
+        """Window closed: final read, verdict, ledger row, Iterate-gate park.
+        Ordering contract: the outcomes row and the CAS to awaiting_input
+        commit BEFORE any ClickUp call (all of which are best-effort)."""
+        job_id = job["issue_id"]
+        started = float(job.get("watch_started_at") or 0)
+        window = int(job.get("metric_window_days") or self.settings.metric_window_days_default)
+        metric = job.get("success_metric") or ""
+        event = job.get("metric_event") or ""
+        final = await provider.query_metric(metric, window, event=event)
+        if final.get("status") == "ok":
+            self.store.reading_add(job_id, metric, event, observed=final.get("total"),
+                                   window_day=window, detail="final read",
+                                   window_start=started)
+        existing = self.store.outcome_for(job_id)
+        if existing and existing.get("baseline") is not None:
+            # a /redo re-finish keeps the ORIGINAL pre-merge baseline — a
+            # window ending at the refreshed start would include post-ship data
+            baseline = existing["baseline"]
+        else:
+            base_res = await provider.query_metric(metric, window, event=event, end=started)
+            baseline = base_res.get("total") if base_res.get("status") == "ok" else None
+        readings = self.store.readings_for(job_id, window_start=started)
+        verdict, inputs = outcome.compute_verdict(
+            readings, job.get("metric_target") or "", baseline,
+            self.settings.outcome_flat_band_pct)
+        feature_id = (job.get("related_jobs") or "").split(",")[0].strip()
+        self.store.outcome_add(
+            job_id, feature_id, job.get("workspace_id"),
+            metric=metric, metric_event=event,
+            target=(job.get("metric_target") or "").strip(),
+            observed=inputs.get("observed"), baseline=baseline, window_days=window,
+            verdict=verdict, verdict_inputs=json.dumps(inputs))
+        fields = self.store.outcome_for(job_id) or {}
+        packet = outcome.build_gate_packet(job, fields, readings)
+        task_id = job.get("clickup_task_id") or ""
+        comments = await self.clickup.comments(task_id)
+        marker = comments[-1]["id"] if comments else ""
+        if not self.store.cas_status(job_id, ["watching"], "awaiting_input",
+                                     analysis=packet,
+                                     question=extract_questions(packet),
+                                     comment_marker=marker,
+                                     detail=packet[:2000]):
+            return  # a human raced the finish (e.g. /skip) — theirs wins, silently
+        # everything below is best-effort visibility AFTER the committed CAS
+        await self.clickup.comment(
+            task_id,
+            f"{GATE_PREFIX} **Iterate gate: {job.get('title') or job_id} — "
+            f"verdict {verdict}**\n\n{packet[:6000]}\n\n---\n"
+            "Reply `/proceed <learning>` to log the learning and close, "
+            "`/redo <days>` to watch again, or `/skip` to close without a "
+            "learning — here or on the dashboard.")
+        await self.clickup.set_status(task_id, "awaiting_input")
+        owner = (job.get("owner") or "").strip()
+        if owner:
+            await self.clickup.set_assignee(task_id, owner)
+        if self.workspaces:
+            await self.workspaces.notify_gate(
+                job, f"📊 {job.get('title') or job_id} — outcome verdict "
+                     f"'{verdict}'; the Iterate gate is waiting.")
+        log.info("watch %s parked at the Iterate gate (verdict %s)", job_id, verdict)
+
+    async def _answer_watch(self, job: dict, action: str, text: str, via: str) -> str:
+        """The Iterate gate's verbs. Every mutation is CAS-guarded and lands in
+        guidance_log (auditable); ClickUp strictly after the CAS, best-effort."""
+        job_id = job["issue_id"]
+        task_id = job.get("clickup_task_id") or ""
+        now = time.time()
+        text = (text or "").strip()
+
+        if action == "skip":
+            # also valid mid-window: cancelling a watch is a human decision
+            if not self.store.cas_status(job_id, ["awaiting_input", "watching"], "skipped",
+                                         question="",
+                                         detail=f"watch closed by human via {via}"):
+                raise GateConflict("already answered")
+            if self.store.outcome_for(job_id):
+                self.store.outcome_set(job_id, decided_by=via, decided_at=now)
+            self.store.guidance_add(job_id, None, "skip", text, via)
+            await self.clickup.comment(
+                task_id, f"{GATE_PREFIX} Outcome watch closed (via {via}) — the "
+                         "verdict stands; no learning recorded.")
+            await self.clickup.set_status(task_id, "skipped")
+            return "skipped"
+
+        if action == "redo":
+            days = int(job.get("metric_window_days")
+                       or self.settings.metric_window_days_default)
+            m = self.WATCH_REDO_RE.match(text)
+            if m:
+                requested = int(m.group(1))
+                if not 1 <= requested <= 365:
+                    raise ValueError(f"watch window must be 1–365 days, got {requested}")
+                days = requested
+                text = text[m.end():].strip()
+            if not self.store.cas_status(job_id, ["awaiting_input"], "watching",
+                                         question="", metric_window_days=days,
+                                         watch_started_at=now,
+                                         watch_deadline=now + days * 86400,
+                                         detail=f"watch re-armed for {days} day(s) via {via}"):
+                raise GateConflict("already answered")
+            self.store.guidance_add(job_id, None, "redo", text, via)
+            await self.clickup.comment(
+                task_id, f"{GATE_PREFIX} Watching again for {days} day(s) (via {via})."
+                         + (f" Notes: {text[:300]}" if text else ""))
+            return "watching"
+
+        if action != "proceed":
+            raise ValueError(f"unknown action '{action}'")
+        if not self.store.cas_status(job_id, ["awaiting_input"], "done",
+                                     question="", detail="outcome recorded"):
+            raise GateConflict("already answered")
+        self.store.outcome_set(job_id, learning=text, decided_by=via, decided_at=now)
+        self.store.guidance_add(job_id, None, "proceed", text, via)
+        await self.clickup.comment(
+            task_id, f"{GATE_PREFIX} Outcome recorded (via {via})."
+                     + (f" Learning: {text[:400]}" if text else ""))
+        await self.clickup.set_status(task_id, "done")
+        if self.settings.outcome_memory_prs:
+            # background, strong-ref'd: the HTTP answer never blocks on a repo lock
+            t = asyncio.create_task(self._outcome_memory_task(self.store.get(job_id) or job))
+            self._bg_tasks.add(t)
+            t.add_done_callback(self._bg_tasks.discard)
+        return "done"
+
+    async def _outcome_memory_task(self, job: dict):
+        """Mechanical (NO model run) memory propagation: changelog entry (+ ADR
+        when a learning was recorded) on a fresh branch, pushed, opened as a
+        draft PR. Git stays truth — the entry only enters the memory tree via a
+        human-merged PR; the outcomes DB row is the record either way. Never
+        raises: failures land in the job detail + a ClickUp note."""
+        job_id = job["issue_id"]
+        try:
+            feature_id = (job.get("related_jobs") or "").split(",")[0].strip()
+            feature = self.store.get(feature_id) or {}
+            row = self.store.outcome_for(job_id) or {}
+            target = self.settings.repo_for_project(job.get("project") or "")
+            if target is None:
+                self.store.set_fields(job_id, detail="outcome memory PR skipped: "
+                                                     "no repo mapped")
+                return
+            branch = f"{self.settings.branch_prefix}/outcome-{feature_id or job_id}"
+            async with self.locks.for_repo(target.repo):
+                workspace = await prepare_workspace(self.settings, target, branch)
+                # the CLONE resolves the namespace (legacy `.gumo/` repos keep
+                # their tree) — never the literal constant
+                ns = engine_dir(workspace)
+                rel, body = outcome.build_outcome_entry(row, feature, ns=ns)
+                path = Path(workspace) / rel
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(body)
+                if (row.get("learning") or "").strip():
+                    arel, abody = outcome.build_outcome_adr(row, feature, ns=ns)
+                    apath = Path(workspace) / arel
+                    apath.parent.mkdir(parents=True, exist_ok=True)
+                    apath.write_text(abody)
+                await git(workspace, "add", "-A")
+                code, out = await git(workspace, "commit", "-m",
+                                      f"outcome: {row.get('verdict') or 'recorded'} — "
+                                      f"{feature_id or job_id}")
+                if code != 0 and "nothing to commit" not in out:
+                    raise RuntimeError(f"commit failed: {out[-300:]}")
+                code, out = await git(workspace, "push", "-u", "origin", branch)
+                if code != 0:
+                    raise RuntimeError(f"push failed: {out[-300:]}")
+            url = await self.engine.github.create_pr(
+                target.repo, head=branch, base=target.base,
+                title=f"outcome: {job.get('title') or feature_id}"[:200],
+                body=f"Measured outcome for `{feature_id or job_id}` — verdict "
+                     f"**{row.get('verdict') or 'unmeasured'}**.\n\n"
+                     "Mechanical memory-propagation PR opened by the outcome loop; "
+                     "review and merge to fold the result into product memory.",
+                draft=True)
+            if url:
+                # doc draft: tracked, never review-bot kicked
+                await self.engine.record_prs(job_id, [url], kickoff=False)
+                await self.clickup.comment(
+                    job.get("clickup_task_id") or "",
+                    f"{GATE_PREFIX} 📝 outcome written into product memory — "
+                    f"draft PR to review: {url}")
+            else:
+                self.store.set_fields(
+                    job_id, detail=f"outcome memory: files pushed to {branch} but "
+                                   "the draft PR could not be opened")
+        except Exception as e:
+            log.exception("outcome memory task failed for %s", job_id)
+            try:
+                self.store.set_fields(job_id,
+                                      detail=f"outcome memory PR failed: {str(e)[:300]}")
+                await self.clickup.comment(
+                    job.get("clickup_task_id") or "",
+                    f"{GATE_PREFIX} outcome memory PR failed (non-fatal — the "
+                    f"ledger row is the record): {str(e)[:200]}")
+            except Exception:
+                pass
 
     # ---------- background loops ----------
 
@@ -968,9 +1338,11 @@ class Worker:
                         self.store.set_fields(job["issue_id"], comment_marker=c["id"])
                     continue
                 # a human replied conversationally — never drop it silently
-                # (docs/CONVERSATIONS.md §2): nudge once per comment, keep scanning
+                # (docs/CONVERSATIONS.md §2): nudge once per comment, keep scanning.
+                # Watch (Iterate) gates included — a non-verb reply on a parked
+                # verdict must not be re-scanned forever with no response.
                 if (use_marker and job["status"] == "awaiting_input"
-                        and (job.get("kind") or "") == "feature" and text):
+                        and (job.get("kind") or "") in ("feature", "watch") and text):
                     await self.clickup.comment(
                         job.get("clickup_task_id") or "",
                         f"{GATE_PREFIX} I only act on `/proceed`, `/redo` or `/skip` here — "
@@ -1159,11 +1531,34 @@ class Worker:
 
             founder_dri = _pid(fields.get(str(dri_map.get("founder") or "").lower()))
             dev_dri = _pid(fields.get(str(dri_map.get("dev") or "").lower()))
+            # Epic B1: metric goal lines in the description ('metric:'/'target:'/
+            # 'window:'), stripped from the request exactly like the project
+            # line; the ticket's `Success metric` custom field is the fallback
+            # when no metric: line exists
+            mm = METRIC_LINE_RE.search(desc)
+            tm = TARGET_LINE_RE.search(desc)
+            wm = WINDOW_LINE_RE.search(desc)
+            success_metric = _clean_metric_value(mm.group(1)) if mm else ""
+            metric_target = _clean_metric_value(tm.group(1)) if tm else ""
+            window_days = None
+            if wm:
+                days = int(wm.group(1))
+                if 1 <= days <= 365:  # same clamp as the API — never silently accept
+                    window_days = days
+            if not success_metric:
+                cu_metric = fields.get("success metric")
+                if isinstance(cu_metric, str) and cu_metric.strip():
+                    success_metric = cu_metric.strip()[:300]
+            for rx in (METRIC_LINE_RE, TARGET_LINE_RE, WINDOW_LINE_RE):
+                request = rx.sub("", request)
+            request = request.strip() or title
             job_id = f"feat-{task_id}"
             decision = self.intake_feature(
                 job_id, title=title, project=project, request=request,
                 clickup_task_id=task_id, clickup_task_url=task_url,
                 founder_dri=founder_dri, dev_dri=dev_dri,
+                success_metric=success_metric, metric_target=metric_target,
+                metric_window_days=window_days,
                 cu_list_id=t.get("list_id") or self.settings.clickup_list_id)
             adopted_as = ("FEATURE PIPELINE (P0 Intake → P9 Ship) — each stage posts its "
                           "artifact as a subtask and parks here for your `/proceed`, "
@@ -1299,6 +1694,10 @@ class Worker:
             job = self.store.get(pr["job_id"])
             if job:  # conveyor mirror: merged feature slides to Complete
                 await self.engine.sync_stage_field(job, "merged")
+                # outcome loop (Epic B4): a merged, TERMINAL feature starts its
+                # watch (the guard inside refuses mid-pipeline merges; the
+                # P9-approval path covers PRs merged before approval)
+                await self._maybe_spawn_watch(job)
             return
         if info.get("state") == "closed":
             self.store.pr_set(url, state="closed", detail="closed without merge")

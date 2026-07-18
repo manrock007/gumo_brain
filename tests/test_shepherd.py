@@ -379,3 +379,133 @@ class TestShepherdPass:
         row = store.prs_for("feat-s1")[0]
         assert row["last_checked"] is not None
         assert "error" in row["detail"]
+
+
+class TestWatchSpawn:
+    """Epic B4: a merged PR on a TERMINAL (pr_opened) feature with a metric
+    spawns the outcome watch — idempotently, guarded, never mid-pipeline."""
+
+    MERGED = {"state": "closed", "merged": True}
+
+    @staticmethod
+    def _pr_row(store, url="https://github.com/acme/demo/pull/5", job="feat-s1"):
+        # NOT the module _pr helper: that re-inserts the job row, which resets
+        # the feature's status and would defeat the terminal-status guard
+        store.pr_add(job, url)
+        store.pr_set(url, state="in_review", review_rounds=1)
+        return store.pr_get(url)
+
+    def _feature(self, store, job="feat-s1", status="pr_opened", **fields):
+        store.feature_intake(job, title="Feature S1", project="web", stage=9,
+                             workspace_id=7, clickup_task_id="cu1",
+                             founder_dri="111", dev_dri="222", owner="222",
+                             **fields)
+        store.set_status(job, status)
+        return store.get(job)
+
+    def test_merged_pr_spawns_watch_with_copied_fields(self, store, tmp_path):
+        w = _worker(store, tmp_path)
+        self._feature(store, success_metric="signups", metric_target=">= 100",
+                      metric_event="signup_done", metric_window_days=7)
+        pr = self._pr_row(store)
+        w.engine.github = GH(pr=self.MERGED)
+        asyncio.run(w._shepherd_pr(pr))
+        row = store.get("watch-feat-s1")
+        assert row is not None
+        assert row["kind"] == "watch" and row["status"] == "watching"
+        assert row["success_metric"] == "signups"
+        assert row["metric_target"] == ">= 100"
+        assert row["metric_event"] == "signup_done"
+        assert row["metric_window_days"] == 7
+        assert row["related_jobs"] == "feat-s1"
+        assert row["workspace_id"] == 7
+        assert row["owner"] == "111"  # founder-owned Iterate gate
+        assert row["clickup_task_id"] == "cu1"
+        assert abs((row["watch_deadline"] - row["watch_started_at"]) - 7 * 86400) < 5
+
+    def test_window_defaults_from_settings_when_unset(self, store, tmp_path):
+        w = _worker(store, tmp_path, metric_window_days_default=21)
+        self._feature(store, success_metric="signups")
+        pr = self._pr_row(store)
+        w.engine.github = GH(pr=self.MERGED)
+        asyncio.run(w._shepherd_pr(pr))
+        assert store.get("watch-feat-s1")["metric_window_days"] == 21
+
+    def test_second_merged_sibling_pr_is_idempotent(self, store, tmp_path):
+        w = _worker(store, tmp_path)
+        self._feature(store, success_metric="signups")
+        pr1 = self._pr_row(store)
+        pr2 = self._pr_row(store, url="https://github.com/acme/demo/pull/6")
+        w.engine.github = GH(pr=self.MERGED)
+        asyncio.run(w._shepherd_pr(pr1))
+        first = store.get("watch-feat-s1")
+        asyncio.run(w._shepherd_pr(pr2))
+        assert store.get("watch-feat-s1")["created_at"] == first["created_at"]
+
+    def test_no_metric_skips_with_one_note_per_feature(self, store, tmp_path):
+        w = _worker(store, tmp_path)
+        posted = []
+
+        class CU:
+            enabled = True
+
+            async def comment(self, task_id, text):
+                posted.append(text)
+
+            async def set_status(self, task_id, state):
+                pass
+
+        w.clickup = CU()
+        self._feature(store)  # no metric, no event
+        pr1 = self._pr_row(store)
+        pr2 = self._pr_row(store, url="https://github.com/acme/demo/pull/6")
+        w.engine.github = GH(pr=self.MERGED)
+        asyncio.run(w._shepherd_pr(pr1))
+        asyncio.run(w._shepherd_pr(pr2))  # second merged PR: no second note
+        assert store.get("watch-feat-s1") is None
+        skips = [t for t in posted if "outcome watch skipped" in t]
+        assert len(skips) == 1
+
+    def test_mid_pipeline_merge_never_spawns(self, store, tmp_path):
+        """Blocker 2: a PR merged while the feature is still live must not put
+        a second gate on the shared ticket — the P9-approval path covers it."""
+        w = _worker(store, tmp_path)
+        self._feature(store, status="awaiting_input", success_metric="signups")
+        pr = self._pr_row(store)
+        w.engine.github = GH(pr=self.MERGED)
+        asyncio.run(w._shepherd_pr(pr))
+        assert store.get("watch-feat-s1") is None
+
+    def test_watch_disabled_never_spawns(self, store, tmp_path):
+        w = _worker(store, tmp_path, watch_enabled=False)
+        self._feature(store, success_metric="signups")
+        pr = self._pr_row(store)
+        w.engine.github = GH(pr=self.MERGED)
+        asyncio.run(w._shepherd_pr(pr))
+        assert store.get("watch-feat-s1") is None
+
+    def test_p9_approval_spawns_for_an_already_merged_pr(self, store, tmp_path):
+        """The early-merge mirror hook: PR merged before P9 approval — the
+        approval makes the feature terminal and spawns the watch then."""
+        w = _worker(store, tmp_path)
+        job = self._feature(store, status="awaiting_input",
+                            success_metric="signups")
+        # solo mode for the answer: enforcement is not what this test is about
+        store.set_fields("feat-s1", founder_dri="", dev_dri="",
+                         pr_url="https://github.com/acme/demo/pull/5")
+        store.pr_add("feat-s1", "https://github.com/acme/demo/pull/5")
+        store.pr_set("https://github.com/acme/demo/pull/5", state="merged")
+        status = asyncio.run(w.answer_job("feat-s1", "proceed", "", via="dashboard"))
+        assert status == "pr_opened"
+        row = store.get("watch-feat-s1")
+        assert row is not None and row["status"] == "watching"
+
+    def test_p9_approval_without_merged_pr_does_not_spawn(self, store, tmp_path):
+        w = _worker(store, tmp_path)
+        self._feature(store, status="awaiting_input", success_metric="signups")
+        store.set_fields("feat-s1", founder_dri="", dev_dri="",
+                         pr_url="https://github.com/acme/demo/pull/5")
+        store.pr_add("feat-s1", "https://github.com/acme/demo/pull/5")
+        store.pr_set("https://github.com/acme/demo/pull/5", state="in_review")
+        asyncio.run(w.answer_job("feat-s1", "proceed", "", via="dashboard"))
+        assert store.get("watch-feat-s1") is None  # the shepherd spawns on merge

@@ -22,6 +22,10 @@ STATUS_CANDIDATES = {
     "skipped": ["rejected", "complete", "done", "closed"],
     "error": ["to do", "open"],
     "timeout": ["to do", "open"],
+    # outcome loop (Epic B4): a closed watch, and an active one (the watch
+    # never flips ticket status at spawn — only at park/close)
+    "done": ["complete", "done", "closed"],
+    "watching": ["in progress", "active"],
 }
 
 

@@ -631,3 +631,80 @@ def test_change_password_rotates_session(client):
     assert client.get("/api/me").status_code == 401
     fresh = {"Authorization": "Basic " + base64.b64encode(b"dev3:newpass456").decode()}
     assert client.get("/api/me", headers=fresh).json()["must_change_pw"] is False
+
+
+def test_feature_submit_with_metric_goal(client):
+    """Epic B1: the metric fields ride the submit onto the job row; a bad
+    window is a 400 with NOTHING queued (atomic)."""
+    r = client.post("/api/features", headers=AUTH, json={
+        "project": "web", "title": "Measured", "summary": "s",
+        "success_metric": "weekly signups", "metric_target": ">= 100",
+        "metric_window_days": 21})
+    assert r.status_code == 200
+    job_id = r.json()["job_id"]
+    row = client.app.state.store.get(job_id)
+    assert row["success_metric"] == "weekly signups"
+    assert row["metric_target"] == ">= 100"
+    assert row["metric_window_days"] == 21
+
+    before = client.app.state.store.job_count()
+    for bad in (0, 366, -3):
+        r = client.post("/api/features", headers=AUTH, json={
+            "project": "web", "title": "Bad", "metric_window_days": bad})
+        assert r.status_code == 400
+        assert "1 and 365" in r.json()["detail"]
+    assert client.app.state.store.job_count() == before  # nothing queued
+
+    # metric fields are optional — a plain submit still works with NULLs
+    r = client.post("/api/features", headers=AUTH,
+                    json={"project": "web", "title": "Plain"})
+    assert r.status_code == 200
+    row = client.app.state.store.get(r.json()["job_id"])
+    assert row["success_metric"] == "" and row["metric_window_days"] is None
+
+
+def test_outcomes_endpoint_shape_and_auth(client):
+    assert client.get("/api/outcomes").status_code == 401
+    store = client.app.state.store
+    ws = client.get("/api/workspaces", headers=AUTH).json()[0]
+    store.outcome_add("watch-feat-o1", "feat-o1", ws["id"], metric="m",
+                      target="10", observed=12.0, verdict="moved")
+    store.outcome_add("watch-feat-o2", "feat-o2", ws["id"], verdict="unmeasured")
+    r = client.get("/api/outcomes", headers=AUTH)
+    assert r.status_code == 200
+    data = r.json()
+    assert {o["feature_id"] for o in data["outcomes"]} == {"feat-o1", "feat-o2"}
+    assert data["verdicts"] == {"moved": 1, "flat": 0, "regressed": 0,
+                                "unmeasured": 1}
+
+
+def test_workspace_analytics_fields(client):
+    """Epic B3: analytics settings store via PATCH; the secret config is NEVER
+    echoed back; an invalid provider is a 400."""
+    ws = client.get("/api/workspaces", headers=AUTH).json()[0]
+    r = client.patch(f"/api/workspaces/{ws['id']}", headers=AUTH, json={
+        "analytics_provider": "mixpanel",
+        "analytics_config": {"project_id": "123", "service_account": "sa",
+                             "secret": "sup3rs3cret"}})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["analytics_provider"] == "mixpanel"
+    assert body["analytics_configured"] is True
+    assert "analytics_config" not in body
+    assert "sup3rs3cret" not in r.text
+    # the row itself carries the secret (at rest)
+    raw = client.app.state.store.workspace_get(ws["id"])
+    assert "sup3rs3cret" in raw["analytics_config"]
+    # list endpoint never leaks it either
+    assert "sup3rs3cret" not in client.get("/api/workspaces", headers=AUTH).text
+
+    r = client.patch(f"/api/workspaces/{ws['id']}", headers=AUTH,
+                     json={"analytics_provider": "amplitude"})
+    assert r.status_code == 400
+    r = client.patch(f"/api/workspaces/{ws['id']}", headers=AUTH,
+                     json={"analytics_config": "not json {{"})
+    assert r.status_code == 400
+    # clearing the provider flips configured off
+    r = client.patch(f"/api/workspaces/{ws['id']}", headers=AUTH,
+                     json={"analytics_provider": ""})
+    assert r.json()["analytics_configured"] is False

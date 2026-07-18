@@ -108,6 +108,7 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(worker.prune_sessions_forever()),
         asyncio.create_task(worker.shepherd_forever()),
         asyncio.create_task(worker.sla_forever()),
+        asyncio.create_task(worker.watch_forever()),
     ]
     app.state.store = store
     app.state.worker = worker
@@ -374,6 +375,8 @@ class WorkspaceCreateBody(BaseModel):
     require_attributed_answers: str | None = None  # Epic A1: auto | on | off
     stage_role_map: str | None = None              # Epic A3: JSON overrides; '' = inherit
     gate_sla_hours: int | str | None = None        # Epic A5: '' = inherit instance default
+    analytics_provider: str | None = None          # Epic B3: '' = none | 'mixpanel'
+    analytics_config: dict | str | None = None     # Epic B3: stored secret; NEVER echoed back
 
 
 class WorkspacePatchBody(WorkspaceCreateBody):
@@ -506,6 +509,23 @@ async def inbox(user: dict = Depends(require_user)):
     return {"items": items,
             "counts": {"mine": len(items), "unassigned": unassigned_n,
                        "overdue": sum(1 for i in items if i["overdue"])}}
+
+
+@app.get("/api/outcomes")
+async def outcomes_ledger(user: dict = Depends(require_user)):
+    """The outcome ledger (Epic B5): one row per finished watch — metric, goal,
+    observed, verdict, learning, decider — membership-scoped (fail closed: rows
+    whose workspace the user cannot access simply don't exist here), plus the
+    verdict distribution over the visible rows."""
+    store: JobStore = app.state.store
+    svc = _ws_svc()
+    rows = [r for r in store.outcomes_recent(200)
+            if svc.user_can_access(user, r.get("workspace_id"))]
+    verdicts = {"moved": 0, "flat": 0, "regressed": 0, "unmeasured": 0}
+    for r in rows:
+        v = r.get("verdict") or "unmeasured"
+        verdicts[v] = verdicts.get(v, 0) + 1
+    return {"outcomes": rows, "verdicts": verdicts}
 
 
 class TriggerBody(BaseModel):
@@ -696,6 +716,9 @@ class SubmitBody(BaseModel):
     dev_dri: str | None = None      # features: same encoding
     related_to: str | None = None  # features: sibling pipeline job id(s), comma-separated
     gate_mode: str | None = None   # features: 'full' (default) | 'light' (checkpoints + guards)
+    success_metric: str | None = None    # features (Epic B1): what should move
+    metric_target: str | None = None     # features: target value (free text; numeric when possible)
+    metric_window_days: int | None = None  # features: 1-365; empty = instance default at spawn
 
 
 async def _prepare_ticket(worker: Worker, body: SubmitBody, prefix: str,
@@ -787,6 +810,11 @@ async def submit_feature(body: SubmitBody, user: dict = Depends(require_user)):
     worker: Worker = app.state.worker
     if user["role"] != "admin":
         _require_project_access(body.project.strip(), user)
+    # Epic B1: validate BEFORE any side effect (ticket creation/adoption) —
+    # a bad window is a 400 with nothing queued and nothing created
+    if body.metric_window_days is not None and not 1 <= body.metric_window_days <= 365:
+        raise HTTPException(status_code=400,
+                            detail="metric_window_days must be between 1 and 365")
     t = await _prepare_ticket(worker, body, "feat", f"**Feature pipeline via {ENGINE_NAME}**")
     decision = worker.intake_feature(
         t["job_id"], title=t["title"], project=t["project"], request=t["request"],
@@ -798,6 +826,9 @@ async def submit_feature(body: SubmitBody, user: dict = Depends(require_user)):
         dev_dri=(body.dev_dri or "").strip() or (body.owner or "").strip(),
         related_jobs=(body.related_to or "").strip(),
         gate_mode=(body.gate_mode or "").strip().lower(),
+        success_metric=(body.success_metric or "").strip(),
+        metric_target=(body.metric_target or "").strip(),
+        metric_window_days=body.metric_window_days,
     )
     if "queued" not in decision:
         raise HTTPException(status_code=409, detail=decision)
@@ -1016,6 +1047,12 @@ async def session_snapshot(job_id: str, user: dict = Depends(require_user)):
             "evidence": job.get("evidence") or "", "analysis": job.get("analysis") or "",
             "detail": (job.get("detail") or "")[:2000],
             "updated_at": job.get("updated_at"),
+            # outcome loop (Epic B): the metric goal + watch window on the pane
+            "success_metric": job.get("success_metric") or "",
+            "metric_target": job.get("metric_target") or "",
+            "metric_window_days": job.get("metric_window_days"),
+            "metric_event": job.get("metric_event") or "",
+            "watch_deadline": job.get("watch_deadline"),
         },
         "runs": store.stage_runs_for(job_id) if feature else [],
         # recorded run transcripts (§13): the index the Activity accordion is
@@ -1037,6 +1074,11 @@ async def session_snapshot(job_id: str, user: dict = Depends(require_user)):
         "chat_limit": store.chat_count(job_id, stage, max(1, int(job.get("stage_attempts") or 1)))
                       >= settings.chat_max_turns_per_gate,
         "chat_available": kind in ("feature", "sentry", "task"),
+        # outcome loop (Epic B5): the verdict card — the watch's own ledger row
+        # + readings, or the feature's outcome once its watch finished
+        "outcome": (store.outcome_for(job_id) if kind == "watch"
+                    else (store.outcome_for_feature(job_id) if feature else None)),
+        "readings": store.readings_for(job_id) if kind == "watch" else [],
         "live": live,
         # steering rides the feature stage-resume machinery — feature-only
         "steer_available": feature and job["status"] == "running",

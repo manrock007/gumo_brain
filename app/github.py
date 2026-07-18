@@ -78,6 +78,28 @@ class GitHub:
             log.exception("get_pr %s#%s failed", repo, number)
             return None
 
+    async def create_pr(self, repo: str, head: str, base: str, title: str,
+                        body: str, draft: bool = True) -> str | None:
+        """Open a PR (draft by default) — the outcome loop's mechanical
+        memory-propagation PRs use this. Returns the PR's html_url, or None on
+        any failure (best-effort like everything here)."""
+        if not self.enabled or not repo or not head or not base:
+            return None
+        try:
+            async with self._client() as client:
+                r = await client.post(
+                    f"{API}/repos/{repo}/pulls", headers=self._headers,
+                    json={"title": title[:250], "head": head, "base": base,
+                          "body": body[:60000], "draft": draft})
+                if r.status_code != 201:
+                    log.warning("create_pr %s %s->%s -> %s %s", repo, head, base,
+                                r.status_code, str(r.text)[:300])
+                    return None
+                return (r.json().get("html_url") or "").strip() or None
+        except Exception:
+            log.exception("create_pr %s %s->%s failed", repo, head, base)
+            return None
+
     async def mark_ready(self, repo: str, number: int) -> bool:
         """Flip a draft PR to ready-for-review. True on success or when the PR
         is already ready; False when it could not be done (stay draft-safe)."""
