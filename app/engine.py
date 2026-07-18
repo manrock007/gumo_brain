@@ -25,6 +25,7 @@ from .config import (  # noqa: F401 — ENGINE_COMMENT_PREFIXES/GATE_PREFIX re-e
     Settings,
 )
 from .db import JobStore
+from . import autonomy
 from . import fastlane
 from . import roles
 from .feature_prompts import (
@@ -565,33 +566,42 @@ class Engine:
         if pr_url:
             self.store.set_fields(job_id, pr_url=pr_url)
 
-        # light gate mode: checkpoint stages always park; the rest auto-advance
-        # on a clean STAGE_DONE unless a guard trips (docs/CONVERSATIONS.md §1)
-        if self._auto_advance_ok(job, stage, payload, pr_url, conflicted):
+        # auto-advance resolution (Epic C2, docs/ENGINE.md §15): workspace pin
+        # > per-job light gate mode > computed autonomy level (opt-in) > full
+        # gating — the invariant guards apply unconditionally on top.
+        advance, reason = self._auto_advance_decision(job, stage, payload, pr_url, conflicted)
+        if advance:
             self.store.guidance_add(job_id, stage, "auto",
-                                    "auto-advanced (light gate mode)", "engine")
+                                    f"auto-advanced ({reason})", "engine")
+            self.store.autonomy_event_add(
+                kind="auto_advance", workspace_id=job.get("workspace_id"),
+                project=job.get("project") or "", stage=stage, job_id=job_id,
+                detail=f"P{stage} auto-advanced — {reason}", actor="engine")
             evidence = await self._evidence(workspace, target, base_sha, stage, pr_url)
             await self._comment(
                 job, f"P{stage} ({stage_name(stage)}) complete — auto-advanced "
-                     f"(light gate mode).\n\n{payload[:3000]}{evidence}")
+                     f"({reason}).\n\n{payload[:3000]}{evidence}")
             self.store.set_fields(job_id, stage=stage + 1, stage_attempts=0, question="",
                                   ask_count=0)
             self.store.set_status(job_id, "queued")
-            log.info("job %s: P%s auto-advanced (light mode)", job_id, stage)
+            log.info("job %s: P%s auto-advanced (%s)", job_id, stage, reason)
             return "requeue"
 
         await self._park(job, stage, run_id, workspace, target, base_sha,
                          payload, pr_url, conflicted=conflicted)
 
-    # light mode parks unconditionally at P0/P1/P3/P9; other stages may advance
-    LIGHT_MODE_AUTO_STAGES = {2, 4, 5, 6, 7, 8}
+    # Light mode parks unconditionally at P0/P1/P3/P9 — unless a workspace
+    # always_auto pin or a cell at level >= the opt-in AUTONOMY_AUTO_LEVEL
+    # fires for that stage (P9 excepted: always terminal-gated). The constant
+    # lives in autonomy.py (resolve_gate shares it); this CLASS attribute is
+    # the compatibility alias.
+    LIGHT_MODE_AUTO_STAGES = autonomy.LIGHT_MODE_AUTO_STAGES
     BOILERPLATE_Q_RE = re.compile(r"approve|continue|proceed|look good|lgtm", re.IGNORECASE)
 
-    def _auto_advance_ok(self, job, stage, payload, pr_url, conflicted) -> bool:
-        if (job.get("gate_mode") or "full") != "light":
-            return False
-        if stage not in self.LIGHT_MODE_AUTO_STAGES:
-            return False
+    def _auto_guards_ok(self, job, stage, payload, pr_url, conflicted) -> bool:
+        """The unconditional safety guards — they apply at EVERY autonomy
+        level and under every pin ('full auto-advance' never means 'skip the
+        guards', docs/ENGINE.md §15)."""
         if conflicted:  # a human edited mid-run — they must see the warning
             return False
         if not job.get("mirror_ok", 1):
@@ -612,6 +622,17 @@ class Engine:
             return False
         probe = items[0] if items else questions.strip()
         return bool(len(probe) <= 160 and self.BOILERPLATE_Q_RE.search(probe))
+
+    def _auto_advance_decision(self, job, stage, payload, pr_url, conflicted) -> tuple[bool, str]:
+        """(advance?, reason). resolve_gate picks the mode (pin > light mode >
+        computed level > full gating); the guards then have absolute veto."""
+        mode, reason = autonomy.resolve_gate(self.store, self.settings, job, stage)
+        if mode != "auto":
+            return False, reason
+        return self._auto_guards_ok(job, stage, payload, pr_url, conflicted), reason
+
+    def _auto_advance_ok(self, job, stage, payload, pr_url, conflicted) -> bool:
+        return self._auto_advance_decision(job, stage, payload, pr_url, conflicted)[0]
 
     async def _park(self, job, stage, run_id, workspace, target, base_sha,
                     payload, pr_url, flag: str = "", conflicted: list[str] | None = None,
