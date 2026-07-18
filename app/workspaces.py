@@ -19,7 +19,7 @@ import logging
 import re
 import sqlite3
 
-from .config import Settings, validate_repo_map
+from .config import DEFAULT_PRODUCT_NAME, Settings, validate_repo_map
 from .db import JobStore
 
 log = logging.getLogger("brain.workspaces")
@@ -55,10 +55,18 @@ class WorkspaceService:
             self.sync_settings()
             return
         mapping = json.loads(self.settings.repo_map)
+        # a still-default product name is NOT the operator's choice: name the
+        # migrated workspace "Default" and store an EMPTY product_name so the
+        # row falls through to the instance value (product_name_for) — persisting
+        # the code default here would permanently shadow later PUT /api/context
+        # edits in every prompt
+        configured = (self.settings.product_name or "").strip()
+        if configured == DEFAULT_PRODUCT_NAME:
+            configured = ""
         ws = self.store.migrate_default_workspace(
-            "default", self.settings.product_name or "Default",
+            "default", configured or "Default",
             fields=dict(
-                product_name=self.settings.product_name,
+                product_name=configured,
                 workspace_context="",  # business_context stays instance-level (§10)
                 canonical_project=self.settings.memory_canonical_project,
                 clickup_list_id=self.settings.clickup_list_id,
@@ -169,11 +177,13 @@ class WorkspaceService:
         url = (ws or {}).get("slack_webhook_url") or ""
         if not url:
             return
-        link = f"{self.settings.public_base_url}/#/job/{job.get('issue_id')}"
+        link = ""  # deep link only when a public base is configured
+        if self.settings.public_base_url:
+            link = f"\n{self.settings.public_base_url}/#/job/{job.get('issue_id')}"
         try:
             import httpx
             async with httpx.AsyncClient(timeout=10) as client:
-                await client.post(url, json={"text": f"{text}\n{link}"})
+                await client.post(url, json={"text": f"{text}{link}"})
         except Exception:  # visibility only — never let a nudge break a gate
             log.warning("slack gate nudge failed for %s (non-fatal)", job.get("issue_id"))
 

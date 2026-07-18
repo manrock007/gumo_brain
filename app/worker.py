@@ -689,7 +689,8 @@ class Worker:
                                     job.get("parked_head") or "")
             self.store.stage_run_gate_answered(job_id, stage, "redo")
             await self._sync_decision_field(task_id, target_stage, " (redo)", text)
-            if self.settings.clickup_field_sync_enabled and text and task_id:
+            if (self.settings.clickup_field_sync_enabled and text and task_id
+                    and self.settings.clickup_friction_field):
                 # a human redo IS workflow friction — feed the improvement loop
                 await self.clickup.field_append(
                     task_id, self.settings.clickup_friction_field,
@@ -958,6 +959,14 @@ class Worker:
             return why
 
         if kind == "sentry":
+            if not self.settings.sentry_enabled:
+                # reject-pin, never a silent skip: an unresolvable short id on a
+                # Sentry-less instance would otherwise rescan (and re-fail) forever
+                why = reject("Sentry integration is not configured on this instance "
+                             "(SENTRY_ORG / SENTRY_AUTH_TOKEN) — cannot adopt a "
+                             "[sentry] ticket")
+                await self.clickup.comment(task_id, f"{GATE_PREFIX} could not adopt: {why}")
+                return
             issue_id = arg if arg.isdigit() else None
             if issue_id is None and arg:
                 resolved = await self.sentry.resolve_short_id(arg.upper())
@@ -1038,6 +1047,9 @@ class Worker:
 
     async def sweep_forever(self):
         if not self.settings.sweep_enabled:
+            return
+        if not self.settings.sentry_enabled:
+            log.info("sweep disabled: Sentry not configured")
             return
         await asyncio.sleep(300)  # let the stack settle after deploy
         while True:

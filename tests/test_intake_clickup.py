@@ -44,6 +44,12 @@ def _cu_task(task_id, name):
     return {"id": task_id, "name": name, "url": f"https://cu/{task_id}", "list_id": "L1"}
 
 
+def _enable_sentry(worker):
+    """The [sentry] adoption path is gated on a configured Sentry integration."""
+    worker.settings.sentry_org = "acme"
+    worker.settings.sentry_auth_token = "tok"
+
+
 class TestClickUpIntake:
     def test_fix_ticket_adopts_as_task(self, worker):
         worker.clickup = FakeClickUp(
@@ -79,6 +85,7 @@ class TestClickUpIntake:
         assert job["cu_list_id"] == "L1"
 
     def test_sentry_ticket_forces_the_issue(self, worker):
+        _enable_sentry(worker)
         worker.clickup = FakeClickUp(
             tasks=[_cu_task("t3", "[sentry 6613584091] 522 fetching place")])
         asyncio.run(worker._poll_intake())
@@ -90,6 +97,7 @@ class TestClickUpIntake:
         assert job["clickup_task_id"] == "t3"
 
     def test_sentry_without_id_rejects_once(self, worker):
+        _enable_sentry(worker)
         worker.clickup = FakeClickUp(tasks=[_cu_task("t4", "[sentry] no id here")])
         asyncio.run(worker._poll_intake())
         pinned = worker.store.get("cu-t4")
@@ -98,6 +106,7 @@ class TestClickUpIntake:
         assert len(worker.clickup.comments_posted) == 1
 
     def test_sentry_short_code_resolves(self, worker):
+        _enable_sentry(worker)
         """Humans know issues as WEB-3Y, the API wants the group id — the scan
         resolves short codes through the Sentry client."""
         worker.clickup = FakeClickUp(tasks=[_cu_task("ts1", "[sentry WEB-3Y] null split")])
@@ -113,6 +122,7 @@ class TestClickUpIntake:
         assert job["clickup_task_id"] == "ts1"
 
     def test_sentry_unknown_short_code_rejects(self, worker):
+        _enable_sentry(worker)
         worker.clickup = FakeClickUp(tasks=[_cu_task("ts2", "[sentry NOPE-1] ghost")])
 
         async def resolve(short_id):
@@ -124,6 +134,7 @@ class TestClickUpIntake:
         assert "did not resolve" in worker.store.get("cu-ts2")["detail"]
 
     def test_sentry_resolution_outage_retries(self, worker):
+        _enable_sentry(worker)
         """A transient Sentry failure must NOT pin the ticket — the next scan
         retries the resolution."""
         worker.clickup = FakeClickUp(tasks=[_cu_task("ts3", "[sentry WEB-3Y] flaky")])
@@ -211,3 +222,16 @@ class TestClickUpIntake:
             bodies={"t10": "**project:** web\n\ndetails"})
         asyncio.run(worker._poll_intake())
         assert worker.store.get("task-t10") is not None
+
+
+class TestSentryIntakeUnconfigured:
+    def test_sentry_ticket_reject_pins_when_sentry_unconfigured(self, worker):
+        """On a Sentry-less instance a [sentry] ticket must be reject-pinned
+        once — never an infinite rescan loop of failed resolutions."""
+        worker.clickup = FakeClickUp(tasks=[_cu_task("tsx", "[sentry WEB-3Y] ghost")])
+        asyncio.run(worker._poll_intake())
+        pinned = worker.store.get("cu-tsx")
+        assert pinned is not None and pinned["status"] == "skipped"
+        assert "not configured" in pinned["detail"]
+        asyncio.run(worker._poll_intake())  # second scan: silent
+        assert len(worker.clickup.comments_posted) == 1

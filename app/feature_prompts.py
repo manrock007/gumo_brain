@@ -227,7 +227,7 @@ def build_stage_prompt(*, target: RepoTarget, branch: str, job: dict, stage: int
                        redo_notes: str = "",
                        evidence_note: str = "",
                        test_block: str = "",
-                       canonical_project: str = "gumo",
+                       canonical_project: str = "",
                        product_name: str = DEFAULT_PRODUCT_NAME,
                        business_context: str = "") -> str:
     job_id = job["issue_id"]
@@ -240,12 +240,16 @@ def build_stage_prompt(*, target: RepoTarget, branch: str, job: dict, stage: int
         )
         task_header = f"## Your task — {stage_name(stage)} (document stage: produce the artifact, change nothing)"
     else:
-        product_scope_note = (
-            " and `.gumo/product/` (product.md / contract.md) since this IS the canonical repo"
-            if job.get("project") == canonical_project else
-            "; product-scope updates (product.md/contract.md) belong to the canonical repo — "
-            "note needed changes in the artifact instead of editing here"
-        )
+        if not canonical_project:
+            product_scope_note = ("; this instance has no product-scope memory "
+                                  "configured — repo-scope memory only")
+        elif job.get("project") == canonical_project:
+            product_scope_note = (" and `.gumo/product/` (product.md / contract.md) "
+                                  "since this IS the canonical repo")
+        else:
+            product_scope_note = (
+                "; product-scope updates (product.md/contract.md) belong to the canonical repo — "
+                "note needed changes in the artifact instead of editing here")
         contract = _CODE_CONTRACTS[stage].format(
             branch=branch, base=target.base, job_id=job_id,
             product_scope_note=product_scope_note if stage == 9 else "",

@@ -40,7 +40,7 @@ def test_projects_lists_repo_map(client):
     r = client.get("/api/projects", headers=AUTH)
     assert r.status_code == 200
     slugs = {p["slug"] for p in r.json()}
-    assert "web" in slugs and "gumo" in slugs
+    assert "web" in slugs and "demo" in slugs
 
 
 def test_task_validation(client):
@@ -96,10 +96,10 @@ def test_context_roundtrip(client):
     r = client.get("/api/context", headers=AUTH)
     assert r.status_code == 200
     data = r.json()
-    assert data["context"]["product_name"] == "Gumo"
-    assert "gumo" in data["context"]["repo_map"]
+    assert data["context"]["product_name"] == "your product"
+    assert "demo" in data["context"]["repo_map"]
     assert data["overridden"] == []
-    assert data["defaults"]["canonical_project"] == "gumo"
+    assert data["defaults"]["canonical_project"] == "demo"
 
     # repo topology moved to workspaces (Phase 2) — the context API refuses it
     # explicitly rather than accepting-and-ignoring
@@ -118,11 +118,11 @@ def test_context_roundtrip(client):
     assert set(data["overridden"]) == {"product_name", "business_context"}
     # workspace-owned repos are untouched by instance-context edits
     slugs = {p["slug"] for p in client.get("/api/projects", headers=AUTH).json()}
-    assert "gumo" in slugs
+    assert "demo" in slugs
 
     r = client.delete("/api/context", headers=AUTH)
     assert r.status_code == 200
-    assert r.json()["context"]["product_name"] == "Gumo"
+    assert r.json()["context"]["product_name"] == "your product"
     assert r.json()["overridden"] == []
 
 
@@ -131,7 +131,7 @@ def test_workspace_crud_and_repo_move(client):
     live-jobs warning rides workspace PATCH responses."""
     ws_list = client.get("/api/workspaces", headers=AUTH).json()
     assert len(ws_list) == 1 and ws_list[0]["slug"] == "default"
-    assert "gumo" in ws_list[0]["repos"]  # migration wrapped the §10 map
+    assert "demo" in ws_list[0]["repos"]  # migration wrapped the §10 map
     default_id = ws_list[0]["id"]
 
     # all-numeric slugs must not be misrouted into id lookups (finding 1595569):
@@ -172,7 +172,7 @@ def test_workspace_crud_and_repo_move(client):
     assert r.status_code == 200
     app_id = r.json()["id"]
     r = client.patch(f"/api/workspaces/{app_id}", headers=AUTH,
-                     json={"repos": [{"slug": "gumo", "repo": "acme/api"}]})
+                     json={"repos": [{"slug": "demo", "repo": "acme/api"}]})
     assert r.status_code == 400 and "already used" in r.json()["detail"]
 
     # enabling ClickUp without the workspace's own list id would silently
@@ -210,8 +210,8 @@ def test_workspace_crud_and_repo_move(client):
     client.patch(f"/api/workspaces/{bare_id}", headers=AUTH,
                  json={"repos": [{"slug": "bare-api", "repo": "bare/api"}]})
     assert svc.canonical_for("bare-api") == ""      # own workspace, no canonical
-    assert svc.canonical_for("gumo") == "gumo"      # own workspace's canonical
-    assert svc.canonical_for("unmapped") == "gumo"  # legacy fallback only when unmapped
+    assert svc.canonical_for("demo") == "demo"      # own workspace's canonical
+    assert svc.canonical_for("unmapped") == "demo"  # legacy fallback only when unmapped
 
     # membership enforcement: a member sees only assigned workspaces' jobs
     client.post("/api/users", headers=AUTH,
@@ -224,7 +224,7 @@ def test_workspace_crud_and_repo_move(client):
     assert [w["slug"] for w in client.get("/api/workspaces", headers=member).json()] == ["app"]
     assert client.get("/api/jobs/task-w1/session", headers=member).status_code == 200
     # ...but not the default workspace's jobs
-    store.insert("task-w2", source="manual", title="t", project="gumo", kind="task")
+    store.insert("task-w2", source="manual", title="t", project="demo", kind="task")
     store.set_fields("task-w2", workspace_id=default_id)
     assert client.get("/api/jobs/task-w2/session", headers=member).status_code == 404
     ids = {j["issue_id"] for j in client.get("/api/jobs", headers=member).json()}
@@ -252,7 +252,7 @@ def test_context_put_persist_failure_leaves_live_state(client, monkeypatch):
     monkeypatch.setattr(store, "config_set_many", boom)
     with _pytest.raises(sqlite3.OperationalError):
         client.put("/api/context", headers=AUTH, json={"product_name": "Acme"})
-    assert client.get("/api/context", headers=AUTH).json()["context"]["product_name"] == "Gumo"
+    assert client.get("/api/context", headers=AUTH).json()["context"]["product_name"] == "your product"
 
 
 def test_dashboard_rebrands_from_context(client):
@@ -260,12 +260,12 @@ def test_dashboard_rebrands_from_context(client):
     and prove the rendered page follows the configured product name."""
     from app.main import _INDEX_HTML
 
-    assert "the Gumo Engine" in _INDEX_HTML  # main.dashboard() replaces this
-    assert "the Gumo Engine" in client.get("/", headers=AUTH).text
+    assert "{{product_name}}" in _INDEX_HTML  # main.dashboard() replaces this
+    assert "the your product Engine" in client.get("/", headers=AUTH).text
     r = client.put("/api/context", headers=AUTH, json={"product_name": "Acme"})
     assert r.status_code == 200
     page = client.get("/", headers=AUTH).text
-    assert "the Acme Engine" in page and "the Gumo Engine" not in page
+    assert "the Acme Engine" in page and "{{product_name}}" not in page
     client.delete("/api/context", headers=AUTH)
 
 
@@ -340,7 +340,7 @@ def test_login_flow_and_roles(client):
     default_ws = client.get("/api/workspaces", headers=AUTH).json()[0]["id"]
     client.put(f"/api/workspaces/{default_ws}/members", headers=AUTH,
                json={"username": "dev1", "member": True})
-    store.insert("task-attr", source="manual", title="t", project="gumo", kind="task")
+    store.insert("task-attr", source="manual", title="t", project="demo", kind="task")
     store.set_fields("task-attr", status="awaiting_input", analysis="a", question="q",
                      workspace_id=default_ws)
     r = client.post("/api/jobs/task-attr/answer", headers=member,
@@ -389,8 +389,8 @@ def test_setup_wizard_lifecycle(client):
     reset; members never see instance onboarding."""
     data = client.get("/api/setup", headers=AUTH).json()
     assert data["needed"] is True
-    # code-default Gumo context/repos are not "configured" — they must be made
-    # the operator's own (semantic compare vs the normalized default map)
+    # default context/repos are not "configured" — they must be made the
+    # operator's own (semantic compare vs the normalized default map)
     assert data["steps"]["business_context"] is False
     assert data["steps"]["repos"] is False
     assert data["steps"]["team"] is False
@@ -415,7 +415,7 @@ def test_run_transcripts_recorded_and_scoped(client):
     store = client.app.state.store
     settings = client.app.state.settings
     ws = client.get("/api/workspaces", headers=AUTH).json()[0]
-    store.insert("task-tr1", source="manual", title="t", project="gumo", kind="task")
+    store.insert("task-tr1", source="manual", title="t", project="demo", kind="task")
     store.set_fields("task-tr1", workspace_id=ws["id"])
     # simulate a run writing its activity through the writer
     w = transcripts.open_writer(settings, "task-tr1", "v1-p1-123", {"kind": "v1", "phase": 1})

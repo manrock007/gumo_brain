@@ -56,7 +56,7 @@ def test_overrides_apply_and_resolve(tmp_path):
     assert s.product_name == "Acme"
     assert s.repo_for_project("api").repo == "acme/api"
     assert s.repo_for_project("api").base == "dev"
-    assert s.repo_for_project("gumo") is None  # old map fully replaced
+    assert s.repo_for_project("demo") is None  # old map fully replaced
     assert s.target_for_repo("acme/api") is not None
 
 
@@ -66,10 +66,10 @@ def test_overrides_atomic_on_failure(tmp_path):
     with pytest.raises(ValueError):
         s.apply_runtime_overrides({
             "product_name": "Acme",
-            "repo_map": {"api": {"repo": "acme/api"}},  # canonical 'gumo' not in it
+            "repo_map": {"api": {"repo": "acme/api"}},  # canonical 'demo' not in it
         })
     assert s.product_name == DEFAULT_PRODUCT_NAME
-    assert s.repo_for_project("gumo") is not None
+    assert s.repo_for_project("demo") is not None
 
 
 def test_stale_canonical_never_blocks_unrelated_edits(tmp_path):
@@ -79,16 +79,36 @@ def test_stale_canonical_never_blocks_unrelated_edits(tmp_path):
     s = Settings(data_dir=str(tmp_path), memory_canonical_project="ghost")
     applied = s.apply_runtime_overrides({"product_name": "Acme"})
     assert applied == {"product_name": "Acme"} and s.product_name == "Acme"
-    # ...but staging either involved field still fail-closes
+    # staging repo_map still fail-closes against the (staged-or-live) canonical
     with pytest.raises(ValueError):
-        s.apply_runtime_overrides({"memory_canonical_project": "nope"})
+        s.apply_runtime_overrides({"repo_map": {"api": {"repo": "acme/api"}}})
+
+
+def test_lone_canonical_is_accepted_with_warning(tmp_path, caplog):
+    """At startup, stored overrides apply BEFORE workspaces rebuild the merged
+    map — a lone canonical override on a legacy row must never atomically drop
+    every persisted override. Accepted with a logged warning, not rejected."""
+    s = Settings(data_dir=str(tmp_path))
+    applied = s.apply_runtime_overrides({"memory_canonical_project": "ghost",
+                                         "product_name": "Acme"})
+    assert applied["memory_canonical_project"] == "ghost"
+    assert s.product_name == "Acme"
+    assert any("ghost" in r.message for r in caplog.records)
+
+
+def test_empty_canonical_is_a_valid_neutral_state(tmp_path):
+    """Empty canonical = no instance-level product scope; staging a repo map
+    with an empty canonical must not raise."""
+    s = Settings(data_dir=str(tmp_path), memory_canonical_project="")
+    applied = s.apply_runtime_overrides({"repo_map": {"api": {"repo": "acme/api"}}})
+    assert "repo_map" in applied and s.repo_for_project("api") is not None
 
 
 def test_overrides_skip_none_and_empty(tmp_path):
     s = Settings(data_dir=str(tmp_path))
     s.apply_runtime_overrides({"product_name": None, "memory_canonical_project": "  "})
     assert s.product_name == DEFAULT_PRODUCT_NAME
-    assert s.memory_canonical_project == "gumo"
+    assert s.memory_canonical_project == "demo"  # the test-env pin, untouched
     # …but an EMPTY business context is a deliberate choice, honored
     s.apply_runtime_overrides({"business_context": ""})
     assert s.business_context == ""
@@ -136,13 +156,13 @@ def test_stage_prompt_carries_context():
     assert "Gumo" not in prompt
 
 
-def test_stage_prompt_defaults_stay_gumo():
+def test_stage_prompt_defaults_stay_neutral():
     prompt = build_stage_prompt(
         target=TARGET, branch="b", job=JOB, stage=0,
         memory_context="", artifact_names=[], inline_artifacts={},
         guidance_entries=[],
     )
-    assert "Gumo Engine's build agent" in prompt
+    assert f"{DEFAULT_PRODUCT_NAME} Engine's build agent" in prompt
     assert "## Business context" not in prompt  # default arg is empty
 
 
@@ -200,8 +220,9 @@ def test_bootstrap_prompt_carries_context():
     assert "Acme builds rockets." in prompt
 
 
-def test_default_business_context_describes_defaults():
-    """The shipped default stays the Gumo setup — swap it via /api/context."""
+def test_default_business_context_is_neutral():
+    """Built for the world: the code default is EMPTY — any non-empty default
+    would be injected into every prompt of every install."""
+    assert DEFAULT_BUSINESS_CONTEXT == ""
     s = Settings()
     assert s.business_context == DEFAULT_BUSINESS_CONTEXT
-    assert "manrock007/gumoserver" in s.business_context

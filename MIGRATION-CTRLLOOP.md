@@ -6,7 +6,31 @@ flipped alone — do them together, in this order, in one maintenance window.
 
 ## 1. Before deploying this version
 
-Nothing required. The app upgrade itself is backward compatible:
+**REQUIRED for pre-existing instances (the neutral-defaults upgrade).** The
+engine's code defaults are now neutral ("built for the world"): every value
+that used to be baked in for the original Gumo instance is empty unless
+configured. These values exist ONLY as code defaults today — they are not in
+`app_config` and not in the workspaces tables — so deploying without setting
+them as env vars silently disables the integrations that relied on them.
+Before deploying to an instance that uses them, set:
+
+| Env var | Old baked-in default | Disabled if unset |
+| --- | --- | --- |
+| `SENTRY_ORG` | `gumo` | the ENTIRE Sentry lane: webhook intake errors, sweep exits, `/api/trigger` 400s, `[sentry]` tickets reject |
+| `SENTRY_API_BASE` | `https://de.sentry.io/api/0` (EU) | new default is the US host — EU orgs MUST set this |
+| `CLICKUP_LIST_ID` | `901615853762` | the ENTIRE ClickUp integration (`clickup_enabled` needs token + list), including intake, gate-answer polling and mirroring — unless every workspace has its own list |
+| `PUBLIC_BASE_URL` | `https://gumo.co.in/brain` | dashboard deep links in Slack nudges and the `Dashboard` ClickUp field |
+| `PRODUCT_NAME` / `BUSINESS_CONTEXT` | the Gumo identity/context | prompts fall back to "your product" / no business block (unless already overridden via `PUT /api/context`, which wins anyway) |
+| `MEMORY_CANONICAL_PROJECT` | `gumo` | instance-level product-scope fallback for legacy unmapped slugs (workspaces' own canonical is unaffected) |
+| `CLICKUP_STAGE_FIELD_MAP`, `CLICKUP_REPO_STAGE_MAP`, `CLICKUP_PR_FIELD_MAP`, `CLICKUP_DOC_FIELD_MAP`, `CLICKUP_FOLDER_FIELD`, `CLICKUP_FRICTION_FIELD`, `CLICKUP_FLAG_FIELD`, `CLICKUP_METRIC_FIELD` | the gumo-speed conveyor maps/fields | the conveyor mirror (Stage board, PR fields, doc/folder links, friction log, launch fields) goes inert |
+
+The old values are reproduced verbatim in the
+"Example configuration: the original Gumo instance" appendix of
+[docs/OPERATIONS.md](docs/OPERATIONS.md). Startup logs a loud warning for
+half-configured integrations (token without org, ClickUp token without any
+list id).
+
+Everything else in the upgrade is backward compatible:
 
 - **Credentials**: if only `DASHBOARD_PASSWORD` is set, first boot creates an
   admin account `gumo` with that password — sign-in keeps working. Prefer

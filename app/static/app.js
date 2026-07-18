@@ -793,7 +793,10 @@ function renderContext() {
       <div><label>Default product name</label><input id="ctx-name" value="${attr(c.product_name)}"></div>
     </div>
     <label>Business context (stacked above each workspace's context in every prompt)</label>
-    <textarea id="ctx-biz">${esc(c.business_context)}</textarea>
+    <textarea id="ctx-biz" placeholder="&lt;product&gt; is &lt;one-line description&gt; for &lt;who it's for&gt;, built across these repositories:
+- &lt;slug&gt; (&lt;owner/repo&gt;) — &lt;what this repo is: backend/API, web client, …&gt;
+How the pieces relate (e.g. clients consume the backend's API; cross-repo features ship server-first).
+Anything every automated run should know about the business or the codebase conventions.">${esc(c.business_context)}</textarea>
     <div style="display:flex; gap:8px; margin-top:12px">
       <button type="button" class="save" onclick="saveContext(this)">Save context</button>
       <button type="button" onclick="resetContext(this)">Reset to defaults</button>

@@ -1,43 +1,29 @@
 import json
+import logging
 import os
 import re
 from functools import lru_cache
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings
+
+log = logging.getLogger("brain.config")
 
 
 class RepoTarget:
     def __init__(self, repo: str, base: str, setup_cmd: str | None = None,
                  test_cmd: str | None = None, allow: list[str] | None = None):
-        self.repo = repo          # e.g. "manrock007/gumoserver"
-        self.base = base          # PR base branch, e.g. "master"
+        self.repo = repo          # e.g. "acme/api"
+        self.base = base          # PR base branch, e.g. "main"
         self.setup_cmd = setup_cmd  # run once to install test deps, e.g. "npm ci"
         self.test_cmd = test_cmd    # how Claude should run the unit tests
         self.allow = allow or []    # extra --allowedTools entries for this repo
 
 
-DEFAULT_REPO_MAP = {
-    "gumo": {
-        "repo": "manrock007/gumoserver", "base": "master",
-        # Django tests need postgres/GDAL — not runnable in this container yet
-        "setup_cmd": None, "test_cmd": None, "allow": [],
-    },
-    "web": {
-        "repo": "manrock007/gumowebclient", "base": "dev",
-        "setup_cmd": "npm ci", "test_cmd": "npm test",
-        "allow": ["Bash(npm:*)", "Bash(npx:*)", "Bash(node:*)"],
-    },
-    "react-native": {
-        "repo": "manrock007/gumoclient", "base": "master",
-        "setup_cmd": "cd codebase/Gumo && npm ci",
-        "test_cmd": "cd codebase/Gumo && npx jest --ci",
-        "allow": ["Bash(npm:*)", "Bash(npx:*)", "Bash(node:*)", "Bash(cd:*)"],
-    },
-    "gumo-video-analyser": {
-        "repo": "manrock007/gumo_video_analyser", "base": "main",
-        "setup_cmd": None, "test_cmd": None, "allow": [],
-    },
-}
+# Neutral out of the box: a fresh install carries NO repos — the first-run
+# wizard demands the first one via the workspace API. A concrete example map
+# (the original Gumo instance) lives in docs/OPERATIONS.md.
+DEFAULT_REPO_MAP: dict = {}
 
 # The engine's own identity (the tool), distinct from product_name (what a
 # team builds with it). Single source of truth for branding, gate-comment
@@ -52,17 +38,13 @@ GATE_PREFIX = f"**[{ENGINE_SLUG}]**"
 LEGACY_GATE_PREFIXES = ("**[gumo_brain]**",)
 ENGINE_COMMENT_PREFIXES = (GATE_PREFIX, *LEGACY_GATE_PREFIXES)
 
-DEFAULT_PRODUCT_NAME = "Gumo"
+DEFAULT_PRODUCT_NAME = "your product"
 
-DEFAULT_BUSINESS_CONTEXT = """\
-Gumo is one product built across three main repositories:
-- `gumo` (manrock007/gumoserver) — the Django backend: API, data models, business \
-logic. This is the canonical repo hosting product-scope memory (`.gumo/product/`).
-- `web` (manrock007/gumowebclient) — the web client.
-- `react-native` (manrock007/gumoclient) — the React Native mobile app.
-The clients consume the backend's API; cross-repo features ship server-first, then
-clients. Deeper, versioned product knowledge (what the product is, who it's for, the
-cross-repo API contract) lives in product memory (`.gumo/product/` and `.gumo/memory/`)."""
+# Empty on purpose: any non-empty code default would be injected verbatim into
+# EVERY run's prompt. Operators write their own via the dashboard's context
+# panel (a template ships as its placeholder) or PUT /api/context; a worked
+# example lives in docs/OPERATIONS.md.
+DEFAULT_BUSINESS_CONTEXT = ""
 
 # Project-context fields an operator may override at runtime (persisted in the
 # app_config table, applied over env/code defaults at startup and via the API).
@@ -70,9 +52,16 @@ RUNTIME_CONTEXT_KEYS = ("product_name", "business_context", "repo_map",
                         "memory_canonical_project")
 
 
-def validate_repo_map(mapping) -> dict:
+def validate_repo_map(mapping, allow_empty: bool = False) -> dict:
     """Normalize + validate an operator-supplied repo map. Raises ValueError
-    with a human-readable reason; returns the cleaned mapping."""
+    with a human-readable reason; returns the cleaned mapping.
+
+    allow_empty=True accepts {} (the neutral fresh-install default — used only
+    where an empty map is a valid state, e.g. the setup wizard's default
+    comparison). The default stays strict/fail-closed: operator writes may
+    never empty a repo set through validation."""
+    if isinstance(mapping, dict) and not mapping and allow_empty:
+        return {}
     if not isinstance(mapping, dict) or not mapping:
         raise ValueError("repo_map must be a non-empty object of {slug: target}")
     cleaned: dict = {}
@@ -101,11 +90,14 @@ def validate_repo_map(mapping) -> dict:
 
 
 class Settings(BaseSettings):
-    # Sentry
-    sentry_org: str = "gumo"
-    # EU-region org — do NOT use https://sentry.io here
-    sentry_api_base: str = "https://de.sentry.io/api/0"
-    sentry_web_base: str = "https://gumo.sentry.io"
+    # Sentry — the whole Sentry lane is OFF until both SENTRY_ORG and
+    # SENTRY_AUTH_TOKEN are configured (see the sentry_enabled property)
+    sentry_org: str = ""
+    # EU-region orgs must set SENTRY_API_BASE=https://de.sentry.io/api/0
+    sentry_api_base: str = "https://sentry.io/api/0"
+    # DEPRECATED/UNUSED: kept only so existing SENTRY_WEB_BASE env vars don't
+    # fail settings validation — nothing reads it
+    sentry_web_base: str = ""
     # Client secret of the Sentry internal integration (verifies webhook signatures)
     sentry_client_secret: str = ""
     # Auth token of the same internal integration (reads issues, posts comments)
@@ -124,35 +116,37 @@ class Settings(BaseSettings):
 
     # ClickUp — one task per issue being fixed; Claude posts progress comments
     clickup_token: str = ""
-    clickup_list_id: str = "901615853762"  # "Sentry Autofix" list in Gumo Space
+    clickup_list_id: str = ""  # instance-default autofix list; empty = ClickUp off
     clickup_poll_seconds: int = 120  # how often to check awaiting-input tickets
     # ClickUp as an INTAKE channel: tasks named '[fix] …', '[feature] …' or
     # '[sentry <id>] …' in the autofix list are adopted and queued
     clickup_intake_enabled: bool = True
-    # Mirror engine state onto the gumo-speed workflow's custom fields (the
-    # Stage board, per-repo PR fields, Decisions, Dashboard link). Best-effort
-    # display only — never drives control flow (ENGINE.md §7).
+    # Mirror engine state onto a workflow board's custom fields (the Stage
+    # board, per-repo PR fields, Decisions, Dashboard link — originally the
+    # gumo-speed workflow). Best-effort display only — never drives control
+    # flow (ENGINE.md §7). All maps/field names default EMPTY: with no
+    # configuration every field-sync helper is inert. A worked example lives
+    # in docs/OPERATIONS.md.
     clickup_field_sync_enabled: bool = True
-    # brain stage -> Stage dropdown option; 'build' resolves per-repo below
-    clickup_stage_field_map: str = ('{"0": "Brief", "1": "PRD", "2": "PRD", "3": "Contract", '
-                                    '"4": "Grounding", "5": "build", "6": "build", '
-                                    '"7": "Integration", "8": "Tech Review", "9": "Launch", '
-                                    '"shipped": "Dogfood", "merged": "Complete"}')
-    # repo -> its build-stage column and its PR url field
-    clickup_repo_stage_map: str = ('{"manrock007/gumoserver": "Backend", '
-                                   '"manrock007/gumowebclient": "Frontend - Web", '
-                                   '"manrock007/gumoclient": "Frontend - App"}')
-    clickup_pr_field_map: str = ('{"manrock007/gumoserver": "Backend PR", '
-                                 '"manrock007/gumowebclient": "Web PR", '
-                                 '"manrock007/gumoclient": "App PR"}')
-    # public dashboard base for the ticket's Dashboard deep link
-    public_base_url: str = "https://gumo.co.in/brain"
-    # artifact mirror -> doc url field (the brain's editable equivalent of the
-    # workflow's Google Docs), + the folder field pointing at the branch's
-    # .gumo tree, + the append-only friction log field
-    clickup_doc_field_map: str = '{"P1-prd.md": "PRD Doc", "P3-design.md": "Contract Doc"}'
-    clickup_folder_field: str = "PRD Folder"
-    clickup_friction_field: str = "Gumo Workflow Improvements"
+    # engine stage -> Stage dropdown option; the literal value 'build'
+    # resolves per-repo via clickup_repo_stage_map
+    clickup_stage_field_map: str = "{}"
+    # repo (owner/name) -> its build-stage column
+    clickup_repo_stage_map: str = "{}"
+    # repo (owner/name) -> its PR url field
+    clickup_pr_field_map: str = "{}"
+    # public dashboard base for deep links (Dashboard field, Slack nudges);
+    # empty = no links are emitted
+    public_base_url: str = ""
+    # artifact mirror -> doc url field (the engine's editable equivalent of
+    # doc links), + the folder field pointing at the branch's engine-namespace
+    # tree, + the append-only friction log field — empty = skip
+    clickup_doc_field_map: str = "{}"
+    clickup_folder_field: str = ""
+    clickup_friction_field: str = ""
+    # P9 launch fields for FLAG_NAME / SUCCESS_METRIC protocol lines — empty = skip
+    clickup_flag_field: str = ""
+    clickup_metric_field: str = ""
 
     # ---- Auth (docs/ENGINE.md §11) ----
     # First-boot admin bootstrap: when the users table is empty, an admin
@@ -202,7 +196,9 @@ class Settings(BaseSettings):
     # Feature pipeline (docs/ENGINE.md)
     doc_stage_timeout_seconds: int = 900   # P0-P4 are document-only runs
     clickup_mirror_max_chars: int = 50000  # artifact size above this -> pointer mirror
-    memory_canonical_project: str = "gumo"  # repo hosting .gumo/product (product scope)
+    # project slug hosting product-scope memory; empty = no instance-level
+    # product scope (workspaces own their own canonical, ENGINE.md §12)
+    memory_canonical_project: str = ""
     stage_gates: str = ""  # future: comma list of auto-advance stages, e.g. "5,7"; empty = all gated
     reaper_grace_seconds: int = 600
 
@@ -271,6 +267,12 @@ class Settings(BaseSettings):
     def clickup_enabled(self) -> bool:
         return bool(self.clickup_token and self.clickup_list_id)
 
+    @property
+    def sentry_enabled(self) -> bool:
+        """The Sentry lane (webhook intake, sweep, manual triggers, [sentry]
+        ticket adoption) requires both the org slug and an auth token."""
+        return bool(self.sentry_org and self.sentry_auth_token)
+
     def stage_runtime_overrides(self, overrides: dict) -> dict:
         """Validate + normalize project-context overrides WITHOUT applying them.
         Raises ValueError on any problem; returns the normalized values. Callers
@@ -292,18 +294,28 @@ class Settings(BaseSettings):
                 if value or key == "business_context":
                     staged[key] = value
         # fail closed: a canonical project outside the map would silently kill
-        # product-scope memory for every client-repo run. Checked ONLY when one
-        # of the two involved fields is being staged — workspaces own canonical
-        # validation now (WorkspaceService.update), and the legacy instance
-        # value may legitimately be absent from the workspace-merged map, which
-        # must not block unrelated edits like product_name (finding 1595745)
-        if "repo_map" in staged or "memory_canonical_project" in staged:
+        # product-scope memory for every client-repo run. Checked ONLY when
+        # repo_map itself is being staged — workspaces own canonical validation
+        # now (WorkspaceService.update), and at startup this method runs BEFORE
+        # WorkspaceService.sync_settings rebuilds the merged map, so the live
+        # repo_map may legitimately be the empty neutral default. Rejecting a
+        # canonical staged alone would atomically drop EVERY persisted override
+        # (product_name, business_context) on legacy instances at boot — so a
+        # lone canonical is accepted with a logged warning instead. An empty
+        # canonical is the valid "no product scope" neutral state, never an error.
+        if "repo_map" in staged:
             canonical = staged.get("memory_canonical_project", self.memory_canonical_project)
-            repo_map = staged.get("repo_map", self.repo_map)
-            if canonical not in json.loads(repo_map):
+            if canonical and canonical not in json.loads(staged["repo_map"]):
                 raise ValueError(
                     f"canonical project '{canonical}' is not a project slug in the repo map"
                 )
+        elif "memory_canonical_project" in staged:
+            canonical = staged["memory_canonical_project"]
+            if canonical and canonical not in json.loads(self.repo_map):
+                log.warning(
+                    "canonical project '%s' is not in the currently-loaded repo map — "
+                    "accepted (workspaces own the merged map; verify it via the "
+                    "workspace settings)", canonical)
         return staged
 
     def apply_staged(self, staged: dict):

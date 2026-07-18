@@ -912,6 +912,8 @@ class Engine:
         link — one click from the board to the live session view."""
         if not self.settings.clickup_field_sync_enabled:
             return
+        if not self.settings.public_base_url:
+            return  # no public base configured — there is no link to write
         task_id = job.get("clickup_task_id") or ""
         if not task_id:
             return
@@ -964,16 +966,19 @@ class Engine:
         if not task_id or (job.get("kind") or "") != "feature":
             return
         try:
-            for m in self.FRICTION_RE.finditer(text or ""):
-                await self.clickup.field_append(
-                    task_id, self.settings.clickup_friction_field,
-                    f"P{stage} {stage_name(stage)} (engine) · {m.group(1).strip()[:400]}")
+            if self.settings.clickup_friction_field:
+                for m in self.FRICTION_RE.finditer(text or ""):
+                    await self.clickup.field_append(
+                        task_id, self.settings.clickup_friction_field,
+                        f"P{stage} {stage_name(stage)} (engine) · {m.group(1).strip()[:400]}")
             fm = self.FLAG_RE.search(text or "")
-            if fm:
-                await self.clickup.field_set(task_id, "Flag name", fm.group(1).strip()[:200])
+            if fm and self.settings.clickup_flag_field:
+                await self.clickup.field_set(task_id, self.settings.clickup_flag_field,
+                                             fm.group(1).strip()[:200])
             mm = self.METRIC_RE.search(text or "")
-            if mm:
-                await self.clickup.field_set(task_id, "Success metric", mm.group(1).strip()[:200])
+            if mm and self.settings.clickup_metric_field:
+                await self.clickup.field_set(task_id, self.settings.clickup_metric_field,
+                                             mm.group(1).strip()[:200])
         except Exception:
             log.exception("run-report field sync failed for %s (non-fatal)", job.get("issue_id"))
 

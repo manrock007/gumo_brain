@@ -37,11 +37,11 @@ class TestParseStageOutput:
         assert pr is None
 
     def test_standalone_pr_line_is_recorded(self):
-        text = ("work done\nPR_URL: https://github.com/manrock007/gumowebclient/pull/42\n"
+        text = ("work done\nPR_URL: https://github.com/acme/web/pull/42\n"
                 "STAGE_DONE:\nbuilt group 1\n## Questions\n1. approve?")
         marker, _, pr = parse_stage_output(text)
         assert marker == "done"
-        assert pr == "https://github.com/manrock007/gumowebclient/pull/42"
+        assert pr == "https://github.com/acme/web/pull/42"
 
     def test_pr_line_tolerates_backticks_and_bullets(self):
         # models often wrap the line; the regex must still find it

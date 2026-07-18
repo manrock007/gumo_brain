@@ -75,6 +75,21 @@ async def lifespan(app: FastAPI):
     workspaces = WorkspaceService(store, settings)
     workspaces.ensure_default()  # upgrade path: wrap the §10 context into a workspace
     app.state.workspaces = workspaces
+    # loud warnings for half-configured integrations: defaults are neutral now,
+    # so a pre-existing instance that relied on the old baked-in values must
+    # set them as env vars (MIGRATION-CTRLLOOP.md upgrade checklist)
+    if settings.sentry_auth_token and not settings.sentry_org:
+        log.warning("SENTRY_AUTH_TOKEN is set but SENTRY_ORG is empty — the whole "
+                    "Sentry lane (webhooks, sweep, manual triggers) is DISABLED. "
+                    "Set SENTRY_ORG (and SENTRY_API_BASE for EU-region orgs).")
+    if settings.sentry_org and not settings.sentry_auth_token:
+        log.warning("SENTRY_ORG is set but SENTRY_AUTH_TOKEN is empty — the whole "
+                    "Sentry lane is DISABLED until the token is provided.")
+    if settings.clickup_token and not settings.clickup_list_id and \
+            not any((w.get("clickup_list_id") or "").strip() for w in store.workspace_list()):
+        log.warning("CLICKUP_TOKEN is set but no list id is configured anywhere "
+                    "(CLICKUP_LIST_ID or a per-workspace list) — the ClickUp "
+                    "integration is DISABLED.")
     # first-run wizard (§14): a deployment that has already processed jobs is
     # not a first run — never greet an upgrading operator with onboarding
     if "setup_done" not in store.config_all() and store.job_count() > 0:
@@ -123,9 +138,10 @@ async def dashboard(request: Request):
             "<code>DASHBOARD_PASSWORD</code>) and restart.</p>", status_code=503)
     if current_user(request) is None:
         return RedirectResponse("login")  # relative: survives proxy prefixes
-    # brand subtitle follows the configured product name (docs/ENGINE.md §10)
+    # brand subtitle follows the configured product name (docs/ENGINE.md §10);
+    # a single-anchor replace keeps the page proxy-prefix-safe
     return _INDEX_HTML.replace(
-        "the Gumo Engine", f"the {html.escape(settings.product_name)} Engine", 1
+        "{{product_name}}", html.escape(settings.product_name), 1
     )
 
 
@@ -294,10 +310,11 @@ async def setup_status():
     store: JobStore = app.state.store
     reader = MemoryReader(settings)
     live_map = json.loads(settings.repo_map)
-    # a fresh install still carries the code-default Gumo context and repos —
-    # "configured" means the operator actually made them theirs (semantic
-    # compare: the workspace migration re-serializes the same default map)
-    default_map = validate_repo_map(json.loads(_default_settings.repo_map))
+    # a fresh install still carries the neutral code defaults — "configured"
+    # means the operator actually made them theirs (semantic compare: the
+    # workspace migration re-serializes the same default map). allow_empty:
+    # the neutral default map IS empty and that must not raise here.
+    default_map = validate_repo_map(json.loads(_default_settings.repo_map), allow_empty=True)
     steps = {
         "business_context": settings.business_context != _default_settings.business_context
                             or settings.product_name != _default_settings.product_name,
@@ -420,6 +437,12 @@ class TriggerBody(BaseModel):
 @app.post("/api/trigger")
 async def trigger(body: TriggerBody, user: dict = Depends(require_user)):
     """Manual fix trigger: Sentry issue id / short id / URL in, ClickUp ticket out."""
+    # guard BEFORE any Sentry API call (short-id resolution fires early too):
+    # an unconfigured integration is a clean 400, never a masked 404
+    if not settings.sentry_enabled:
+        raise HTTPException(
+            status_code=400,
+            detail="Sentry integration is not configured (SENTRY_ORG / SENTRY_AUTH_TOKEN)")
     worker: Worker = app.state.worker
     ref = body.issue.strip()
 

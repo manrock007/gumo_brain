@@ -17,7 +17,7 @@ def _worker(store, tmp_path, **over):
     return Worker(Settings(**kw), store)
 
 
-def _pr(store, url="https://github.com/manrock007/gumoserver/pull/5",
+def _pr(store, url="https://github.com/acme/demo/pull/5",
         job="feat-s1", state="in_review", rounds=1):
     store.insert(job, source="manual", kind="feature")
     store.pr_add(job, url)
@@ -293,7 +293,7 @@ class TestShepherdFixRun:
 
         monkeypatch.setattr(worker_mod, "prepare_feature_workspace", fake_ws)
         monkeypatch.setattr(worker_mod, "run_claude_raw", fake_run)
-        target = w.settings.target_for_repo("manrock007/gumoserver")
+        target = w.settings.target_for_repo("acme/demo")
 
         async def run():
             async with w.locks.for_repo(target.repo):  # a busy pipeline job
