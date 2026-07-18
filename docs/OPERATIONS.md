@@ -117,6 +117,13 @@ pre-upgrade backup is the rollback path.
 - **Disk**: clones under `workspaces/` are the growth driver; they are safe
   to delete when no run is active. Transcripts self-prune after
   `TRANSCRIPT_TTL_DAYS` (30), CLI sessions after `SESSION_TTL_DAYS` (14).
+- **Routines** (Epic I): the dashboard's **Routines panel** shows every
+  routine's scope, schedule, enabled state and run history, with a run-now
+  button. The builtin sweep/reaper/janitor rows derive their cadence from
+  the env (schedule shown as "from settings") unless you set an explicit
+  schedule; the reaper cannot be disabled. Stale inbox notices expire after
+  `INBOX_NOTICE_TTL_DAYS`; routine run history is pruned after
+  `ROUTINE_RUN_TTL_DAYS` (newest 20 per routine always kept).
 - **Locked account**: 5 consecutive bad passwords lock sign-in for 5
   minutes (`AUTH_LOCKOUT_ATTEMPTS` / `AUTH_LOCKOUT_SECONDS`). An admin
   password reset clears the lockout immediately.
@@ -303,6 +310,38 @@ quarantined until confirmed: never indexed for retrieval, never rendered
 into any prompt, excluded from the default `GET /api/decisions` view.
 Dismissals are remembered — the row is kept, so a re-scan can never
 re-propose it.
+
+## 11. Proactive routines (Epic I)
+
+All neutral, env-overridable; the schedule keys are **seed defaults only** —
+after first boot the routine ROW is authoritative (edit in the Routines
+panel or `PUT /api/routines/{id}`).
+
+| Env var | Default | Meaning |
+| --- | --- | --- |
+| `ROUTINES_ENABLED` | `true` | master flag for the PER-WORKSPACE routines (standup, memory upkeep, risk scan, proposal scan, planning) ONLY — the builtin sweep/reaper/janitor rows keep firing when off. Env-only; restart to flip. |
+| `ROUTINE_TICK_SECONDS` | `60` | scheduler tick cadence. |
+| `ROUTINE_TZ` | `UTC` | timezone (zoneinfo name) daily/weekly schedules evaluate in. |
+| `STANDUP_SCHEDULE` | `daily@09:00;days=mon,tue,wed,thu,fri` | seed schedule for the exception-only standup digest. |
+| `MEMORY_UPKEEP_SCHEDULE` | `daily@07:00` | seed schedule for memory upkeep. |
+| `RISK_SCAN_SCHEDULE` | `every:3600` | seed schedule for the risk scan. |
+| `PROPOSAL_SCAN_SCHEDULE` | `every:86400` | seed schedule for the proposal scan. |
+| `PLANNING_SCHEDULE` | `weekly@mon 09:00` | seed schedule for the weekly planning pack. |
+| `MEMORY_STALENESS_THRESHOLD` | `0` | commits-stale threshold that queues a memory refresh. **0 = memory upkeep inert** (opt-in spend). Per-routine `config.staleness_threshold` overrides. |
+| `MEMORY_UPKEEP_COOLDOWN_DAYS` | `7` | at most one auto refresh per repo per window (human bootstraps count). |
+| `RISK_SENTRY_SPIKE_EVENTS` | `0` | 24h event count that raises a Sentry-spike alert. **0 = off.** Absolute threshold (no baseline store in v1). |
+| `RISK_REDO_THRESHOLD` | `3` | redos on one stage of one job (rolling `AUTONOMY_WINDOW_DAYS`) that raise a trust-decay alert. |
+| `BUDGET_MONTHLY_USD` | `0` | instance fallback for the per-workspace `budget_monthly_usd` column (NULL = inherit). **0 = no budget** — spend alerts and the digest budget section stay inert. The substrate Epic G4 extends. |
+| `PROPOSAL_WINDOW_DAYS` | `30` | evidence window for the proposal lane + the dismissal recency guard. |
+| `PROPOSAL_FRICTION_MIN` | `3` | friction entries per (project, stage) before a process-improvement brief. |
+| `PROPOSAL_SENTRY_CLUSTER_MIN` | `3` | stored sentry jobs per (project, culprit head) before a hardening brief. |
+| `INBOX_NOTICE_TTL_DAYS` | `30` | open notices (risk alerts, notes, digests, packs) expire — visibly — after this. |
+| `ROUTINE_RUN_TTL_DAYS` | `90` | routine run-history retention (janitor; newest 20 per routine always kept). |
+
+Per-workspace: `budget_monthly_usd` (Settings → Workspaces or
+`PATCH /api/workspaces/{id}`; `""` = inherit the instance value, `0` = no
+budget). Slack copies of digests/packs use the workspace's existing
+`slack_webhook_url` — no new secret.
 
 ## Appendix — Example configuration: the original Gumo instance
 

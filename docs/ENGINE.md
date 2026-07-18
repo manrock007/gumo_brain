@@ -992,3 +992,151 @@ Postgres (same treatment as §15's auto-advance non-CAS note). The registry
 API's `q` search uses escaped LIKE rather than the FTS index — deliberate:
 the index excludes non-active rows, and a status-filtered registry search
 must not depend on it.
+
+## 17. Proactive routines & planning cadence (Epic I)
+
+The engine runs the team's operating rhythm and proposes work from signals
+it already holds. **The invariant line**: routines emit inbox items and
+parked candidates ONLY — never self-initiated pipelines; a routine NEVER
+invokes Claude, and the single sanctioned queue interaction is the memory-
+upkeep routine's `intake_memory` (a bootstrap that parks a draft PR for
+human review like any other — git stays truth).
+
+### The routine engine (I1)
+
+`routines` table: one row per (kind, scope); `routine_runs` is the
+INSERT-only history. The scheduler (`app/routines.py`, one asyncio task)
+ticks every `ROUTINE_TICK_SECONDS`, resolves each row's schedule
+(`every:<seconds>` — floored at 300, never a hot loop — |
+`daily@HH:MM[;days=…]` | `weekly@<day> HH:MM`, evaluated in `ROUTINE_TZ`
+via zoneinfo), and fires due rows through a **claim CAS on `last_run_at`**
+(single-flight per routine, correct today and load-bearing under Epic F2)
+plus an in-process in-flight guard. Each due handler runs as its **own
+asyncio task**, so a slow handler (the sweep's paginated Sentry HTTP) can
+never delay the reaper. Handler failures record `error` in the run history;
+the next due tick retries. `POST /api/routines/{id}/run` arms a fire
+through the scheduler task — handlers never run inline in an HTTP request.
+
+**Builtin rows** (instance-scoped, `workspace_id NULL`) generalize three of
+the hardcoded loops: `sweep`, `reaper`, `janitor`. They store `schedule=''`
+meaning *derive from live settings at each tick*
+(`SWEEP_INTERVAL_HOURS`, 300s, 86400s) — env contracts keep working after
+upgrade; an operator-edited non-empty schedule wins. Their handlers call
+the existing `_once` bodies unchanged. Effective-enabled = routine row AND
+the legacy settings flags (`sweep_enabled`+`sentry_enabled`) — either off
+means off — EXCEPT the **reaper, which is non-disableable** (the PUT
+endpoint refuses `enabled=false` and schedule edits; the scheduler ignores
+a hand-edited disable). A builtin row whose stored schedule fails to parse
+**falls back to its settings-derived default with a logged error** — never
+a silently dead reaper. At EVERY boot, `last_run_at` is bumped to now for
+the sweep/janitor rows (the settle-delay behavior; an explicit boot-time
+bump, distinct from the INSERT OR IGNORE seeding that preserves operator
+edits). **Deliberately NOT migrated**: the shepherd (it invokes Claude via
+its fix runs — the strongest reason a routine may not host it), plus
+`sla_forever`, `watch_forever`, `autonomy_forever` and the ClickUp poller
+(control-flow-adjacent, tight cadence, already flag-guarded).
+
+**Per-workspace rows** (seeded for every workspace, and at workspace
+creation): `standup_digest`, `memory_upkeep`, `risk_scan`, `proposal_scan`,
+`weekly_planning`. All enabled but inert-by-neutral-thresholds wherever
+they would spend anything — a fresh install gets visibility with zero token
+spend. `ROUTINES_ENABLED=false` silences ONLY these five; the builtin rows
+keep firing ('off' never means 'less safe'). A workspace routine whose
+schedule fails to parse is disabled fail-closed
+(`last_status='error: bad schedule'`) — never a guessed cadence.
+Fresh daily/weekly rows wait for their NEXT occurrence (no boot-fire of a
+missed slot). Schedules are seed defaults only — after seeding the routine
+ROW is authoritative (`PUT /api/routines/{id}`, audited in `admin_events`
+as `routine_config`). NOTE (Epic F1): the `COALESCE(workspace_id,-1)`
+unique expression index needs Postgres expression-index syntax review.
+
+### Inbox items (the substrate)
+
+Every routine output lands as a durable `inbox_items` row —
+`UNIQUE(kind, dedupe_key)` is BOTH the re-scan idempotence guard and the
+**dismissal memory**: rows are never deleted, so a dismissed key blocks
+re-insert forever; only a candidate whose contributing content changed
+(folded into the key) can surface again. Status is a single CAS transition
+`open → dismissed | adopted | expired` (409 to the loser); the row itself
+is the audit record. The janitor expires stale OPEN rows (risk alerts,
+notes, digests, packs) after `INBOX_NOTICE_TTL_DAYS` — visibly, never
+silently — and a fresh digest/pack expires its open predecessor directly.
+Item bodies are human-facing markdown; they are **fed to prompts only via
+adoption**, where the brief becomes `job.request` and takes the
+untrusted-fragment posture of a ClickUp description (delimited data, not
+instructions). Adoption (`POST /api/inbox/notices/{id}/adopt`) validates
+exactly like `POST /api/features` BEFORE the CAS resolve (mapped project +
+member project access), then runs the ordinary intake — the ONLY path from
+a proposal to a pipeline. An unexpected intake failure leaves the item
+`adopted` with the error recorded in refs (visible, auditable — never a
+silent un-adopt).
+
+### Standup digest (I2)
+
+Exception-only; a quiet day sends nothing (the run records `quiet`).
+Sections: gates overdue (ONE shared implementation of "overdue" —
+`inboxlib.gate_summary` — used by the API inbox too) + exhausted SLA
+flags, blocked/stalled pipelines, watch metrics trending off-goal
+mid-window, budget position (only when a budget is configured or spend is
+non-zero; pacing flag when the linear projection exceeds it), autonomy
+changes. `since` = the last ok/quiet run **floored at now−24h** (a first
+run or long outage never replays history). Deduped per workspace per local
+date; the Slack copy (workspace webhook, `notify_text`) goes out only on a
+NEW insert, strictly after the DB row.
+
+### Memory upkeep (I3)
+
+Threshold `MEMORY_STALENESS_THRESHOLD` (default 0 = inert; per-routine
+config override). Staleness comes from the cache the engine refreshes after
+every stage run — **an engine-idle repo's staleness is frozen** (verified
+limitation: the routine under-fires, the safe direction, but it will not
+catch exactly the most neglected repos; the no-cache/stale notes carry the
+cache's `fetched_at` age for this reason). Bounded one refresh per repo per
+`MEMORY_UPKEEP_COOLDOWN_DAYS` (human bootstraps count toward the bound),
+skipped visibly at the daily run cap or a spent monthly budget.
+
+### Risk surfacing (I4)
+
+`risk_scan` emits attributed, deduplicated `risk_alert` items: Sentry 24h
+velocity spikes (`RISK_SENTRY_SPIKE_EVENTS`, 0 = off; an ABSOLUTE count —
+no historical snapshot store in v1, recorded limitation; one alert per
+issue per day), mid-window regressing watch metrics
+(`outcome.mid_window_trend`: needs a numeric target with an unambiguous
+direction, ≥3 current-window readings and half the window elapsed —
+anything else is `insufficient`, never a guess; one alert per watch window,
+`/redo` re-arms), repeated redos on the same TARGET stage
+(`RISK_REDO_THRESHOLD`; a higher count re-alerts, the same count never
+repeats), and spend pacing (projection only after day 7 of the month OR
+≥50% of the budget spent; the pct-bucketed key 100/120/150 means an early
+alert cannot consume the month). The per-workspace `budget_monthly_usd`
+column (NULL = inherit `BUDGET_MONTHLY_USD`; 0 = no budget) is the
+substrate Epic G4 extends into the warn/block ladder.
+
+### Proposal lane (I5)
+
+Friction is engine data: `FRICTION:` protocol lines land in the
+`frictions` table at harvest (OUTSIDE the ClickUp field-sync gate — the
+row is the record, the mirror stays visibility) and human redos write rows
+unconditionally. `proposal_scan` emits parked candidate **briefs**
+(why-now, evidence, suggested next step) from four sources: decided
+flat/regressed outcomes with no live successor (the lane beyond B4's single
+Iterate gate; the key folds verdict + learning), friction groups per
+(project, stage) with **count-bucketed keys** (3-5 / 6-10 / 11+ — a
+dismissal holds until the pain measurably grows), Sentry clusters over the
+stored `jobs.culprit` head (stamped at sentry intake; pre-upgrade rows have
+`culprit=''`, so clusters accumulate from upgrade forward), and stale
+high-traffic memory areas (monotone staleness tiers 1x/2x/5x/10x; proposed
+only where the upkeep routine won't act itself). A source-signature recency
+guard additionally suppresses any same-signature proposal younger than
+`PROPOSAL_WINDOW_DAYS` regardless of status — dismissals are remembered.
+
+### Weekly planning pack (I6)
+
+Assembled mechanically (no model run): receipts this week vs last (open
+runs excluded from every denominator — Epic C1's column semantics; median
+gate wait; redo rate over answered gates) with trend arrows, outcome-ledger
+movement, autonomy shifts, open proposals, and the deterministic "what I'd
+do next lap" ranking (regressed outcomes → risk-linked clusters → friction
+count desc → age), with the formula stated in the pack body (the §15
+transparency posture). Carried by `GET /api/inbox` — no bespoke endpoint
+(deliberate). ISO-week deduped; predecessor packs expire on the new insert.

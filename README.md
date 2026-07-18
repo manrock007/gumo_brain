@@ -97,7 +97,27 @@ rename/infra checklist.
 - `GET /api/inbox` — the per-person "Awaiting you" queue: gates you own +
   unassigned gates, overdue first (per-workspace `gate_sla_hours` SLA); plus
   `candidates` — parked Slack decision candidates awaiting confirm/dismiss
-  (additive; `counts.mine` still counts gates only)
+  (additive; `counts.mine` still counts gates only) — and `notices` —
+  durable proactive-routine outputs (risk alerts, proposal briefs, standup
+  digests, weekly planning packs; Epic I, docs/ENGINE.md §17) with
+  `counts.notices`
+- `POST /api/inbox/notices/{id}/dismiss` — `{reason?}`; the row is KEPT
+  (dismissal memory — the engine never re-proposes a rejected idea
+  unchanged); CAS, 409 on a lost race
+- `POST /api/inbox/notices/{id}/adopt` — proposals only: `{as:
+  feature|task, project, title?, request?, founder_dri?, dev_dri?,
+  success_metric?, metric_target?, metric_window_days?}` — validates like
+  `POST /api/features` BEFORE resolving, then runs the ordinary intake
+  (job `feat-prop-<id>` / `task-prop-<id>`); the ONLY path from a proposal
+  to a pipeline
+- `GET /api/routines` — the routine engine (Epic I1): membership-scoped
+  routine table (kind, scope, schedule, enabled, last run) + run history;
+  instance (builtin sweep/reaper/janitor) rows admin-only
+- `PUT /api/routines/{id}` — admin: `{enabled?, schedule?, config?}`;
+  schedules validate fail-closed; the reaper is non-disableable and its
+  schedule locked; audited in `admin_events`
+- `POST /api/routines/{id}/run` — admin: arm an immediate fire through the
+  scheduler task (never inline in the request)
 - `GET /api/people` — who owns what (Epic D1): person role, ownership areas,
   decision-authority tags. Members see only people covering their own
   workspaces; profiles are edited by admins via `PATCH /api/users/{u}`

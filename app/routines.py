@@ -603,17 +603,20 @@ class RoutineScheduler:
 
     async def run_forever(self):
         log.info("routine scheduler started (%d registered kinds)", len(REGISTRY))
+        # sleep-first, like the loops this engine replaced: the boot settle
+        # belongs to the boot bump + _recover_interrupted, not a dispatch
+        # storm in the first event-loop tick. request_run wakes us early.
         while True:
-            try:
-                self._dispatch_due()
-            except Exception:
-                log.exception("routine tick failed")
             try:
                 await asyncio.wait_for(self._wake.wait(),
                                        timeout=self.settings.routine_tick_seconds)
                 self._wake.clear()
             except asyncio.TimeoutError:
                 pass
+            try:
+                self._dispatch_due()
+            except Exception:
+                log.exception("routine tick failed")
 
     # -- internals --
 
