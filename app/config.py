@@ -315,6 +315,32 @@ class Settings(BaseSettings):
     inbox_notice_ttl_days: int = 30
     routine_run_ttl_days: int = 90
 
+    # ---- SSO / identity (Epic E1) — all neutral/off by default ----
+    oidc_enabled: bool = False
+    oidc_issuer: str = ""            # https://…/  (discovery at {issuer}/.well-known/openid-configuration)
+    oidc_client_id: str = ""
+    oidc_client_secret: str = ""     # SECRET — never in any API response or log
+    oidc_redirect_url: str = ""      # the registered callback, e.g. https://host/auth/oidc/callback
+    oidc_scopes: str = "openid email profile"
+    oidc_role_claim: str = ""        # claim carrying group/role info (e.g. 'groups')
+    oidc_role_map: str = "{}"        # JSON {claim_value: role}
+    oidc_default_role: str = "member"
+    oidc_admin_group: str = ""       # membership -> instance_admin
+    oidc_role_sync: bool = True      # re-map role on repeat login (never demotes the last admin)
+    saml_enabled: bool = False       # SCAFFOLD — interface only
+    scim_enabled: bool = False       # SCAFFOLD — interface only
+    scim_token: str = ""             # SECRET
+    # Break-glass: local password login can never be turned off in a way that
+    # locks out. False only HIDES the login form; verify_login still honors any
+    # local-provider account with a usable password (auth.is_break_glass).
+    ctrlloop_local_login: bool = True
+
+    @property
+    def oidc_configured(self) -> bool:
+        """Fail-closed: partial/unknown config disables OIDC entirely."""
+        return bool(self.oidc_enabled and self.oidc_issuer and self.oidc_client_id
+                    and self.oidc_client_secret and self.oidc_redirect_url)
+
     # ---- Audit log (Epic E4) ----
     # Max rows per /api/audit/export page (cursor-paged JSONL for SIEM).
     audit_export_page_size: int = 500

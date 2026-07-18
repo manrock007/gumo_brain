@@ -603,6 +603,10 @@ class JobStore:
             # index creation is always safe.
             c.execute("""CREATE UNIQUE INDEX IF NOT EXISTS idx_users_clickup_id
                          ON users(clickup_user_id) WHERE clickup_user_id != ''""")
+            # Epic E1: one external identity ↔ one user (partial — empty
+            # external_id rows, i.e. every local account, are exempt).
+            c.execute("""CREATE UNIQUE INDEX IF NOT EXISTS idx_users_external_id
+                         ON users(auth_provider, external_id) WHERE external_id != ''""")
             # Epic D4: the memory-retrieval index lives beside the data it
             # mirrors. SQLite built without FTS5 (exotic) degrades to ABSENT
             # retrieval — fail-open ONLY for a read enhancement: no control
@@ -944,6 +948,28 @@ class JobStore:
                 "SELECT * FROM users WHERE clickup_user_id = ? AND disabled = 0 LIMIT 2",
                 (cu_id,)).fetchall()
             return dict(rows[0]) if len(rows) == 1 else None
+
+    def user_by_external_id(self, provider: str, external_id: str) -> dict | None:
+        """The user an IdP identity maps to (Epic E1). Keyed on
+        (auth_provider, external_id) — the ONLY auto-link key for SSO."""
+        external_id = (external_id or "").strip()
+        if not external_id:
+            return None
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM users WHERE auth_provider = ? AND external_id = ? LIMIT 1",
+                (provider, external_id)).fetchone()
+            return dict(row) if row else None
+
+    def instance_admin_count(self, enabled_only: bool = True) -> int:
+        """Instance admins (Epic E1/E3 — accept both legacy 'admin' and
+        'instance_admin' during the E3 transition). Guards 'never demote the
+        last admin'."""
+        q = "SELECT COUNT(*) AS n FROM users WHERE role IN ('admin','instance_admin')"
+        if enabled_only:
+            q += " AND disabled = 0"
+        with self._conn() as c:
+            return c.execute(q).fetchone()["n"]
 
     def any_clickup_mapping(self) -> bool:
         """Does ANY enabled user carry a ClickUp mapping? Drives the 'auto'

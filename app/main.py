@@ -21,10 +21,12 @@ from pydantic import BaseModel
 
 from .auth import (
     SESSION_COOKIE,
+    SSOConflict,
     bootstrap_admin,
     current_user,
     hash_password,
     issue_session,
+    jit_provision,
     require_admin,
     require_user,
     revoke_session,
@@ -37,7 +39,7 @@ from .feature_prompts import stage_name
 from .fixer import ensure_session_store
 from .memory import MemoryReader
 from .sentry_api import extract_issue_ref, verify_signature
-from . import audit, autonomy, inboxlib, people, roles, routines
+from . import audit, autonomy, identity, inboxlib, people, roles, routines
 from .worker import GateConflict, GateForbidden, Worker
 from .workspaces import WorkspaceError, WorkspaceNotFound, WorkspaceService
 from . import transcripts
@@ -133,6 +135,8 @@ async def lifespan(app: FastAPI):
     app.state.store = store
     app.state.worker = worker
     app.state.scheduler = scheduler
+    # Epic E1: resolve configured identity providers (Local is always present).
+    app.state.identity_providers = identity.registry(settings)
     yield
     for t in tasks:
         t.cancel()
@@ -248,6 +252,77 @@ async def logout(request: Request, response: Response):
         revoke_session(app.state.store, token)
     response.delete_cookie(SESSION_COOKIE, path="/")
     return {"ok": True}
+
+
+def _providers():
+    return getattr(app.state, "identity_providers", None) or identity.registry(settings)
+
+
+def _oidc_provider():
+    for p in _providers():
+        if p.name == "oidc":
+            return p
+    return None
+
+
+@app.get("/api/auth/providers")
+async def auth_providers():
+    """PUBLIC — powers the login page's SSO buttons. Never leaks any secret."""
+    out = []
+    for p in _providers():
+        if p.name == "local":
+            out.append({"name": "local", "kind": "password", "login_url": ""})
+        elif p.name == "oidc":
+            out.append({"name": "oidc", "kind": "browser_redirect",
+                        "login_url": "login/oidc"})
+    return {"providers": out,
+            "local_login_form": settings.ctrlloop_local_login}
+
+
+@app.get("/login/oidc")
+async def login_oidc(request: Request):
+    provider = _oidc_provider()
+    if provider is None:
+        raise HTTPException(status_code=404, detail="OIDC is not configured")
+    state, nonce = identity.new_state_nonce()
+    try:
+        endpoint, params = provider.authorize_params(settings, state, nonce)
+    except Exception as e:
+        log.warning("OIDC authorize failed: %s", type(e).__name__)
+        return RedirectResponse("login?error=oidc")
+    app.state.store.oidc_txn_create(state, nonce, redirect_after="/")
+    from urllib.parse import urlencode
+    return RedirectResponse(f"{endpoint}?{urlencode(params)}")
+
+
+@app.get("/auth/oidc/callback")
+async def oidc_callback(request: Request, response: Response,
+                        code: str = "", state: str = ""):
+    provider = _oidc_provider()
+    store: JobStore = app.state.store
+    if provider is None or not code or not state:
+        return RedirectResponse("../login?error=oidc")
+    txn = store.oidc_txn_take(state)
+    if txn is None:  # unknown / replayed / expired -> fail closed
+        return RedirectResponse("../login?error=state")
+    try:
+        claims = provider.exchange_and_validate(settings, code, txn["nonce"])
+        user = jit_provision(store, settings, provider, claims)
+    except SSOConflict as e:
+        log.warning("OIDC conflict: %s", e)
+        return RedirectResponse("../login?error=conflict")
+    except Exception as e:
+        log.warning("OIDC callback failed: %s", type(e).__name__)
+        return RedirectResponse("../login?error=oidc")
+    token = issue_session(store, settings, user)
+    audit.record(store, audit.LOGIN, actor=f"oidc:{user['username']}",
+                 actor_kind="user", target=user["username"], channel="oidc",
+                 detail={"method": "oidc"})
+    resp = RedirectResponse("../")
+    resp.set_cookie(SESSION_COOKIE, token, httponly=True, samesite="lax",
+                    secure=settings.session_cookie_secure,
+                    max_age=settings.auth_session_ttl_days * 86400, path="/")
+    return resp
 
 
 @app.get("/api/me")

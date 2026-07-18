@@ -140,6 +140,69 @@ def verify_login(store: JobStore, settings: Settings,
 _DUMMY_HASH = hash_password("ctrlloop-timing-dummy")
 
 
+class SSOConflict(Exception):
+    """An SSO login's email/username matches an existing LOCAL account. We NEVER
+    auto-adopt a local account (that could hijack an admin's break-glass); the
+    conflict is surfaced for manual linking instead."""
+
+
+def jit_provision(store: JobStore, settings: Settings, provider, claims: dict) -> dict:
+    """Resolve an SSO login to a CtrlLoop user, creating one on first sight.
+
+    Auto-link ONLY on the IdP-stable external_id (Epic E1, blocker 6): an
+    email/username collision with a LOCAL account is a conflict, never an
+    adoption — we must never overwrite a local user's pw_hash/auth_provider,
+    which would kill their break-glass password or silently take over the admin.
+    On repeat login, role-sync (OIDC_ROLE_SYNC) re-maps the role EXCEPT it never
+    demotes the last enabled instance_admin and never touches a local-provider
+    admin at all."""
+    external_id = (claims.get("external_id") or "").strip()
+    if not external_id:
+        raise SSOConflict("SSO claim has no stable subject id (sub)")
+    existing = store.user_by_external_id(provider.name, external_id)
+    role = provider.jit_role(claims, settings)
+    if existing is not None:
+        _maybe_role_sync(store, existing, role, settings)
+        return store.user_get(existing["username"])
+    # No external_id match. A local account with the same email/username must
+    # NOT be adopted — surface the conflict for an admin to link deliberately.
+    email = (claims.get("email") or "").strip()
+    username = (claims.get("username") or "").strip() or email or external_id
+    for candidate in (username, email):
+        if not candidate:
+            continue
+        clash = store.user_get(candidate)
+        if clash is not None and (clash.get("auth_provider") or "local") == "local":
+            raise SSOConflict(
+                f"an existing local account '{clash['username']}' matches this SSO "
+                f"identity — an admin must link it (never auto-adopted)")
+    # unique the username against any non-local collision
+    final_username = username
+    if store.user_get(final_username) is not None:
+        final_username = f"{username}-{external_id[:6]}"
+    user = store.user_create(final_username, UNUSABLE_PW, role=role,
+                             must_change_pw=False)
+    store.user_set(final_username, auth_provider=provider.name,
+                   external_id=external_id, email=email)
+    log.info("jit-provisioned SSO user '%s' (provider=%s, role=%s)",
+             final_username, provider.name, role)
+    return store.user_get(final_username)
+
+
+def _maybe_role_sync(store: JobStore, user: dict, new_role: str, settings: Settings):
+    if not settings.oidc_role_sync or new_role == user.get("role"):
+        return
+    # never demote a local-provider admin via SSO role-sync
+    if (user.get("auth_provider") or "local") == "local":
+        return
+    demoting = _is_instance_admin(user) and new_role != "instance_admin"
+    if demoting and store.instance_admin_count(enabled_only=True) <= 1:
+        log.warning("SSO role-sync refused: would demote the last instance_admin '%s'",
+                    user["username"])
+        return
+    store.user_set(user["username"], role=new_role)
+
+
 def issue_session(store: JobStore, settings: Settings, user: dict) -> str:
     """New cookie token for a verified user; only its hash is stored."""
     token = secrets.token_urlsafe(32)
