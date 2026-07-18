@@ -136,6 +136,8 @@ class PostgresDriver(DBDriver):
         from psycopg.rows import dict_row
         from psycopg_pool import ConnectionPool
 
+        self._psycopg = psycopg
+        self._dsn = dsn
         self.IntegrityError = psycopg.errors.IntegrityError
         self.OperationalError = psycopg.OperationalError
 
@@ -159,10 +161,12 @@ class PostgresDriver(DBDriver):
         with self._pool.connection() as conn:
             yield _PgConn(conn)
 
-    def advisory_conn(self):
-        """A dedicated pooled connection for session-level advisory locks
-        (Epic F2 repolocks). Returns the pool's connection context manager."""
-        return self._pool.connection()
+    def lock_connection(self):
+        """A standalone autocommit connection for session-level advisory locks
+        (Epic F2 repolocks). Deliberately NOT from the query pool: a per-repo
+        advisory lock is held for the whole duration of a Claude run, so holding
+        a pooled connection would starve queries. The caller owns closing it."""
+        return self._psycopg.connect(self._dsn, autocommit=True)
 
 
 def resolve_driver(settings) -> DBDriver:

@@ -126,8 +126,14 @@ class Worker:
         self._seq = itertools.count()
         self.sentry = SentryClient(settings)
         self.clickup = ClickUp(settings)
-        self.locks = RepoLocks()
+        # Epic F2: SQLite → in-process asyncio locks (single consumer); Postgres
+        # → cross-process advisory locks (multi-worker safe).
+        from .repolocks import resolve_locks
+        self.locks = resolve_locks(store)
+        self.worker_id = settings.resolved_worker_id()
         self.engine = Engine(settings, store, self.clickup, locks=self.locks)
+        # F4: heartbeat updated each run-loop iteration; /health/ready reads it.
+        self.last_tick: float = time.time()
         self.workspaces = None  # WorkspaceService, injected at startup (main.lifespan)
         # strong refs for fire-and-forget background tasks (outcome memory PRs) —
         # bare create_task results can be GC'd mid-flight (same as main._chat_tasks)
@@ -314,20 +320,50 @@ class Worker:
 
     # ---------- main loop ----------
 
+    async def _next_job(self) -> tuple[dict, float | None] | None:
+        """Fetch the next job to run. Returns (job, queued_at) ready to process,
+        or None (a stale wakeup / idle poll — caller loops).
+
+        - SQLite (default): the in-process priority queue is the dispatch
+          source. A wakeup is validated against the DB row (received/queued).
+        - Postgres (multi-worker): the DB claim is authoritative — the asyncio
+          queue is NOT drained as a parallel dispatch source (that would
+          double-dispatch the same job). We poll claim_next_job, which
+          atomically advances the row to 'running' + stamps claimed_by."""
+        if self.settings.multi_worker:
+            job = self.store.claim_next_job(self.worker_id)
+            if job is None:
+                await asyncio.sleep(max(1, self.settings.job_poll_interval_seconds))
+                return None
+            return job, job.get("claimed_at")
+        _, _, job_id, queued_at = await self.queue.get()
+        try:
+            job = self.store.get(job_id)
+            if job is None or job["status"] not in ("received", "queued"):
+                return None  # stale wakeup — the DB row moved on
+            return job, queued_at
+        finally:
+            self.queue.task_done()
+
     async def run_forever(self):
         await self.clickup.load_statuses()
-        # SQLite is the queue of record: re-enqueue whatever a restart dropped
-        for job in self.store.requeueable():
-            self._enqueue(job["issue_id"], self._priority_for(job))
-            log.info("startup requeue: %s (%s)", job["issue_id"], job["status"])
+        # SQLite is the queue of record: re-enqueue whatever a restart dropped.
+        # On Postgres the DB claim loop is authoritative — no in-process queue.
+        if not self.settings.multi_worker:
+            for job in self.store.requeueable():
+                self._enqueue(job["issue_id"], self._priority_for(job))
+                log.info("startup requeue: %s (%s)", job["issue_id"], job["status"])
         await self._recover_interrupted()
-        log.info("worker started")
+        log.info("worker started (id=%s, backend=%s)", self.worker_id,
+                 self.settings.db_backend)
         while True:
-            _, _, job_id, queued_at = await self.queue.get()
+            self.last_tick = time.time()  # F4 heartbeat
+            nxt = await self._next_job()
+            if nxt is None:
+                continue
+            job, queued_at = nxt
+            job_id = job["issue_id"]
             try:
-                job = self.store.get(job_id)
-                if job is None or job["status"] not in ("received", "queued"):
-                    continue  # stale wakeup — the DB row moved on
                 await self._process(job, queued_at)
             except Exception as e:
                 log.exception("job %s failed", job_id)
@@ -338,20 +374,34 @@ class Worker:
                     f"{GATE_PREFIX} internal error on this job: {str(e)[:500]}",
                 )
             finally:
-                self.queue.task_done()
+                if self.settings.multi_worker:
+                    self.store.release_claim(job_id)  # done: drop ownership
 
     async def _recover_interrupted(self):
-        """Boot-time crash recovery: at startup NO run can legitimately be
-        'running' — the CLI subprocess dies with the process (deploys restart
-        the container mid-run). Requeue those corpses immediately instead of
-        letting the stale-run reaper surface them as errors an hour later;
-        the stage/phase machinery re-runs them cleanly (attempts bump, fresh
-        checkout). The reaper stays for mid-life zombies in a live process."""
-        for job in self.store.by_status(["running"]):
-            self.store.set_status(
-                job["issue_id"], "queued",
-                detail="recovered: a restart interrupted the previous run — re-running")
-            self._enqueue(job["issue_id"], self._priority_for(job))
+        """Boot-time crash recovery: at startup NO run this worker owns can
+        legitimately be 'running' — the CLI subprocess dies with the process
+        (deploys restart the container mid-run). Requeue those corpses
+        immediately instead of letting the stale-run reaper surface them as
+        errors an hour later; the stage/phase machinery re-runs them cleanly
+        (attempts bump, fresh checkout).
+
+        Epic F2: with multiple live workers, a blanket reset of EVERY 'running'
+        row would corrupt a sibling's in-flight run. On Postgres recovery is
+        SCOPED to this worker's own claims (claimed_by == worker_id); cross-
+        worker zombies are left to the reaper (run_started_at + grace). SQLite
+        (single consumer) keeps the blanket reset."""
+        if self.settings.multi_worker:
+            recovered = self.store.recover_worker_claims(self.worker_id)
+        else:
+            recovered = []
+            for job in self.store.by_status(["running"]):
+                self.store.set_status(
+                    job["issue_id"], "queued",
+                    detail="recovered: a restart interrupted the previous run — re-running")
+                recovered.append(job)
+        for job in recovered:
+            if not self.settings.multi_worker:
+                self._enqueue(job["issue_id"], self._priority_for(job))
             log.info("startup recovery: requeued interrupted run %s", job["issue_id"])
             await self.clickup.comment(
                 job.get("clickup_task_id") or "",

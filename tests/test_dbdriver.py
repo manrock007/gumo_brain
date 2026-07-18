@@ -123,15 +123,16 @@ def test_every_migrations_column_in_alembic_baseline():
     """Static guard: every additive MIGRATIONS column name must appear in the
     committed Alembic baseline, so the two schema definitions cannot silently
     diverge even when TEST_DATABASE_URL is unset."""
+    import glob
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    baseline = os.path.join(here, "migrations", "versions", "0001_baseline.py")
-    text = open(baseline).read()
+    versions = glob.glob(os.path.join(here, "migrations", "versions", "*.py"))
+    text = "\n".join(open(p).read() for p in versions)
     missing = []
     for table, cols in MIGRATIONS.items():
         for col in cols:
             if col not in text:
                 missing.append(f"{table}.{col}")
-    assert not missing, f"MIGRATIONS columns absent from Alembic baseline: {missing}"
+    assert not missing, f"MIGRATIONS columns absent from Alembic revisions: {missing}"
 
 
 def test_baseline_carries_core_tables_and_indexes():

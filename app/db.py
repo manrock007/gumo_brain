@@ -540,6 +540,12 @@ MIGRATIONS = {  # table -> columns added after that table first shipped (in-plac
         # over-budget stage proceed, then is consumed (cleared) by the engine so
         # the next over-budget stage re-parks. Default 0 = enforce the budget.
         "budget_override": "INTEGER NOT NULL DEFAULT 0",
+        # Epic F2: multi-worker DB-claim queue (Postgres only). claimed_by is
+        # the worker that owns an in-flight run (default '' = unclaimed); boot
+        # crash recovery is scoped to a worker's own claims. Neutral defaults —
+        # SQLite never touches the claim path and existing rows are unaffected.
+        "claimed_by": "TEXT NOT NULL DEFAULT ''",
+        "claimed_at": "REAL",
     },
     "users": {
         "clickup_user_id": "TEXT NOT NULL DEFAULT ''",  # Epic A1: ClickUp id ↔ CtrlLoop identity
@@ -851,6 +857,65 @@ class JobStore:
     def requeueable(self) -> list[dict]:
         """Jobs that must be re-enqueued on startup — SQLite is the queue of record."""
         return self.by_status(["received", "queued"])
+
+    def claim_next_job(self, worker_id: str) -> dict | None:
+        """Epic F2 (Postgres only): atomically claim the highest-priority
+        received/queued job for this worker. ONE statement removes the row from
+        the candidate set — it advances status to 'running', stamps claimed_by
+        and run_started_at — so a second worker can never re-claim it (the
+        double-dispatch window the design's blocker called out). SKIP LOCKED
+        skips rows another worker is mid-claim on.
+
+        Priority mirrors worker._priority_for: live sentry (0) > human (1) >
+        sweep (2), then oldest updated_at first. Watch jobs (status='watching')
+        are never candidates by construction.
+
+        On SQLite this returns None — SQLite keeps the single-consumer in-memory
+        queue and never calls this path."""
+        if self._driver.backend != "postgres":
+            return None
+        now = time.time()
+        prio = ("CASE WHEN kind='sentry' AND source='sweep' THEN 2 "
+                "WHEN kind='sentry' THEN 0 ELSE 1 END")
+        with self._conn() as c:
+            row = c.execute(
+                f"""UPDATE jobs SET status='running', claimed_by=?, claimed_at=?,
+                        run_started_at=?, updated_at=?
+                    WHERE issue_id = (
+                        SELECT issue_id FROM jobs
+                        WHERE status IN ('received','queued') AND claimed_by=''
+                        ORDER BY {prio}, updated_at
+                        FOR UPDATE SKIP LOCKED
+                        LIMIT 1)
+                    RETURNING *""",
+                (worker_id, now, now, now),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def recover_worker_claims(self, worker_id: str) -> list[dict]:
+        """Epic F2: boot crash recovery SCOPED to one worker's own in-flight
+        runs. A restart of the same worker reclaims only the corpses it left
+        ('running' rows it had claimed) — cross-worker zombies are left to the
+        reaper (run_started_at + grace), so a live sibling's run is never
+        corrupted. Returns the rows reset to 'queued' (claim cleared)."""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM jobs WHERE status='running' AND claimed_by=?",
+                (worker_id,)).fetchall()
+            recovered = [dict(r) for r in rows]
+            for r in recovered:
+                c.execute(
+                    "UPDATE jobs SET status='queued', claimed_by='', claimed_at=NULL, "
+                    "updated_at=? WHERE issue_id=?",
+                    (time.time(), r["issue_id"]))
+        return recovered
+
+    def release_claim(self, issue_id: str):
+        """Clear a job's claim (best-effort; used when a claimed job finishes or
+        is handed back so a later reaper/recovery doesn't treat it as owned)."""
+        with self._conn() as c:
+            c.execute("UPDATE jobs SET claimed_by='', claimed_at=NULL WHERE issue_id=?",
+                      (issue_id,))
 
     def stale_running(self, older_than_seconds: float) -> list[dict]:
         cutoff = time.time() - older_than_seconds

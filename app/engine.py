@@ -72,31 +72,11 @@ CHAT_TOOLS = ["Read", "Grep", "Glob"]
 CHAT_DENIED_TOOLS = ["Edit", "Write", "NotebookEdit", "Bash", "WebFetch", "WebSearch"]
 
 
-class RepoLocks:
-    """One asyncio.Lock per repo workspace. Every workspace toucher — stage runs,
-    sentry/task fixes, memory bootstraps, chat runs, canonical product-scope reads —
-    must hold the repo's lock. In-process: the service MUST run single-process
-    (uvicorn workers=1; see deploy wiring)."""
-
-    def __init__(self):
-        self._locks: dict[str, asyncio.Lock] = {}
-        # Concurrent claude invocations sharing a config dir must serialize — the
-        # CLI read-modify-writes its state files per invocation (docs/
-        # CONVERSATIONS.md §4). claude_global guards the stage/default store
-        # (which is ~/.claude when session_persistence is off — and chat is the
-        # first concurrent invoker this service ever had); chat_global guards the
-        # dedicated artifact-primed chat store used when persistence is on.
-        self.claude_global = asyncio.Lock()
-        self.chat_global = asyncio.Lock()
-
-    def for_repo(self, repo: str) -> asyncio.Lock:
-        if repo not in self._locks:
-            self._locks[repo] = asyncio.Lock()
-        return self._locks[repo]
-
-    def is_busy(self, repo: str) -> bool:
-        lock = self._locks.get(repo)
-        return bool(lock and lock.locked())
+# Epic F2: RepoLocks became a backend-aware seam (app/repolocks.py). The
+# default is the in-process asyncio-lock backend (unchanged, single-process /
+# SQLite); Postgres deployments get cross-process advisory locks. Re-exported
+# here so existing `from .engine import RepoLocks` call sites keep working.
+from .repolocks import InProcessRepoLocks as RepoLocks  # noqa: E402,F401
 
 # PR_LINE_RE (the strict `PR_URL:` line matcher) lives in fixer.py — one
 # definition for both the feature pipeline and the v1 lifecycle capture.
