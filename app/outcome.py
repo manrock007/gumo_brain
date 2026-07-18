@@ -127,6 +127,38 @@ def compute_verdict(readings: list[dict], target_text: str,
     return v, inputs
 
 
+def mid_window_trend(readings: list[dict], target_text: str, window_days: int,
+                     flat_band_pct: int) -> str:
+    """'on_track' | 'regressing' | 'insufficient' — the mid-window risk read
+    (Epic I4; the standup digest reuses it). Transparent, fail-closed:
+
+    - requires ≥3 successful readings of the CURRENT window (callers filter
+      by window_start — a /redo re-arms a new window) AND elapsed days ≥ half
+      the window;
+    - requires a NUMERIC target with an UNAMBIGUOUS direction (same parsing
+      as compute_verdict) — anything else is 'insufficient', never a guess;
+    - projects the window-to-date total linearly (observed / elapsed_days ×
+      window_days) and flags 'regressing' only when the projection misses the
+      target beyond the flat band, in the goal direction.
+    """
+    band = max(0, int(flat_band_pct or 0)) / 100.0
+    target = parse_target(target_text)
+    direction = parse_direction(target_text)
+    measured = [r for r in readings if r.get("observed") is not None
+                and r.get("window_day") is not None]
+    if target is None or direction == "" or len(measured) < 3:
+        return "insufficient"
+    window_days = max(1, int(window_days or 1))
+    last = measured[-1]
+    elapsed = max(1, int(last["window_day"]))
+    if elapsed * 2 < window_days:
+        return "insufficient"  # too early to call
+    projection = float(last["observed"]) / elapsed * window_days
+    if direction == "down":
+        return "regressing" if projection > target * (1 + band) else "on_track"
+    return "regressing" if projection < target * (1 - band) else "on_track"
+
+
 VERDICT_ICON = {"moved": "📈", "flat": "➖", "regressed": "📉", "unmeasured": "❔"}
 
 

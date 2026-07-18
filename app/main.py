@@ -37,7 +37,7 @@ from .feature_prompts import stage_name
 from .fixer import ensure_session_store
 from .memory import MemoryReader
 from .sentry_api import extract_issue_ref, verify_signature
-from . import autonomy, people, roles, routines
+from . import autonomy, inboxlib, people, roles, routines
 from .worker import GateConflict, GateForbidden, Worker
 from .workspaces import WorkspaceError, WorkspaceNotFound, WorkspaceService
 from . import transcripts
@@ -622,15 +622,11 @@ async def inbox(user: dict = Depends(require_user)):
     for job in store.awaiting_gates():
         if not svc.user_can_access(user, job.get("workspace_id")):
             continue
-        ws = svc.for_job(job)
-        owner = roles.gate_owner(store, settings, ws, job)
-        stage = int(job.get("stage") or 0)
-        feature = (job.get("kind") or "") == "feature"
-        gate_posted = store.latest_gate_posted(job["issue_id"], stage)
-        sla = ws["gate_sla_hours"] if ws and ws.get("gate_sla_hours") is not None \
-            else settings.gate_sla_hours
-        due_at = (gate_posted + sla * 3600) if (sla and gate_posted) else None
-        overdue = bool(due_at and now > due_at)
+        # Epic I2: the shared user-independent summary (one implementation of
+        # "overdue" for the inbox AND the standup digest); the per-user fields
+        # (is_you / mine-filtering) stay here — the digest has no acting user.
+        item, owner = inboxlib.gate_summary(store, settings, svc.for_job(job),
+                                            job, now)
         enforced = owner is not None and owner.enforce
         is_you = roles.actor_is_owner(owner, user) if enforced else False
         unassigned = not enforced
@@ -638,18 +634,10 @@ async def inbox(user: dict = Depends(require_user)):
             continue
         if unassigned:
             unassigned_n += 1
-        items.append({
-            "issue_id": job["issue_id"], "title": job.get("title") or job["issue_id"],
-            "kind": job.get("kind") or "sentry", "status": job["status"],
-            "project": job.get("project") or "", "workspace_id": job.get("workspace_id"),
-            "stage": stage, "stage_name": stage_name(stage) if feature else "",
-            "question": (job.get("question") or "")[:300],
-            "updated_at": job.get("updated_at"),
+        items.append(item | {
             "gate_owner": ({"role": owner.role, "display": owner.display,
                             "is_you": is_you} if enforced else None),
             "unassigned": unassigned,
-            "gate_posted_at": gate_posted, "sla_hours": sla or 0,
-            "overdue": overdue, "due_at": due_at,
         })
     items.sort(key=lambda i: (not i["overdue"], i["gate_posted_at"] or 0))
     # Epic D3: parked Slack decision candidates — inbox material awaiting a

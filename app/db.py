@@ -1463,6 +1463,13 @@ class JobStore:
             )
             return cur.rowcount == 1
 
+    def inbox_item_by_key(self, kind: str, dedupe_key: str) -> dict | None:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM inbox_items WHERE kind = ? AND dedupe_key = ?",
+                (kind, dedupe_key)).fetchone()
+            return dict(row) if row else None
+
     def inbox_item_get(self, item_id: int) -> dict | None:
         with self._conn() as c:
             row = c.execute("SELECT * FROM inbox_items WHERE id = ?",
@@ -1741,6 +1748,39 @@ class JobStore:
                    ) x JOIN jobs j ON j.issue_id = x.job_id
                    GROUP BY j.workspace_id""", (since, since)).fetchall()
             return {r["ws"]: float(r["total"] or 0) for r in rows}
+
+    def gate_events_by_kind(self, kinds: tuple, since: float,
+                            workspace_id: int | None = None) -> list[dict]:
+        """Gate events of the given kinds since a timestamp, joined to jobs
+        for workspace scoping (Epic I2: the digest's SLA-flag section)."""
+        if not kinds:
+            return []
+        marks = ",".join("?" for _ in kinds)
+        ws_clause = "" if workspace_id is None else " AND j.workspace_id = ?"
+        params: list = [*kinds, since]
+        if workspace_id is not None:
+            params.append(int(workspace_id))
+        with self._conn() as c:
+            rows = c.execute(
+                f"""SELECT e.*, j.workspace_id AS workspace_id,
+                           j.title AS job_title, j.project AS project
+                    FROM gate_events e JOIN jobs j ON j.issue_id = e.job_id
+                    WHERE e.kind IN ({marks}) AND e.at >= ?{ws_clause}
+                    ORDER BY e.id""", params).fetchall()
+            return [dict(r) for r in rows]
+
+    def prs_in_state_with_workspace(self, states: tuple) -> list[dict]:
+        """Tracked PRs in the given states with their owning job's workspace
+        (Epic I2: the digest's stalled-PR section)."""
+        marks = ",".join("?" for _ in states)
+        with self._conn() as c:
+            rows = c.execute(
+                f"""SELECT p.*, j.workspace_id AS workspace_id,
+                           j.title AS job_title, j.project AS project
+                    FROM prs p JOIN jobs j ON j.issue_id = p.job_id
+                    WHERE p.state IN ({marks}) ORDER BY p.id""",
+                tuple(states)).fetchall()
+            return [dict(r) for r in rows]
 
     def awaiting_gates(self) -> list[dict]:
         """Everything answerable right now: parked gates (all kinds) plus
@@ -2264,21 +2304,22 @@ class JobStore:
                 (workspace_id, project, stage, job_id, kind, detail, actor, time.time()))
 
     def autonomy_events_recent(self, workspace_ids: list[int] | None,
-                               limit: int = 50) -> list[dict]:
-        """Newest-first event log. None = all workspaces (admins)."""
+                               limit: int = 50, since: float = 0.0) -> list[dict]:
+        """Newest-first event log. None = all workspaces (admins). `since`
+        (Epic I2) bounds the digest's changes-since-yesterday section."""
         with self._conn() as c:
             if workspace_ids is None:
                 rows = c.execute(
-                    "SELECT * FROM autonomy_events ORDER BY id DESC LIMIT ?",
-                    (limit,)).fetchall()
+                    "SELECT * FROM autonomy_events WHERE at >= ? "
+                    "ORDER BY id DESC LIMIT ?", (since, limit)).fetchall()
             elif not workspace_ids:
                 rows = []
             else:
                 marks = ",".join("?" for _ in workspace_ids)
                 rows = c.execute(
                     f"SELECT * FROM autonomy_events WHERE workspace_id IN ({marks}) "
-                    f"ORDER BY id DESC LIMIT ?",
-                    (*workspace_ids, limit)).fetchall()
+                    f"AND at >= ? ORDER BY id DESC LIMIT ?",
+                    (*workspace_ids, since, limit)).fetchall()
             return [dict(r) for r in rows]
 
     # ---------- gate chat (INSERT-only transcript) ----------

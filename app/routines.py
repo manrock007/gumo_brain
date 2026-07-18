@@ -38,6 +38,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, time as dtime, timedelta
 from zoneinfo import ZoneInfo
 
+from . import digests
 from .config import Settings
 from .db import JobStore
 
@@ -198,10 +199,55 @@ async def _handle_janitor(ctx: RoutineContext):
     return "ok", f"expired {expired} notice(s); pruned {pruned} run row(s)", 0
 
 
+def routine_tz(settings: Settings):
+    try:
+        return ZoneInfo(settings.routine_tz or "UTC")
+    except Exception:
+        log.warning("unknown ROUTINE_TZ %r — using UTC", settings.routine_tz)
+        return ZoneInfo("UTC")
+
+
+# ---------- I2: the daily standup digest ----------
+
+
+async def _handle_standup(ctx: RoutineContext):
+    ws = ctx.workspace
+    if ws is None:
+        return "skipped", "workspace row missing", 0
+    # `since` = the last useful (ok|quiet) standup run, floored at now-24h:
+    # a first run or a long outage must never replay full history.
+    anchor = ctx.store.routine_last_success(ctx.routine["id"])
+    since = max(anchor or 0.0, ctx.now - 86400)
+    digest = digests.build_standup(ctx.store, ctx.settings, ws, since, ctx.now)
+    if digest is None:
+        return "quiet", "nothing to report", 0
+    tz = routine_tz(ctx.settings)
+    local_date = datetime.fromtimestamp(ctx.now, tz).strftime("%Y-%m-%d")
+    key = f"{ws['id']}:{local_date}"  # a mid-day run-now re-fire is idempotent
+    new = ctx.store.inbox_item_add(
+        "standup_digest", key, digest["title"], digest["body"],
+        refs={"date": local_date}, workspace_id=ws["id"],
+        source="standup_digest")
+    if new:
+        row = ctx.store.inbox_item_by_key("standup_digest", key)
+        if row:  # yesterday's unread digest expires the moment today's lands
+            ctx.store.inbox_expire_predecessors("standup_digest", ws["id"],
+                                                row["id"])
+        # DB row first, best-effort Slack strictly after (crash under-notifies,
+        # never double-fires — the Epic A5 ordering)
+        if ctx.workspaces is not None:
+            await ctx.workspaces.notify_text(
+                ws, f"*{digest['title']}*\n\n{digest['body'][:3500]}")
+    n_lines = sum(len(v) for v in digest["sections"].values())
+    return "ok", f"{len(digest['sections'])} section(s), {n_lines} line(s)", \
+        1 if new else 0
+
+
 REGISTRY: dict = {
     "sweep": _handle_sweep,
     "reaper": _handle_reaper,
     "janitor": _handle_janitor,
+    "standup_digest": _handle_standup,
 }
 
 
