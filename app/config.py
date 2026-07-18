@@ -31,6 +31,19 @@ DEFAULT_REPO_MAP: dict = {}
 ENGINE_NAME = "CtrlLoop"
 ENGINE_SLUG = "ctrlloop"
 
+# The engine namespace inside customer repos (like `.github/`): artifacts,
+# memory and product scope all live under it. Repos initialized before the
+# rename keep their legacy tree working — ONE precedence rule governs every
+# resolution helper (fixer.engine_dir, fixer.git_show_ns, the memory reads):
+# legacy wins when present, so a repo is never split-brained across two trees.
+# Migrate a repo with a single `git mv .gumo .ctrlloop` PR on the base branch
+# (MIGRATION-CTRLLOOP.md).
+ENGINE_DIR = ".ctrlloop"
+LEGACY_ENGINE_DIRS = (".gumo",)
+# Archival refs for rejected code-stage attempts: refs/<ns>/<job>/P<n>-attempt-<k>.
+# Write-only (no read path), so no legacy fallback is needed.
+REFS_NAMESPACE = "ctrlloop"
+
 # Engine-authored ClickUp comments carry a fixed prefix the poller uses to
 # ignore its own comments. Pre-rename comments still in threads must stay
 # recognized, or parked jobs could misread them as human answers.
@@ -105,6 +118,22 @@ class Settings(BaseSettings):
 
     # GitHub token used for git push + `gh pr create` (fine-grained PAT)
     github_token: str = ""
+    # Branch prefix for engine-created branches (<prefix>/feat-…, <prefix>/
+    # sentry-…, <prefix>/memory-…). Jobs record their branch at first use, so
+    # changing this never strands in-flight work (pre-upgrade rows are
+    # backfilled with their historical 'brain/…' branches).
+    branch_prefix: str = "ctrlloop"
+
+    @field_validator("branch_prefix")
+    @classmethod
+    def _validate_branch_prefix(cls, v: str) -> str:
+        v = (v or "").strip()
+        # one git-valid path segment: no '/', no leading '.', no '.lock' suffix
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", v) or v.endswith(".lock"):
+            raise ValueError(
+                "branch_prefix must be a single git-valid branch segment "
+                "(start alphanumeric; chars A-Za-z0-9._-; no '/', no '.lock' suffix)")
+        return v
     # PR lifecycle: auto-flip captured draft PRs to ready-for-review and post
     # the first `@sentry review` trigger (the Seer bot ignores plain pushes)
     pr_auto_ready: bool = True

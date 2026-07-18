@@ -1,8 +1,9 @@
 # CtrlLoop — feature pipeline, shared artifacts, product memory
 
 > Formerly "the Gumo Engine" / gumo_brain. The engine identity (CtrlLoop) is
-> distinct from the configured product identity (§10); Gumo remains the
-> default project context.
+> distinct from the configured product identity (§10); all code defaults are
+> neutral — Gumo is one customer whose values live in its instance's config
+> (worked example in OPERATIONS.md).
 
 > Status: AS-BUILT SPEC (v2 of gumo_brain). Reviewed by a 5-lens design critique
 > (sync protocol, memory, state machine, operator UX, prompt/token economics);
@@ -39,18 +40,22 @@ Atomic cross-repo pipelines are deferred.
 | `sentry`  | webhook / sweep / manual         | grade → fix (HITL only if COMPLEX) |
 | `task`    | dashboard (title or ClickUp URL) | analyse → gate → implement         |
 | `feature` | dashboard (title or ClickUp URL) | **P0–P9 pipeline, gate after every stage** |
-| `memory`  | dashboard, per project           | bootstrap `.gumo/memory/` → draft PR |
+| `memory`  | dashboard, per project           | bootstrap `<ns>/memory/` → draft PR |
 
 ## 2. The stage ladder (P0–P9)
 
-One headless Claude run per stage, on the feature branch `brain/feat-<job>`.
+One headless Claude run per stage, on the feature branch
+`<branch_prefix>/feat-<job>` (BRANCH_PREFIX, default `ctrlloop`; each job
+records its branch at first use, so in-flight pipelines survive prefix
+changes — pre-rename jobs are backfilled with their historical `brain/…`
+branches).
 P0–P4 are **document stages** (artifact only, produced in the run output and
 written/committed by the ENGINE — the run gets read-only tools). P5–P8 are
 **code stages** (full toolset). Every stage ends parked at a gate.
 
 | stage | name       | artifact         | contract (summary) |
 |-------|------------|------------------|--------------------|
-| P0 | Intake      | `P0-intake.md`  | Restate request, ambiguities as questions, draft acceptance criteria. Memory only — read-only tools, instructed to stay within `.gumo/**`; if memory is absent, runs in **declared degraded mode** (may read code, must say so in the artifact header). |
+| P0 | Intake      | `P0-intake.md`  | Restate request, ambiguities as questions, draft acceptance criteria. Memory only — read-only tools, instructed to stay within `<ns>/**`; if memory is absent, runs in **declared degraded mode** (may read code, must say so in the artifact header). |
 | P1 | PRD         | `P1-prd.md`     | User stories, scope IN/OUT, numbered acceptance criteria, non-goals. Same tool scoping as P0. |
 | P2 | Recon       | `P2-recon.md`   | Read the code. Current behaviour, touched modules, constraints, risks. No solutioneering. |
 | P3 | Design      | `P3-design.md`  | Technical design. Data-model decisions explicit, each with options + trade-offs + recommendation. |
@@ -85,7 +90,8 @@ artifact subtask**; the poller scans both):
 
 **Redo semantics for code stages (P5+):** the engine records
 `stage_base_sha` (branch HEAD before each stage run). Redo preserves the
-current head as `refs/gumo/<job>/P<n>-attempt-<k>`, hard-resets the branch to
+current head as `refs/ctrlloop/<job>/P<n>-attempt-<k>` (write-only archival
+refs — no read path, so no legacy fallback), hard-resets the branch to
 `stage_base_sha`, and re-runs. `stage_attempts` soft-caps at 3 (warns on the
 gate, never blocks). Redo of an earlier stage stamps downstream artifact
 mirrors with a SUPERSEDED banner.
@@ -96,7 +102,7 @@ advance is an atomic compare-and-set (`UPDATE jobs … WHERE status =
 <channel>" (HTTP 409). The worker re-validates status at dequeue and discards
 stale entries. Every decision (stage, action, verbatim text, channel,
 timestamp, artifact blob SHA answered against) is appended to `guidance_log`
-and mirrored to `.gumo/features/<job>/guidance.md` on the branch at next
+and mirrored to `<ns>/features/<job>/guidance.md` on the branch at next
 stage start.
 
 **Gate evidence (P5–P8).** Gate cards/comments include harness-captured
@@ -120,7 +126,8 @@ outage are honored.
 is the sync layer. Human edits always survive. Fail closed on anything
 ambiguous.**
 
-- Artifacts live on the feature branch under `.gumo/features/<job>/`.
+- Artifacts live on the feature branch under `<ns>/features/<job>/`
+  (the engine namespace dir, §4/§10).
   The ENGINE commits and **pushes the branch to origin at the end of every
   stage run** — including timeout/fail/unparsed — so no work exists only in a
   disposable workspace. For stage > 0, `prepare_workspace` checks out
@@ -162,13 +169,19 @@ update is always last.
 ## 4. Product memory
 
 **Markdown in git, updated through the same PRs the engine ships, split into
-two scopes** (per-repo product.md triplication would drift — critic-confirmed):
+two scopes** (per-repo product.md triplication would drift — critic-confirmed).
+Both live under the **engine namespace dir** `<ns>` = `.ctrlloop/` — repos
+initialized before the rename keep their legacy `.gumo/` tree working, and
+ONE precedence rule governs every resolution helper (working-tree reads,
+base-pinned `git show` reads, freshness): **legacy wins when present**, so a
+repo is never split-brained across two trees. Migrate with a single
+`git mv .gumo .ctrlloop` PR (MIGRATION-CTRLLOOP.md).
 
-- **Repo scope** — `.gumo/memory/` in each repo: `architecture.md`, `map.md`,
+- **Repo scope** — `<ns>/memory/` in each repo: `architecture.md`, `map.md`,
   `conventions.md`, plus `decisions/` and `changelog/` **directories** (one
   file per entry, `<date>-<slug>.md` — append-only files guarantee merge
   conflicts; per-entry files can't conflict, and "recent N" is trivial).
-- **Product scope** — `.gumo/product/` in the configured canonical repo (§10):
+- **Product scope** — `<ns>/product/` in the configured canonical repo (§10):
   `product.md`, product-level decisions/changelog, `contract.md` (endpoints/
   models the clients depend on). Client-repo runs get it inlined from the
   canonical repo's base branch (via the brain's canonical workspace —
@@ -191,7 +204,8 @@ two scopes** (per-repo product.md triplication would drift — critic-confirmed)
   `{commit_sha, fetched_at}`, dashboard-only (plus the base-pinned product
   scope inline for client-repo runs). Never last-writer-wins from branches.
 - **Freshness metric**: commits on origin/<base> since the last commit
-  touching `.gumo/`, shown per repo on the Product brain panel.
+  touching the engine namespace (both `.ctrlloop/` and `.gumo/` pathspecs are
+  passed; whichever exists counts), shown per repo on the Product brain panel.
 
 **Context assembly (binding inputs, not recency):**
 
@@ -319,8 +333,8 @@ workspace schema belongs to the humans.
 
 Full-parity extras: `PRD Doc`/`Contract Doc` point at the artifact-mirror
 subtasks (the brain's EDITABLE equivalent of the workflow's Drive docs —
-edits there sync back to git) and the folder field at the branch's `.gumo`
-tree; feature adoption reads the `Assigned Dev DRI`/`Assigned Founder DRI`
+edits there sync back to git) and the folder field at the branch's engine
+namespace tree; feature adoption reads the `Assigned Dev DRI`/`Assigned Founder DRI`
 people fields into `owner` (gates assign that person, as the original
 automations did); stage runs may emit `FRICTION: <what> · <improvement>`
 lines that append to `Gumo Workflow Improvements` (human redos append there
@@ -412,7 +426,8 @@ not code** — the same brain serves any software team:
   Any number of repos; drives intake validation, workspace clones, PR bases,
   test instructions and the shepherd's reverse lookup.
 - **Canonical project** — which slug hosts product-scope memory
-  (`.gumo/product/`). Must be a slug in the repo map (fail-closed on save).
+  (`<ns>/product/`). Must be a slug in the repo map (fail-closed on save);
+  empty = no instance-level product scope (repo-scope memory only).
 - **Product name** — the identity used in prompts ("the `<name>` Engine",
   "the `<name>` platform").
 - **Business context** — operator-maintained free text injected into EVERY
@@ -421,15 +436,20 @@ not code** — the same brain serves any software team:
   memory, when present, is more current and takes precedence — the injected
   block itself states this, so it holds for custom contexts too.
 
-Precedence: **DB overrides > env vars > code defaults** (the Gumo repos and a
-structural Gumo description ship as the defaults). Operators edit the context
+Precedence: **DB overrides > env vars > code defaults** (the code defaults
+are NEUTRAL: empty repo map, "your product", empty business context — the
+original Gumo values live in docs/OPERATIONS.md as a worked example).
+Operators edit the context
 in the dashboard's "Project context" panel or via `PUT /api/context`; saved
 values persist in the `app_config` table, apply to the live engine immediately
 (next run picks them up) and survive restarts. `DELETE /api/context` reverts
 to defaults. Validation is atomic and fail-closed: a malformed repo map or a
 canonical slug missing from the map is a 400 and nothing changes; persistence
-is one transaction. The `.gumo/` directory names are engine namespace (like
-`.github/`), not product branding — they stay fixed regardless of context.
+is one transaction. The engine directory names are engine namespace (like
+`.github/`), not product branding — they never follow the product context.
+The namespace is the constant `.ctrlloop/` with a read+write legacy fallback:
+a repo already carrying `.gumo/` keeps using it (legacy wins when both exist,
+deterministically), until a `git mv .gumo .ctrlloop` PR migrates it.
 
 Edits and running work: jobs keep their recorded project slug. If the new map
 still contains the slug, they continue under the new mapping; if a slug was
@@ -482,7 +502,7 @@ stays deterministic, and `settings.repo_for_project` keeps working: the
 service rebuilds the merged map into live Settings after every edit.
 
 - **Context hierarchy in prompts**: business context (instance, §10) +
-  workspace context + repo memory (`.gumo/`, in the clone). Product name and
+  workspace context + repo memory (`<ns>/`, in the clone). Product name and
   canonical repo resolve per workspace. The instance context API now owns
   ONLY the business layer; repo topology edits there are refused with a
   pointer to the workspace API.

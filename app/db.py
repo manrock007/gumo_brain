@@ -220,6 +220,7 @@ MIGRATIONS = {  # table -> columns added after that table first shipped (in-plac
         "steer_note": "TEXT DEFAULT ''",  # human's live steer, moved into resume_answer on interrupt
         "auto_retries": "INTEGER NOT NULL DEFAULT 0",  # transient-error retries spent (max 1; human redo resets)
         "workspace_id": "INTEGER",  # owning workspace (Phase 2); NULL rows adopted by migration
+        "branch": "TEXT NOT NULL DEFAULT ''",  # git branch this job's work lives on (stamped at first use)
     },
     "stage_runs": {
         "session_id": "TEXT DEFAULT ''",
@@ -258,6 +259,20 @@ class JobStore:
                 for col, ddl in columns.items():
                     if col not in cols:
                         c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
+                        if table == "jobs" and col == "branch":
+                            # one-time backfill on the upgrade boot (idempotent
+                            # by construction — it only runs when the column is
+                            # first added): every pre-upgrade job keeps the
+                            # EXACT branch it already pushed under the
+                            # historical 'brain/' prefix. Feature job ids
+                            # already carry 'feat-', so 'brain/feat-feat-<id>'
+                            # is deliberate — it matches what the engine built.
+                            c.execute("""UPDATE jobs SET branch = CASE kind
+                                WHEN 'feature' THEN 'brain/feat-' || issue_id
+                                WHEN 'memory'  THEN 'brain/memory-' || project
+                                WHEN 'sentry'  THEN 'brain/sentry-' || issue_id
+                                ELSE 'brain/' || issue_id END
+                                WHERE branch = ''""")
 
     @contextmanager
     def _conn(self):

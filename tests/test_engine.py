@@ -73,3 +73,34 @@ class TestExtractQuestionsLast:
 
     def test_fallback_tail(self):
         assert extract_questions_last("just prose") == "just prose"
+
+
+class TestBranchResolution:
+    """Epic 0.2: stored branch wins; new jobs get the configured prefix and
+    persist it before first use."""
+
+    def test_new_feature_gets_configured_prefix_and_persists(self, worker):
+        worker.intake_feature("feat-b1", title="F", project="web", request="r")
+        job = worker.store.get("feat-b1")
+        assert job["branch"] == ""
+        branch = worker.engine._branch(job)
+        assert branch == "ctrlloop/feat-feat-b1"  # job ids already carry feat-
+        assert worker.store.get("feat-b1")["branch"] == branch
+
+    def test_stored_branch_wins_over_prefix(self, worker):
+        worker.intake_feature("feat-b2", title="F", project="web", request="r")
+        worker.store.set_fields("feat-b2", branch="brain/feat-feat-b2")  # backfilled row
+        job = worker.store.get("feat-b2")
+        assert worker.engine._branch(job) == "brain/feat-feat-b2"
+        assert worker.store.get("feat-b2")["branch"] == "brain/feat-feat-b2"
+
+    def test_custom_prefix_is_used(self, worker):
+        worker.settings.branch_prefix = "team-x"
+        worker.intake_feature("feat-b3", title="F", project="web", request="r")
+        assert worker.engine._branch(worker.store.get("feat-b3")) == "team-x/feat-feat-b3"
+
+    def test_memory_job_branch(self, worker):
+        worker.intake_memory("web")
+        job = worker.store.get("mem-web")
+        assert worker.engine._branch(job) == "ctrlloop/memory-web"
+        assert worker.store.get("mem-web")["branch"] == "ctrlloop/memory-web"

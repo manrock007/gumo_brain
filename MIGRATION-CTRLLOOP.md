@@ -41,6 +41,28 @@ Everything else in the upgrade is backward compatible:
 - **Git author**: engine commits are now authored `ctrlloop <engine@ctrlloop.local>`
   (override with `CTRLLOOP_GIT_NAME` / `CTRLLOOP_GIT_EMAIL`).
 
+## 1b. Engine namespace: migrating a repo's `.gumo/` tree to `.ctrlloop/`
+
+New repos get `.ctrlloop/`; repos that already carry `.gumo/` keep working
+indefinitely — **legacy wins whenever both trees exist** (one deterministic
+rule across every read/write path), so there is no forced migration. To
+migrate a repo:
+
+1. Wait until no memory-bootstrap PR is open on the repo (its branch writes
+   `.gumo/` and would resurrect the legacy tree on merge).
+2. One PR containing exactly `git mv .gumo .ctrlloop`, **landed on the BASE
+   branch**. After it merges, only `.ctrlloop` exists and the engine follows
+   automatically — no config change.
+3. In-flight feature branches created before the move keep writing `.gumo/`
+   until they merge; that is safe (legacy-wins means their reads and writes
+   stay consistent), and the tree merges into `.ctrlloop`-era base with an
+   ordinary rename-aware merge. Prefer migrating in a quiet window anyway.
+
+Branch prefix: new engine branches are `ctrlloop/…` (override with
+`BRANCH_PREFIX`); every pre-upgrade job keeps its recorded `brain/…` branch
+(backfilled at first boot), so parked gates and phase-2 runs resume exactly
+where they pushed.
+
 ## 2. GitHub repo rename (your click)
 
 Rename `manrock007/gumo_brain` → `manrock007/ctrlloop` in GitHub settings.

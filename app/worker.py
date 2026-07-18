@@ -365,7 +365,13 @@ class Worker:
             "project": project_slug,
         }
         stacktrace = format_stacktrace(event)
-        branch = f"brain/sentry-{issue_id}"
+        # stored branch wins (phase-2 runs and backfilled pre-rename rows keep
+        # the branch phase 1 pushed); new jobs get the configured prefix,
+        # persisted before first use
+        branch = (row.get("branch") or "").strip() \
+            or f"{self.settings.branch_prefix}/sentry-{issue_id}"
+        if branch != (row.get("branch") or ""):
+            self.store.set_fields(issue_id, branch=branch)
 
         # live observation: v1 runs stream into the same broker the inbox detail
         # pane subscribes to (session/stream), exactly like feature stages —
@@ -470,7 +476,11 @@ class Worker:
             "project": project,
         }
         request_text = row.get("request") or row.get("title") or ""
-        branch = f"brain/{job_id}"
+        # stored branch wins (phase 2 / backfilled rows); else configured prefix
+        branch = (row.get("branch") or "").strip() \
+            or f"{self.settings.branch_prefix}/{job_id}"
+        if branch != (row.get("branch") or ""):
+            self.store.set_fields(job_id, branch=branch)
 
         # live observation: stream this run to the inbox detail pane (see
         # _process_sentry for the same wiring on the sentry path), teeing every

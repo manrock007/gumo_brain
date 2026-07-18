@@ -8,9 +8,33 @@ import os
 import re
 from pathlib import Path
 
-from .config import RepoTarget, Settings
+from .config import ENGINE_DIR, LEGACY_ENGINE_DIRS, RepoTarget, Settings
 
 log = logging.getLogger("brain.fixer")
+
+
+def engine_dir(workspace: str) -> str:
+    """The engine namespace dir for THIS clone: a repo that already has a
+    legacy tree keeps it (legacy wins when present — never split-brain a repo
+    across two trees); otherwise the current ENGINE_DIR. Migrate a repo by
+    `git mv .gumo .ctrlloop` in one PR, after which only `.ctrlloop` exists."""
+    for legacy in LEGACY_ENGINE_DIRS:
+        if (Path(workspace) / legacy).is_dir():
+            return legacy
+    return ENGINE_DIR
+
+
+async def git_show_ns(workspace: str, ref: str, rel: str) -> tuple[int, str]:
+    """`git show {ref}:{<ns>}/{rel}` with the SAME precedence rule as
+    engine_dir — legacy wins when present in the ref — for base-pinned reads
+    that cannot consult the working tree. Returns the last (code, output)
+    when no namespace has the file."""
+    code, out = 1, ""
+    for ns in (*LEGACY_ENGINE_DIRS, ENGINE_DIR):
+        code, out = await git(workspace, "show", f"{ref}:{ns}/{rel}")
+        if code == 0:
+            return code, out
+    return code, out
 
 PR_URL_RE = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+")
 # STRICT capture: only a standalone `PR_URL: <url>` line counts as "this run

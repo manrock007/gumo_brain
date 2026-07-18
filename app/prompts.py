@@ -26,8 +26,9 @@ def business_block(business_context: str) -> str:
 
 {text}
 
-(Versioned product memory — `.gumo/` files or a memory section in this prompt, when
-present — is more current than this section and takes precedence over it.)"""
+(Versioned product memory — the engine's memory files in this repo or a memory
+section in this prompt, when present — is more current than this section and
+takes precedence over it.)"""
 
 
 def _common_header(target: RepoTarget, branch: str, issue: dict, stacktrace: str,
@@ -71,14 +72,21 @@ Post an update at each milestone: (1) root cause identified — explain it, \
 
 
 def _memory_write_block() -> str:
+    # Deliberately namespace-AGNOSTIC: sentry/task prompts are built before the
+    # workspace is cloned, so the run itself resolves which engine dir the repo
+    # carries. Naming only one dir here would silently stop memory writes on
+    # repos using the other one — and bulk traffic must feed memory or it
+    # decays (docs/ENGINE.md §4).
     return """
 
 ## Product memory (include in the same commit/PR)
 
-If `.gumo/memory/` exists in this repo: add a one-entry changelog file
-`.gumo/memory/changelog/<YYYY-MM-DD>-<short-slug>.md` (2-4 lines: what changed, why,
-PR link placeholder), and update any `.gumo/memory/map.md` / `architecture.md`
-section your change makes inaccurate. If `.gumo/memory/` does not exist, skip this."""
+This repo's engine memory directory is `.ctrlloop/memory/` — or `.gumo/memory/`
+on repos that still carry the legacy tree (use whichever EXISTS; never create
+the other). If one exists: add a one-entry changelog file
+`<memory dir>/changelog/<YYYY-MM-DD>-<short-slug>.md` (2-4 lines: what changed,
+why, PR link placeholder), and update any `map.md` / `architecture.md` section
+your change makes inaccurate. If neither directory exists, skip this."""
 
 
 def _test_block(target: RepoTarget) -> str:

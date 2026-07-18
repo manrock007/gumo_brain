@@ -17,7 +17,13 @@ from pathlib import Path
 from .artifacts import ArtifactSync, artifact_path, feature_dir, list_artifacts, normalize
 from .chatstream import ChatBroker
 from .clickup import ClickUp
-from .config import ENGINE_COMMENT_PREFIXES, GATE_PREFIX, Settings  # noqa: F401 — re-exported for worker
+from .config import (  # noqa: F401 — ENGINE_COMMENT_PREFIXES/GATE_PREFIX re-exported for worker
+    ENGINE_COMMENT_PREFIXES,
+    ENGINE_DIR,
+    GATE_PREFIX,
+    REFS_NAMESPACE,
+    Settings,
+)
 from .db import JobStore
 from . import fastlane
 from .feature_prompts import (
@@ -36,6 +42,7 @@ from .fixer import (
     PR_LINE_RE,
     TRANSIENT_ERROR_RE,
     BranchLostError,
+    engine_dir,
     git,
     prepare_feature_workspace,
     prepare_workspace,
@@ -229,6 +236,23 @@ class Engine:
                                      "re-review requested")
             log.info("job %s: %s#%s re-kicked after post-approval push", job_id, repo, number)
 
+    def _branch(self, job: dict) -> str:
+        """The job's git branch. Stored branch wins (in-flight pipelines and
+        backfilled pre-rename rows keep the exact branch they already pushed);
+        a job without one gets the configured prefix and persists it before
+        first use, so a later branch_prefix change never strands it."""
+        branch = (job.get("branch") or "").strip()
+        if branch:
+            return branch
+        prefix = self.settings.branch_prefix
+        if (job.get("kind") or "") == "memory":
+            branch = f"{prefix}/memory-{job.get('project') or job['issue_id']}"
+        else:  # feature job ids already carry 'feat-' — the double prefix is historical shape
+            branch = f"{prefix}/feat-{job['issue_id']}"
+        self.store.set_fields(job["issue_id"], branch=branch)
+        job["branch"] = branch
+        return branch
+
     # ---------- the one entry point ----------
 
     async def run_stage(self, job: dict, queued_at: float | None = None):
@@ -238,7 +262,7 @@ class Engine:
         if target is None:
             self.store.set_status(job_id, "skipped", detail=f"no repo mapped for '{job.get('project')}'")
             return
-        branch = f"brain/feat-{job_id}"
+        branch = self._branch(job)
         # conveyor mirror: slide the ticket's Stage card + link the live view
         await self.sync_stage_field(job, str(stage))
         await self.sync_dashboard_field(job)
@@ -328,7 +352,7 @@ class Engine:
                 resuming, resume_reason = False, "the session transcript is gone (restart/prune)"
 
         # An explicit redo of THIS code stage rewinds to the stage baseline,
-        # preserving the rejected attempt under refs/gumo/. This keys off the
+        # preserving the rejected attempt under refs/<REFS_NAMESPACE>/. This keys off the
         # pending_redo_stage flag set by the human's answer — `attempt > 1` alone
         # also fires when the pipeline merely re-advances through this stage after
         # an earlier-stage redo, which would hard-reset to a now-stale baseline.
@@ -336,9 +360,9 @@ class Engine:
         if (not resuming and job.get("pending_redo_stage") == stage
                 and stage_kind(stage) == "code" and state.get("base_sha")):
             await git(workspace, "update-ref",
-                      f"refs/gumo/{job_id}/P{stage}-attempt-{max(1, attempt - 1)}", "HEAD")
+                      f"refs/{REFS_NAMESPACE}/{job_id}/P{stage}-attempt-{max(1, attempt - 1)}", "HEAD")
             await git(workspace, "push", "origin",
-                      f"refs/gumo/{job_id}/P{stage}-attempt-{max(1, attempt - 1)}")
+                      f"refs/{REFS_NAMESPACE}/{job_id}/P{stage}-attempt-{max(1, attempt - 1)}")
             await git(workspace, "reset", "--hard", state["base_sha"])
         if job.get("pending_redo_stage") == stage:
             self.store.set_fields(job_id, pending_redo_stage=None)
@@ -634,7 +658,7 @@ class Engine:
         if owner:
             await self.clickup.set_assignee(job.get("clickup_task_id") or "", owner)
         # conveyor mirror: doc/folder fields point at the editable artifacts
-        await self.sync_doc_fields(job)
+        await self.sync_doc_fields(job, ns=engine_dir(workspace))
         log.info("job %s parked at P%s gate", job_id, stage)
 
     # ---------- helpers ----------
@@ -673,7 +697,7 @@ class Engine:
 
     async def _push_branch(self, workspace, branch) -> bool:
         """Push with --force-with-lease: a code-stage redo legitimately rewrites
-        history (the rejected attempt is preserved under refs/gumo/), so a plain
+        history (the rejected attempt is preserved under the refs archive), so a plain
         push's non-fast-forward rejection would silently discard human-approved
         redo work. The lease baseline is origin/<branch> fetched at stage start,
         so a third-party push mid-run still correctly fails the lease."""
@@ -820,7 +844,7 @@ class Engine:
         for e in entries:
             when = time.strftime("%Y-%m-%d %H:%M", time.gmtime(e["at"]))
             lines.append(f"## P{e['stage']} — {e['action']} ({e['via']}, {when} UTC, head {e['artifact_sha'][:12]})\n\n{e['text'] or '(no text)'}\n")
-        path = Path(workspace) / feature_dir(job["issue_id"]) / "guidance.md"
+        path = Path(workspace) / feature_dir(workspace, job["issue_id"]) / "guidance.md"
         path.parent.mkdir(parents=True, exist_ok=True)
         content = "\n".join(lines)
         if path.exists() and normalize(path.read_text()) == normalize(content):
@@ -878,12 +902,13 @@ class Engine:
             redo_notes=redo_notes,
             evidence_note=edited_note,
             test_block=_test_block(target) if stage in (7, 8) else "",
+            ns=engine_dir(workspace),
             canonical_project=(self.workspaces.canonical_for(job.get("project") or "")
                                if self.workspaces else self.settings.memory_canonical_project),
             product_name=pname, business_context=brief,
         )
 
-    # ---------- gumo-speed conveyor mirror (ClickUp custom fields) ----------
+    # ---------- workflow-conveyor mirror (ClickUp custom fields; originally the gumo-speed workflow) ----------
 
     async def sync_stage_field(self, job: dict, key: str):
         """Mirror the pipeline position onto the ticket's `Stage` dropdown —
@@ -924,12 +949,13 @@ class Engine:
         except Exception:
             log.exception("Dashboard field sync failed for %s (non-fatal)", job.get("issue_id"))
 
-    async def sync_doc_fields(self, job: dict):
-        """Point `PRD Doc` / `Contract Doc` at their editable artifact-mirror
-        subtasks and the folder field at the branch's `.gumo` tree — the
-        brain's equivalent of the workflow's per-feature Drive folder (the
-        subtasks are BETTER than the original's Drive docs: human edits there
-        sync back into git, which the Drive connector never could)."""
+    async def sync_doc_fields(self, job: dict, ns: str = ENGINE_DIR):
+        """Point the configured doc fields at their editable artifact-mirror
+        subtasks and the folder field at the branch's engine-namespace tree —
+        the engine's equivalent of a per-feature docs folder (the subtasks are
+        BETTER than doc copies: human edits there sync back into git). `ns` is
+        the namespace the calling stage resolved from its workspace —
+        display-only, best-effort; a guessed ns is never persisted."""
         if not self.settings.clickup_field_sync_enabled:
             return
         task_id = job.get("clickup_task_id") or ""
@@ -946,8 +972,8 @@ class Engine:
             if target and self.settings.clickup_folder_field:
                 await self.clickup.field_set(
                     task_id, self.settings.clickup_folder_field,
-                    f"https://github.com/{target.repo}/tree/brain/feat-{job['issue_id']}"
-                    f"/.gumo/features/{job['issue_id']}")
+                    f"https://github.com/{target.repo}/tree/{self._branch(job)}"
+                    f"/{ns}/features/{job['issue_id']}")
         except Exception:
             log.exception("doc field sync failed for %s (non-fatal)", job.get("issue_id"))
 
@@ -1140,7 +1166,8 @@ class Engine:
                         "the record."), {}, True
             try:
                 workspace = await prepare_workspace(
-                    self.settings, target, f"brain/chat-{job_id}",
+                    self.settings, target,
+                    f"{self.settings.branch_prefix}/chat-{job_id}",  # disposable local branch
                     workspace_root=f"{self.settings.workspaces_dir}/chat")
             except Exception as e:
                 return (f"(cannot check out the repository to answer from code: "
@@ -1216,7 +1243,7 @@ class Engine:
         job_id = job["issue_id"]
         if target is None:
             return "(no repo is mapped for this project — cannot answer from code)", {}, True
-        branch = f"brain/feat-{job_id}"
+        branch = self._branch(job)
         publish("status", "waiting for the repository workspace")
 
         async with self.locks.for_repo(target.repo):
@@ -1283,6 +1310,7 @@ class Engine:
                     transcript=self.store.chat_for(job_id, stage)[:-1],  # exclude the turn being answered
                     inline_artifacts=inline,
                     product_name=self._job_context(job)[0],
+                    ns=engine_dir(workspace),
                 )
                 # serialize on whichever store this run touches: the dedicated
                 # chat store when persistence is on, else the shared default
@@ -1344,7 +1372,7 @@ class Engine:
         if target is None:
             self.store.set_status(job_id, "skipped", detail=f"no repo mapped for '{project}'")
             return
-        branch = f"brain/memory-{project}"
+        branch = self._branch(job)
         self.store.set_fields(job_id, run_started_at=time.time())
         self.store.set_status(job_id, "running")
 
@@ -1358,6 +1386,7 @@ class Engine:
             bws = self.workspaces.for_project(project) if self.workspaces else None
             prompt = build_bootstrap_prompt(target=target, branch=branch, project=project,
                                             is_canonical=is_canonical, run=run,
+                                            ns=engine_dir(workspace),
                                             product_name=(self.workspaces.product_name_for(bws)
                                                           if self.workspaces else self.settings.product_name),
                                             business_context=(self.workspaces.briefing(bws)

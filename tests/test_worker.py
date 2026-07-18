@@ -202,3 +202,59 @@ class TestAnswerFeature:
         job_id = self._park_feature(worker, stage=6)
         status = asyncio.run(worker.answer_job(job_id, "skip", "not now", via="dashboard"))
         assert status == "skipped"
+
+
+class TestSentryLaneGate:
+    def test_sweep_exits_when_sentry_unconfigured(self, worker):
+        """sweep_forever must return immediately (not sleep/loop) on an
+        instance without a configured Sentry integration."""
+        worker.settings.sweep_enabled = True
+        assert not worker.settings.sentry_enabled
+        asyncio.run(worker.sweep_forever())  # returns immediately or the test hangs
+
+    def test_sweep_exits_when_disabled(self, worker):
+        worker.settings.sweep_enabled = False
+        asyncio.run(worker.sweep_forever())
+
+
+class TestV1BranchPersistence:
+    def test_task_branch_uses_prefix_and_persists(self, worker, monkeypatch, tmp_path):
+        import app.worker as worker_mod
+        from app.fixer import FixResult
+
+        worker.intake_task("task-br1", title="T", project="web", request="r")
+        seen = {}
+
+        async def fake_ws(settings, target, branch, keep_branch=False, workspace_root=None):
+            seen["branch"] = branch
+            return str(tmp_path)
+
+        async def fake_run(settings, target, workspace, prompt, on_event=None):
+            return FixResult("no_fix", detail="nothing to do")
+
+        monkeypatch.setattr(worker_mod, "prepare_workspace", fake_ws)
+        monkeypatch.setattr(worker_mod, "run_claude", fake_run)
+        asyncio.run(worker._process_task(worker.store.get("task-br1")))
+        assert seen["branch"] == "ctrlloop/task-br1"
+        assert worker.store.get("task-br1")["branch"] == "ctrlloop/task-br1"
+
+    def test_task_stored_branch_wins(self, worker, monkeypatch, tmp_path):
+        import app.worker as worker_mod
+        from app.fixer import FixResult
+
+        worker.intake_task("task-br2", title="T", project="web", request="r")
+        worker.store.set_fields("task-br2", branch="brain/task-br2")  # backfilled row
+        seen = {}
+
+        async def fake_ws(settings, target, branch, keep_branch=False, workspace_root=None):
+            seen["branch"] = branch
+            return str(tmp_path)
+
+        async def fake_run(settings, target, workspace, prompt, on_event=None):
+            return FixResult("no_fix", detail="nothing to do")
+
+        monkeypatch.setattr(worker_mod, "prepare_workspace", fake_ws)
+        monkeypatch.setattr(worker_mod, "run_claude", fake_run)
+        asyncio.run(worker._process_task(worker.store.get("task-br2")))
+        assert seen["branch"] == "brain/task-br2"
+        assert worker.store.get("task-br2")["branch"] == "brain/task-br2"

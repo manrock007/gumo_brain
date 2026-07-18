@@ -1,9 +1,11 @@
 """Product memory: versioned knowledge that warms every run (docs/ENGINE.md §4).
 
-Two scopes:
-- Repo scope   — `.gumo/memory/` in each repo (architecture, map, conventions,
+Two scopes (under the engine namespace dir — `.ctrlloop/`, or the legacy
+`.gumo/` on pre-rename repos; legacy wins when present, same rule as
+fixer.engine_dir):
+- Repo scope   — `<ns>/memory/` in each repo (architecture, map, conventions,
   decisions/ + changelog/ as per-entry directories).
-- Product scope — `.gumo/product/` in the CANONICAL repo (settings.
+- Product scope — `<ns>/product/` in the CANONICAL repo (settings.
   memory_canonical_project, part of the editable project context): what the
   product is, cross-repo contract. Client-repo runs read it base-pinned from
   the canonical workspace; client repos carry no product.md.
@@ -17,13 +19,23 @@ import logging
 import time
 from pathlib import Path
 
-from .config import Settings
-from .fixer import _run, git
+from .config import ENGINE_DIR, LEGACY_ENGINE_DIRS, Settings
+from .fixer import _run, engine_dir, git, git_show_ns
 
 log = logging.getLogger("brain.memory")
 
-MEMORY_DIR = ".gumo/memory"
-PRODUCT_DIR = ".gumo/product"
+# display-string defaults (docs, prompts with no workspace at hand); real
+# reads resolve the namespace per clone via memory_dir()/product_dir()
+MEMORY_DIR = f"{ENGINE_DIR}/memory"
+PRODUCT_DIR = f"{ENGINE_DIR}/product"
+
+
+def memory_dir(workspace: str) -> str:
+    return f"{engine_dir(workspace)}/memory"
+
+
+def product_dir(workspace: str) -> str:
+    return f"{engine_dir(workspace)}/product"
 
 REPO_FILES = ["architecture.md", "map.md", "conventions.md"]
 PRODUCT_FILES = ["product.md", "contract.md"]
@@ -108,7 +120,7 @@ class MemoryReader:
         canonical = (self.canonical_resolver(project) if self.canonical_resolver
                      else self.settings.memory_canonical_project)
         if project == canonical:
-            return {f: _read(workspace, f"{PRODUCT_DIR}/{f}") for f in PRODUCT_FILES}
+            return {f: _read(workspace, f"{product_dir(workspace)}/{f}") for f in PRODUCT_FILES}
         target = self.settings.repo_for_project(canonical)
         if target is None:
             return {}
@@ -131,7 +143,7 @@ class MemoryReader:
         await git(str(ws), "fetch", "origin", target.base)
         files = {}
         for f in PRODUCT_FILES:
-            code, out = await git(str(ws), "show", f"origin/{target.base}:{PRODUCT_DIR}/{f}")
+            code, out = await git_show_ns(str(ws), f"origin/{target.base}", f"product/{f}")
             files[f] = out if code == 0 else ""
         return files
 
@@ -139,6 +151,7 @@ class MemoryReader:
         """Assemble the memory block for a stage prompt (capped excerpts + paths)."""
         wanted = STAGE_MATRIX.get(stage, ["product.md"])
         product = await self.product_scope(project, workspace)
+        md = memory_dir(workspace)
         blocks: list[str] = []
         degraded = True
         for section in wanted:
@@ -146,14 +159,14 @@ class MemoryReader:
                 text = product.get(section, "")
                 note = f"{PRODUCT_DIR}/{section} (canonical repo)"
             elif section == "changelog":
-                text = _entries_tail(workspace, f"{MEMORY_DIR}/changelog", CAPS["changelog"])
-                note = f"{MEMORY_DIR}/changelog/"
+                text = _entries_tail(workspace, f"{md}/changelog", CAPS["changelog"])
+                note = f"{md}/changelog/"
             elif section == "decisions":
-                text = _entries_tail(workspace, f"{MEMORY_DIR}/decisions", CAPS["decisions"])
-                note = f"{MEMORY_DIR}/decisions/"
+                text = _entries_tail(workspace, f"{md}/decisions", CAPS["decisions"])
+                note = f"{md}/decisions/"
             else:
-                text = _read(workspace, f"{MEMORY_DIR}/{section}")
-                note = f"{MEMORY_DIR}/{section}"
+                text = _read(workspace, f"{md}/{section}")
+                note = f"{md}/{section}"
             if not text.strip():
                 continue
             degraded = False
@@ -163,9 +176,12 @@ class MemoryReader:
         return "\n\n".join(blocks)
 
     async def freshness(self, workspace: str, base: str) -> int | None:
-        """Commits on origin/<base> since the last commit touching .gumo/ — the
-        memory-staleness metric shown on the dashboard."""
-        code, last = await git(workspace, "rev-list", "-1", f"origin/{base}", "--", ".gumo")
+        """Commits on origin/<base> since the last commit touching the engine
+        namespace — the memory-staleness metric shown on the dashboard. BOTH
+        pathspecs are passed (git tolerates absent ones), so whichever tree
+        the repo carries counts."""
+        code, last = await git(workspace, "rev-list", "-1", f"origin/{base}",
+                               "--", ENGINE_DIR, *LEGACY_ENGINE_DIRS)
         if code != 0 or not last.strip():
             return None
         code, count = await git(workspace, "rev-list", "--count",
@@ -179,16 +195,23 @@ class MemoryReader:
         cache.mkdir(parents=True, exist_ok=True)
         code, sha = await git(workspace, "rev-parse", f"origin/{base}")
         listed: dict[str, int] = {}
-        for rel_dir, names in ((MEMORY_DIR, REPO_FILES), (PRODUCT_DIR, PRODUCT_FILES)):
+        for scope, names in (("memory", REPO_FILES), ("product", PRODUCT_FILES)):
             for name in names:
-                code, out = await git(workspace, "show", f"origin/{base}:{rel_dir}/{name}")
-                if code == 0 and out.strip():
+                fcode, out = await git_show_ns(workspace, f"origin/{base}", f"{scope}/{name}")
+                if fcode == 0 and out.strip():
                     (cache / name).write_text(out)
                     listed[name] = len(out)
         for entry_dir in ("changelog", "decisions"):
-            code, out = await git(workspace, "ls-tree", "--name-only",
-                                  f"origin/{base}", f"{MEMORY_DIR}/{entry_dir}/")
-            listed[entry_dir] = len([l for l in out.splitlines() if l.strip().endswith(".md")]) if code == 0 else 0
+            n = 0
+            # same precedence as every other read: legacy wins when present
+            for ns in (*LEGACY_ENGINE_DIRS, ENGINE_DIR):
+                lcode, out = await git(workspace, "ls-tree", "--name-only",
+                                       f"origin/{base}", f"{ns}/memory/{entry_dir}/")
+                if lcode == 0:
+                    n = len([l for l in out.splitlines() if l.strip().endswith(".md")])
+                    if n:
+                        break
+            listed[entry_dir] = n
         fresh = await self.freshness(workspace, base)
         (cache / "meta.json").write_text(json.dumps({
             "commit_sha": sha.strip() if code == 0 else "",
