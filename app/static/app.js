@@ -107,9 +107,70 @@ function renderInbox() {
   const empty = (ME && ME.role === 'member' && WORKSPACES && !WORKSPACES.length)
     ? 'no workspace access yet &mdash; ask your CtrlLoop admin to assign you to a workspace'
     : 'nothing here';
-  const strip = candidateStrip();
+  const strip = candidateStrip() + noticeStrip();
   document.getElementById('inbox-list').innerHTML = strip
     + (items.length ? items.map(row).join('') : `<div class="empty">${empty}</div>`);
+}
+
+// Epic I: proactive-routine notices — risk alerts (badge + dismiss),
+// proposals (Adopt / Dismiss), standup digests + planning packs
+// (collapsible markdown cards), routine notes.
+const NOTICE_BADGE = { risk_alert: 'risk', proposal: 'proposal',
+                       standup_digest: 'standup', planning_pack: 'planning',
+                       routine_note: 'note' };
+function noticeStrip() {
+  const notices = (inboxCache && inboxCache.notices) || [];
+  if (!notices.length) return '';
+  const cards = notices.map((n) => {
+    const badge = `<span class="badge">${esc(NOTICE_BADGE[n.kind] || n.kind)}</span>`;
+    const meta = `<span class="hint" style="display:inline">${esc(n.source || '')} &middot; ${fmtAgo(n.created_at)}</span>`;
+    let actions = `<button onclick="dismissNotice(${Number(n.id)})">Dismiss</button>`;
+    if (n.kind === 'proposal') {
+      const opts = (window.PROJECTS_CACHE || []).map((p) => `<option value="${attr(p.slug)}"${(n.refs && n.refs.project) === p.slug ? ' selected' : ''}>${esc(p.slug)}</option>`).join('');
+      actions = `<select id="np-proj-${Number(n.id)}">${opts}</select>
+        <select id="np-as-${Number(n.id)}"><option value="feature" selected>feature</option><option value="task">task</option></select>
+        <button onclick="adoptNotice(${Number(n.id)})">Adopt</button> ${actions}`;
+    }
+    const long = n.kind === 'standup_digest' || n.kind === 'planning_pack'
+      || n.kind === 'proposal';
+    const body = (n.body || '').slice(0, 4000);
+    const bodyHtml = long
+      ? `<details><summary class="hint" style="display:inline">details</summary><pre style="white-space:pre-wrap; margin:4px 0">${esc(body)}</pre></details>`
+      : `<div style="margin:4px 0; white-space:pre-wrap">${esc(body.slice(0, 400))}</div>`;
+    return `<div class="panel" style="margin:6px 0; padding:8px">
+      <div>${badge} <strong>${esc(n.title || '')}</strong> ${meta}</div>
+      ${bodyHtml}
+      <div class="u-row">${actions}</div>
+    </div>`;
+  }).join('');
+  return `<div class="section-label" style="margin:8px 10px 0">Notices</div>${cards}`;
+}
+
+async function dismissNotice(id) {
+  try {
+    const r = await fetch('api/inbox/notices/' + id + '/dismiss', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({}),
+    });
+    const data = await r.json();
+    if (!r.ok) uiMsg('Error: ' + (data.detail || r.status));
+    lastInbox = ''; refreshInbox();
+  } catch (e) { uiMsg('Error: ' + e); }
+}
+
+async function adoptNotice(id) {
+  const project = (document.getElementById('np-proj-' + id) || {}).value || '';
+  const as = (document.getElementById('np-as-' + id) || {}).value || 'feature';
+  try {
+    const r = await fetch('api/inbox/notices/' + id + '/adopt', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ as, project }),
+    });
+    const data = await r.json();
+    if (!r.ok) { uiMsg('Error: ' + (data.detail || r.status)); return; }
+    lastInbox = ''; refreshInbox(); refresh(true);
+    if (data.job_id) openItem(data.job_id);
+  } catch (e) { uiMsg('Error: ' + e); }
 }
 
 // Epic D3: parked Slack decision candidates — confirm (scope picker) / dismiss
@@ -181,7 +242,9 @@ async function refreshInbox() {
     const sig = JSON.stringify(data);
     if (sig === lastInbox) return;
     lastInbox = sig; inboxCache = data;
-    const n = (data.counts && data.counts.mine) || 0;
+    // notices join the badge (Epic I0)
+    const n = ((data.counts && data.counts.mine) || 0)
+      + ((data.counts && data.counts.notices) || 0);
     const b = document.getElementById('await-badge');
     if (b) { b.textContent = String(n); b.style.display = n ? '' : 'none'; }
     const chip = document.getElementById('me-chip');
@@ -1378,11 +1441,82 @@ document.addEventListener('keydown', (e) => {
 });
 window.addEventListener('hashchange', routeHash);
 
-loadProjects(); refresh(true); refreshMemory(true); loadContext(); loadOutcomes(); loadDecisions(); loadAutonomy(); routeHash();
+// ---------- proactive routines (Epic I1: the Routines panel) ----------
+
+let lastRoutines = '';
+async function loadRoutines() {
+  const box = document.getElementById('routines-body');
+  if (!box) return;
+  try {
+    const r = await fetch('api/routines');
+    if (!r.ok) return;
+    const data = await r.json();
+    const sig = JSON.stringify(data);
+    if (sig === lastRoutines) return;
+    lastRoutines = sig;
+    const isAdmin = ME && ME.role === 'admin';
+    if (!data.routines.length) { box.innerHTML = '<div class="empty">no routines visible</div>'; return; }
+    const wsName = (id) => {
+      if (id == null) return 'instance';
+      const w = (WORKSPACES || []).find((x) => x.id === id);
+      return w ? w.slug : ('ws ' + id);
+    };
+    const rows = data.routines.map((rt) => {
+      const sched = rt.schedule || (rt.builtin ? '(from settings)' : '');
+      const status = rt.last_status
+        ? `<span class="badge">${esc(rt.last_status)}</span>` : '';
+      const last = rt.last_run_at ? fmtAgo(rt.last_run_at) : 'never';
+      const runs = (rt.runs || []).slice(0, 8).map((run) => {
+        const dur = run.ended_at ? Math.round(run.ended_at - run.started_at) + 's' : 'running';
+        return `<div class="hint">${fmtAgo(run.started_at)} &middot; ${esc(run.status || '?')} &middot; ${dur}${run.items_emitted ? ' · ' + run.items_emitted + ' item(s)' : ''}${run.detail ? ' — ' + esc(String(run.detail).slice(0, 120)) : ''}</div>`;
+      }).join('') || '<div class="hint">no runs yet</div>';
+      const controls = isAdmin ? `
+        ${rt.kind === 'reaper' ? '<span class="hint" style="display:inline">non-disableable</span>'
+          : `<button onclick="toggleRoutine(${rt.id}, ${rt.enabled ? 'false' : 'true'})">${rt.enabled ? 'Disable' : 'Enable'}</button>`}
+        <button onclick="runRoutineNow(${rt.id})">Run now</button>` : '';
+      return `<div class="panel" style="margin:6px 0; padding:8px">
+        <div><strong>${esc(rt.kind)}</strong>
+          <span class="hint" style="display:inline">${esc(wsName(rt.workspace_id))}
+          &middot; ${esc(sched)} &middot; last run ${last}</span>
+          ${status}${rt.enabled ? '' : ' <span class="badge">disabled</span>'}</div>
+        <div class="u-row">${controls}</div>
+        <details><summary class="hint" style="display:inline">run history</summary>${runs}</details>
+      </div>`;
+    }).join('');
+    const flag = data.enabled ? ''
+      : '<div class="hint">ROUTINES_ENABLED=false — workspace routines are paused (builtin loops keep running)</div>';
+    box.innerHTML = flag + rows;
+  } catch (e) { /* advisory panel */ }
+}
+
+async function toggleRoutine(id, enable) {
+  try {
+    const r = await fetch('api/routines/' + id, {
+      method: 'PUT', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ enabled: enable === true || enable === 'true' }),
+    });
+    const data = await r.json();
+    if (!r.ok) uiMsg('Error: ' + (data.detail || r.status));
+    lastRoutines = ''; loadRoutines();
+  } catch (e) { uiMsg('Error: ' + e); }
+}
+
+async function runRoutineNow(id) {
+  try {
+    const r = await fetch('api/routines/' + id + '/run', { method: 'POST' });
+    const data = await r.json();
+    if (!r.ok) uiMsg('Error: ' + (data.detail || r.status));
+    else uiMsg('Routine armed — it fires on the scheduler’s next tick.');
+    setTimeout(() => { lastRoutines = ''; loadRoutines(); }, 3000);
+  } catch (e) { uiMsg('Error: ' + e); }
+}
+
+loadProjects(); refresh(true); refreshMemory(true); loadContext(); loadOutcomes(); loadDecisions(); loadAutonomy(); loadRoutines(); routeHash();
 setInterval(() => refresh(false), 10000);
 setInterval(() => refreshMemory(false), 60000);
 setInterval(() => loadOutcomes(), 60000);
 setInterval(() => loadAutonomy(), 60000);
+setInterval(() => loadRoutines(), 60000);
 
 // ---------- auth: who am I, sign-out, expired-session redirect ----------
 
