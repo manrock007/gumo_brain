@@ -1771,6 +1771,43 @@ class JobStore:
                 (since,)).fetchall()
             return {r["project"]: r["n"] for r in rows}
 
+    # ---------- planning-pack reads (Epic I6) ----------
+
+    def stage_runs_window(self, workspace_id: int, since: float,
+                          until: float) -> list[dict]:
+        """A workspace's stage runs started in [since, until) — the weekly
+        receipts input (same join semantics as autonomy_run_rows)."""
+        with self._conn() as c:
+            rows = c.execute(
+                """SELECT r.* FROM stage_runs r JOIN jobs j ON j.issue_id = r.job_id
+                   WHERE j.workspace_id = ? AND r.started_at >= ?
+                     AND r.started_at < ? ORDER BY r.id""",
+                (int(workspace_id), since, until)).fetchall()
+            return [dict(r) for r in rows]
+
+    def redo_rows_window(self, workspace_id: int, since: float,
+                         until: float) -> list[dict]:
+        """Human redos in [since, until) — TARGET-stage attributed, exactly
+        like autonomy_redo_rows."""
+        with self._conn() as c:
+            rows = c.execute(
+                """SELECT g.stage AS stage, g.at AS at
+                   FROM guidance_log g JOIN jobs j ON j.issue_id = g.job_id
+                   WHERE g.action = 'redo' AND j.workspace_id = ?
+                     AND g.at >= ? AND g.at < ? ORDER BY g.id""",
+                (int(workspace_id), since, until)).fetchall()
+            return [dict(r) for r in rows]
+
+    def outcomes_decided_window(self, workspace_id: int, since: float,
+                                until: float) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute(
+                """SELECT * FROM outcomes WHERE workspace_id = ?
+                   AND decided_at IS NOT NULL AND decided_at >= ?
+                   AND decided_at < ? ORDER BY id""",
+                (int(workspace_id), since, until)).fetchall()
+            return [dict(r) for r in rows]
+
     # ---------- spend (Epic I0/I4; the substrate Epic G4 extends) ----------
 
     def costs_since(self, since: float) -> dict:

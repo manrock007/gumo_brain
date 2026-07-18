@@ -497,6 +497,37 @@ async def _handle_standup(ctx: RoutineContext):
         1 if new else 0
 
 
+# ---------- I6: the weekly planning pack ----------
+
+
+async def _handle_weekly_planning(ctx: RoutineContext):
+    """Assemble the weekly review mechanically (no model run; the next-lap
+    ranking is a transparent formula stated in the pack body). Always
+    produces a pack — the weekly cadence is the point, unlike the
+    exception-only standup. GET /api/inbox carries it; no bespoke endpoint
+    (deliberate)."""
+    ws = ctx.workspace
+    if ws is None:
+        return "skipped", "workspace row missing", 0
+    pack = digests.build_planning_pack(ctx.store, ctx.settings, ws, ctx.now)
+    tz = routine_tz(ctx.settings)
+    iso_week = datetime.fromtimestamp(ctx.now, tz).strftime("%G-W%V")
+    key = f"{ws['id']}:{iso_week}"
+    new = ctx.store.inbox_item_add(
+        "planning_pack", key, pack["title"], pack["body"],
+        refs={"week": iso_week, "ranked": pack["ranked"]},
+        workspace_id=ws["id"], source="weekly_planning")
+    if new:
+        row = ctx.store.inbox_item_by_key("planning_pack", key)
+        if row:
+            ctx.store.inbox_expire_predecessors("planning_pack", ws["id"],
+                                                row["id"])
+        if ctx.workspaces is not None:
+            await ctx.workspaces.notify_text(
+                ws, f"*{pack['title']}*\n\n{pack['body'][:3500]}")
+    return "ok", f"week {iso_week}", 1 if new else 0
+
+
 REGISTRY: dict = {
     "sweep": _handle_sweep,
     "reaper": _handle_reaper,
@@ -505,6 +536,7 @@ REGISTRY: dict = {
     "memory_upkeep": _handle_memory_upkeep,
     "risk_scan": _handle_risk_scan,
     "proposal_scan": _handle_proposal_scan,
+    "weekly_planning": _handle_weekly_planning,
 }
 
 

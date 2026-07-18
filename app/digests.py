@@ -139,3 +139,140 @@ def build_standup(store: JobStore, settings: Settings, ws: dict,
         "body": "\n\n".join(body_parts),
         "sections": sections,
     }
+
+
+# ---------- I6: the weekly planning pack ----------
+
+
+def week_stats(runs: list[dict], redos: list[dict]) -> dict:
+    """Receipts for one week of stage runs — the exact column semantics Epic
+    C1's scorer established: OPEN runs (result_status='') are excluded from
+    every denominator; gate wait uses only runs with BOTH gate timestamps."""
+    closed = [r for r in runs if (r.get("result_status") or "")]
+    cost = sum(float(r.get("cost_usd") or 0) for r in runs)
+    waits = sorted((r["gate_answered_at"] - r["gate_posted_at"]) for r in runs
+                   if r.get("gate_posted_at") and r.get("gate_answered_at"))
+    median_wait = waits[len(waits) // 2] if waits else None
+    answered = [r for r in closed if r.get("gate_answered_at")]
+    redo_rate = (len(redos) / len(answered)) if answered else 0.0
+    return {"runs": len(closed), "cost_usd": round(cost, 2),
+            "median_gate_wait_s": median_wait,
+            "redo_rate": round(redo_rate, 3), "answered_gates": len(answered)}
+
+
+def _trend(cur, prev) -> str:
+    if prev in (None, 0) and cur in (None, 0):
+        return "→"
+    if prev in (None, 0):
+        return "↑"
+    if cur is None:
+        return "→"
+    if cur > prev * 1.05:
+        return "↑"
+    if cur < prev * 0.95:
+        return "↓"
+    return "→"
+
+
+RANKING_FORMULA = ("ranking: regressed-outcome sources first, then "
+                   "risk-linked (sentry clusters), then by evidence count "
+                   "desc, then oldest first")
+
+
+def rank_proposals(proposals: list[dict]) -> list[dict]:
+    """Deterministic 'what I'd do next lap' ordering — a transparent formula
+    (stated in the pack body), never a model run."""
+    def key(p):
+        try:
+            refs = json.loads(p.get("refs") or "{}")
+            if not isinstance(refs, dict):
+                refs = {}
+        except (ValueError, TypeError):
+            refs = {}
+        source_kind = refs.get("source_kind") or ""
+        if refs.get("verdict") == "regressed":
+            priority = 0
+        elif source_kind == "sentry-cluster":
+            priority = 1
+        else:
+            priority = 2
+        return (priority, -int(refs.get("count") or 0),
+                float(p.get("created_at") or 0), int(p.get("id") or 0))
+    return sorted(proposals, key=key)
+
+
+def build_planning_pack(store: JobStore, settings: Settings, ws: dict,
+                        now: float | None = None) -> dict:
+    """The weekly review ENGINE.md §8 promised, assembled MECHANICALLY:
+    receipts (this week vs last, trend arrows), outcome-ledger movement,
+    autonomy shifts, open proposals, and the ranked next-lap list."""
+    now = now or time.time()
+    ws_id = ws["id"]
+    week = 7 * 86400
+    this_runs = store.stage_runs_window(ws_id, now - week, now)
+    prev_runs = store.stage_runs_window(ws_id, now - 2 * week, now - week)
+    this_stats = week_stats(this_runs, store.redo_rows_window(ws_id, now - week, now))
+    prev_stats = week_stats(prev_runs,
+                            store.redo_rows_window(ws_id, now - 2 * week, now - week))
+
+    def fmt_wait(s):
+        return f"{s / 3600:.1f}h" if s is not None else "n/a"
+
+    receipts_lines = [
+        f"- Runs: {this_stats['runs']} "
+        f"({_trend(this_stats['runs'], prev_stats['runs'])} vs {prev_stats['runs']})",
+        f"- Cost: ${this_stats['cost_usd']:.2f} "
+        f"({_trend(this_stats['cost_usd'], prev_stats['cost_usd'])} vs "
+        f"${prev_stats['cost_usd']:.2f})",
+        f"- Median gate wait: {fmt_wait(this_stats['median_gate_wait_s'])} "
+        f"({_trend(this_stats['median_gate_wait_s'], prev_stats['median_gate_wait_s'])} "
+        f"vs {fmt_wait(prev_stats['median_gate_wait_s'])})",
+        f"- Redo rate: {this_stats['redo_rate']:.0%} "
+        f"({_trend(this_stats['redo_rate'], prev_stats['redo_rate'])} vs "
+        f"{prev_stats['redo_rate']:.0%})",
+    ]
+
+    this_outcomes = store.outcomes_decided_window(ws_id, now - week, now)
+    prev_outcomes = store.outcomes_decided_window(ws_id, now - 2 * week, now - week)
+
+    def dist(rows):
+        d: dict[str, int] = {}
+        for r in rows:
+            v = r.get("verdict") or "unmeasured"
+            d[v] = d.get(v, 0) + 1
+        return d
+
+    outcome_lines = [f"- Decided this week: {len(this_outcomes)} "
+                     f"({dist(this_outcomes)}) vs last week "
+                     f"{len(prev_outcomes)} ({dist(prev_outcomes)})"]
+    for r in this_outcomes:
+        outcome_lines.append(f"  - {r.get('feature_id')}: {r.get('verdict')}"
+                             + (f" — {(r.get('learning') or '')[:120]}"
+                                if (r.get("learning") or "").strip() else ""))
+
+    autonomy_lines = []
+    for e in store.autonomy_events_recent([ws_id], 100, since=now - week):
+        if e["kind"] in ("level_change", "pin_set", "pin_clear", "clawback"):
+            autonomy_lines.append(f"- {e.get('detail') or e['kind']}")
+    if not autonomy_lines:
+        autonomy_lines = ["- no shifts this week"]
+
+    proposals = store.inbox_items_open([ws_id], kinds=("proposal",))
+    ranked = rank_proposals(proposals)
+    proposal_lines = [f"- #{p['id']}: {p['title']}" for p in ranked] \
+        or ["- none open"]
+    next_lap = [f"{i + 1}. {p['title']} (notice #{p['id']})"
+                for i, p in enumerate(ranked[:5])] \
+        or ["1. Nothing queued — a quiet lap."]
+
+    body = "\n\n".join([
+        "## Receipts (this week vs last)\n" + "\n".join(receipts_lines),
+        "## Outcome-ledger movement\n" + "\n".join(outcome_lines),
+        "## Autonomy shifts\n" + "\n".join(autonomy_lines),
+        "## Open proposals\n" + "\n".join(proposal_lines),
+        f"## What I'd do next lap\n_({RANKING_FORMULA})_\n\n"
+        + "\n".join(next_lap),
+    ])
+    return {"title": f"Weekly planning pack — {ws['name']}", "body": body,
+            "receipts": {"this_week": this_stats, "last_week": prev_stats},
+            "ranked": [p["id"] for p in ranked]}
