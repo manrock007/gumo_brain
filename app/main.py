@@ -92,6 +92,21 @@ async def lifespan(app: FastAPI):
         log.warning("CLICKUP_TOKEN is set but no list id is configured anywhere "
                     "(CLICKUP_LIST_ID or a per-workspace list) — the ClickUp "
                     "integration is DISABLED.")
+    # Epic G2: a loud, non-secret line naming the detected model-auth backend
+    # so a starved/misconfigured env is visible at boot, not silent mid-run.
+    from .secrets import build_subprocess_env, detect_auth_backend
+    backend = detect_auth_backend(build_subprocess_env(settings))
+    log.info("model auth backend detected: %s", backend)
+    # Epic G5: the Anthropic policy line — personal Max OAuth creds must not
+    # route OTHER users' requests. Warn loudly (not fatal — break-glass) when a
+    # Max token is in use on an instance with more than one enabled user.
+    if settings.using_max_oauth_token and store.enabled_user_count() > 1:
+        log.warning(
+            "POLICY: this instance uses personal Claude Max OAuth credentials "
+            "(CLAUDE_CODE_OAUTH_TOKEN) but has >1 enabled user. Anthropic policy "
+            "prohibits routing other users' requests through personal Max "
+            "credentials — flip to ANTHROPIC_API_KEY (unset CLAUDE_CODE_OAUTH_TOKEN) "
+            "before onboarding a second user. See OPERATIONS.md 'Model billing'.")
     # first-run wizard (§14): a deployment that has already processed jobs is
     # not a first run — never greet an upgrading operator with onboarding
     if "setup_done" not in store.config_all() and store.job_count() > 0:

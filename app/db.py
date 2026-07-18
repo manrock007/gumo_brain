@@ -917,6 +917,13 @@ class JobStore:
         with self._conn() as c:
             return c.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
 
+    def enabled_user_count(self) -> int:
+        """Enabled (non-disabled) users — drives the Epic G5 Max→API policy
+        warning (personal Max creds must not route a 2nd user's requests)."""
+        with self._conn() as c:
+            return c.execute(
+                "SELECT COUNT(*) AS n FROM users WHERE disabled = 0").fetchone()["n"]
+
     def user_list(self) -> list[dict]:
         """All users WITHOUT pw_hash — safe for the admin UI."""
         with self._conn() as c:
