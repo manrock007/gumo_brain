@@ -217,6 +217,25 @@ learning across tenants — real network-effect potential, severe
 privacy/enterprise-trust constraints; do not attempt before SOC 2 and
 per-tenant isolation are boring. (XL)
 
+### Agreed scope (founder decision log, 2026-07-18)
+
+- **Tier 1**: do bets **1, 2, 3, 4**. Bet 2 ships with **manual override pins**
+  — a per-gate "never auto-advance" setting that always wins over the computed
+  autonomy level (e.g. pin P7 human-gated forever regardless of track record).
+- **Tier 2**: do everything **except** the Claude Max → API-billing switch,
+  which is deferred to the very end. The GitHub PAT → GitHub App migration is
+  in scope now.
+- **Dual-DRI correction (folds into bet 4)**: the original workflow contract
+  is TWO DRIs (founder + developer). The engine currently flattens them: at
+  ClickUp adoption it takes `assigned dev dri` and uses `assigned founder dri`
+  only as a *fallback when dev is empty*, keeps just the first person, and
+  stores a single `owner` column (`app/worker.py:1016-1019`, `app/db.py:31`);
+  every gate then assigns that one person regardless of stage
+  (`app/engine.py:633-635`). Fix: store both DRIs, type each stage's gate
+  (product vs technical), route product gates (P0/P1 intake-PRD, P9 ship)
+  to the founder DRI and technical gates (P2–P8) to the dev DRI, with the
+  other DRI CC'd and either allowed to answer.
+
 ### The sequence in one line
 
 **#1 → #2 → #4 → #5/#6/#7 in parallel with first design partners → #8 → #9/#10.**
