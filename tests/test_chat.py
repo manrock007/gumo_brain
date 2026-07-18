@@ -621,9 +621,17 @@ class TestChatEndpoints:
         assert r.status_code == 409
         assert "kind" in r.json()["detail"]
 
-    def test_single_flight_and_get(self, client):
+    def test_single_flight_and_get(self, client, monkeypatch):
         c, m = client
         store = self._park_feature(m, "feat-api2")
+        # keep the background turn in-flight deterministically: single-flight is
+        # about a SECOND message arriving while the first is unanswered, so the
+        # first answer must not race to completion before the second POST.
+        import asyncio as _a
+
+        async def _hang(job, message, publish=None):
+            await _a.Event().wait()
+        monkeypatch.setattr(m.app.state.worker.engine, "chat", _hang)
         r = c.post("/api/jobs/feat-api2/chat", headers=AUTH, json={"message": "why B?"})
         assert r.status_code == 202
         # second message while the first is unanswered -> 409

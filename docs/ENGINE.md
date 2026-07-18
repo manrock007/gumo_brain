@@ -1222,3 +1222,53 @@ override re-kick audits `budget.override`. Budget 0 is inert.
 
 **Model billing (G5).** `using_max_oauth_token` is the policy signal; startup
 warns when personal Max creds run a >1-user instance (flip to `ANTHROPIC_API_KEY`).
+
+## 19. Execution substrate (Epic F)
+
+**SQLite stays the zero-config default across all of F** — an existing
+single-process SQLite instance keeps working byte-for-byte with no new config.
+Postgres, multi-worker, and sandboxed runs are additive and off/absent by
+default. Operator-facing config + migration steps are in OPERATIONS.md §20.
+
+**DB driver seam (F1).** `app/dbdriver.py` — `DBDriver` with `SqliteDriver`
+(default; owns_schema=False → JobStore runs SCHEMA + MIGRATIONS in-process) and
+`PostgresDriver` (psycopg3 pool; owns_schema=True → Alembic owns the schema).
+`JobStore(dsn)` picks the driver off the DSN (empty/path → SQLite;
+`postgresql://` → Postgres); `resolve_driver` fails closed to SQLite on an
+unknown backend. The Postgres adapter rewrites qmark `?`→`%s` (skipping string
+literals, doubling literal `%`), and `_insert_returning` synthesizes lastrowid
+via an appended `RETURNING <pk>` at the ~7 real sites only (no blanket rewrite —
+most PKs are not named `id`). All `INSERT OR IGNORE/REPLACE` became portable
+`ON CONFLICT` (same dedupe contract on SQLite; valid on Postgres). Exceptions
+are driver-normalized (`db.IntegrityError`/`OperationalError`). Alembic baseline
+is *generated from* the live SQLite schema (`scripts/gen_pg_baseline.py`); every
+future MIGRATIONS column gets a matching revision (static lockstep guard). All
+CAS transitions hold under Postgres READ COMMITTED (plain `UPDATE … WHERE`).
+Postgres FTS (D4 retrieval) is out of scope — `fts_enabled=False`, `mem_search`
+returns `[]` (a read enhancement, no control flow depends on it).
+
+**Multi-worker queue (F2).** SQLite keeps the single-consumer in-process
+priority queue and the blanket boot recovery (`workers=1`). On Postgres the
+worker claims jobs from the DB in ONE statement —
+`UPDATE … WHERE issue_id=(SELECT … FOR UPDATE SKIP LOCKED LIMIT 1)` advances the
+row to `running` + stamps `claimed_by` — closing the double-dispatch window; the
+in-process queue is NOT a parallel dispatch source there. Per-repo serialization
+moves to Postgres advisory locks (`app/repolocks.py`), and the
+`claude_global`/`chat_global` CLI-config-dir guards ALSO become cross-process
+advisory locks (a per-event-loop `asyncio.Lock` would let two worker processes
+race the shared config dir). Boot recovery is scoped to `claimed_by == worker_id`
+(a sibling's live run is never reset); cross-worker zombies fall to the reaper.
+
+**Sandboxed runs (F3, FLAG).** `app/runner.py` — `LocalRunner` (default) is the
+exact subprocess exec; `ContainerRunner` (flag) runs each Claude invocation in a
+disposable `docker run --rm` with the clone bind-mounted, only the G2
+allow-listed env (0600 `--env-file`), and a mandatory egress-allowlist network
+(empty → fail closed). Kill/timeout issues `docker kill`; the env-file is
+unlinked. `resolve_runner` fails closed to local.
+
+**Observability (F4).** `/metrics` (dependency-free Prometheus exposition;
+queue depth, jobs, runs, cost, gate latency, autonomy, budget spend; admin-gated
+by default, Bearer with `METRICS_TOKEN`; TTL-cached). `/health/ready` (DB hard
+dependency → 503; worker/scheduler heartbeats; booleans only). Structured JSON
+logs (`LOG_FORMAT=json`) carry `request_id` (X-Request-ID middleware) and
+`job_id` (set around each job's processing).

@@ -488,7 +488,15 @@ def test_routines_api(tmp_path, monkeypatch):
         # run-now goes through the scheduler (never inline)
         assert client.post(f"/api/routines/{reaper['id']}/run",
                            headers=AUTH).status_code == 200
-        assert reaper["id"] in client.app.state.scheduler._run_now
+        # the arm was routed to the scheduler (never inline). It may already
+        # have been consumed by a scheduler tick — race-tolerant across the
+        # _run_now → _inflight → drained transition; the routine_run_now audit
+        # event asserted just below is the durable proof of registration.
+        sched = client.app.state.scheduler
+        assert (reaper["id"] in sched._run_now
+                or reaper["id"] in sched._inflight
+                or any(e["kind"] == "routine_run_now"
+                       for e in store.admin_events_recent(10)))
         # …and the accepted arm is audited with the admin as actor (a forced
         # firing is otherwise indistinguishable from a scheduled one)
         events = [e for e in store.admin_events_recent(10)

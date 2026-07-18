@@ -84,6 +84,17 @@ restriction. See MIGRATION-CTRLLOOP.md for the rename/infra checklist.
 - `GET /api/audit` / `GET /api/audit/export` — the append-only audit log viewer
   and the SIEM JSONL cursor-paged export (Epic E4).
 - `GET /api/budgets` — per-workspace spend vs budget (Epic G4).
+- `GET /metrics` — Prometheus exposition (admin-gated by default; Bearer with
+  `METRICS_TOKEN`). `GET /health/ready` — readiness (DB hard-dep → 503;
+  worker/scheduler heartbeats). `/health` stays the open liveness probe (Epic F4).
+
+**Execution substrate (Epic F).** SQLite is the zero-config default and nothing
+below is required. Set `DATABASE_URL=postgresql://…` for the Postgres driver
+(Alembic-owned schema; `pip install -r requirements-postgres.txt`; migrate an
+existing SQLite instance with `alembic upgrade head` + `scripts/sqlite_to_pg.py`).
+`WORKERS>1` requires Postgres (DB-claim queue + advisory locks). `RUNNER_BACKEND=
+container` sandboxes each run (FLAG, off). `LOG_FORMAT=json` for structured logs.
+See OPERATIONS.md §20 and docs/ENGINE.md §19.
 
 - `GET /` — dashboard: intake (Sentry fix / request / **feature pipeline**), queue
   columns with inline gate answering (Proceed / Redo / Skip), feature **stage strips**
