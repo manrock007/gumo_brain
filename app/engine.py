@@ -47,6 +47,7 @@ from .fixer import (
     BranchLostError,
     engine_dir,
     git,
+    mint_git_token,
     prepare_feature_workspace,
     prepare_workspace,
     run_claude_raw,
@@ -404,6 +405,10 @@ class Engine:
         timeout = (self.settings.doc_stage_timeout_seconds if kind == "doc"
                    else self.settings.claude_timeout_seconds)
 
+        # G1: mint the run's per-repo installation token once (PAT fallback when
+        # the app is off / can't reach the repo). Stage runs push to the feature
+        # branch, so they authenticate as the installation when available.
+        git_token = await mint_git_token(self.settings, target.repo)
         ask_answer = (job.get("resume_answer") or "").strip()
         resume_sid = (job.get("resume_session_id") or "").strip()
         resume_kind = job.get("gate_kind")  # 'ask' | 'steer' — captured before the clear
@@ -419,7 +424,8 @@ class Engine:
             publish("status", "resuming the session with your steer"
                     if resume_kind == "steer" else "resuming the session with your answer")
             raw = await self._invoke(workspace, prompt, tools, timeout, resume_session=resume_sid,
-                                     publish=publish, interrupt_event=interrupt_event)
+                                     publish=publish, interrupt_event=interrupt_event,
+                                     git_token=git_token)
             if raw.status == "session_lost":
                 resuming, resume_reason = False, "the session could not be resumed"
             else:
@@ -439,7 +445,8 @@ class Engine:
             log.info("job %s: running P%s (%s) attempt %s", job_id, stage, stage_name(stage), attempt)
             publish("status", f"running P{stage} {stage_name(stage)} (attempt {attempt})")
             raw = await self._invoke(workspace, prompt, tools, timeout,
-                                     publish=publish, interrupt_event=interrupt_event)
+                                     publish=publish, interrupt_event=interrupt_event,
+                                     git_token=git_token)
 
         # a human tripped the steer event mid-run: the CLI was stopped with the
         # session intact — checkpoint the work so far and re-enqueue to resume it
@@ -794,7 +801,8 @@ class Engine:
 
     async def _invoke(self, workspace, prompt, tools, timeout,
                       resume_session: str | None = None, fork_session: bool = False,
-                      config_dir: str | None = None, publish=None, interrupt_event=None):
+                      config_dir: str | None = None, publish=None, interrupt_event=None,
+                      git_token: str | None = None):
         """All stage/session claude invocations funnel here: the engine owns the
         session id on fresh runs (timeout/error runs still have a resumable id on
         record), and invocations sharing the session store serialize globally.
@@ -813,11 +821,12 @@ class Engine:
                     self.settings, workspace, prompt, tools, timeout,
                     resume_session=resume_session, fork_session=fork_session,
                     session_id=sid, config_dir=cdir,
-                    on_event=publish, interrupt_event=interrupt_event)
+                    on_event=publish, interrupt_event=interrupt_event,
+                    git_token=git_token)
             return await run_claude_raw(self.settings, workspace, prompt, tools, timeout,
                                         resume_session=resume_session,
                                         fork_session=fork_session, session_id=sid,
-                                        config_dir=cdir)
+                                        config_dir=cdir, git_token=git_token)
 
         if config_dir is None:
             # stage/bootstrap runs touch the stage/default store — ALWAYS serialize:

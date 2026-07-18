@@ -245,6 +245,17 @@ async def prepare_feature_workspace(settings: Settings, target: RepoTarget,
     return workspace
 
 
+async def mint_git_token(settings: Settings, repo: str) -> str | None:
+    """Resolve the GH_TOKEN a run for `repo` should carry (Epic G1). Returns an
+    app installation token when the GitHub App covers the repo, else None so the
+    caller lets the PAT env default apply. Never raises — app errors fall back."""
+    if not getattr(settings, "github_app_enabled", False):
+        return None
+    from .githubapp import effective_git_token
+    token, kind = await effective_git_token(settings, repo)
+    return token if kind == "app" else None
+
+
 def _claude_cmd_env(settings: Settings, prompt: str, allowed_tools: list[str],
                     resume_session: str | None, disallowed_tools: list[str] | None,
                     session_id: str | None, fork_session: bool,
@@ -554,18 +565,24 @@ async def run_claude(settings: Settings, target: RepoTarget, workspace: str, pro
     """v1 contract used by sentry/task jobs: PR URL sniffing + NEEDS_INPUT/NO_FIX.
     With on_event, the run streams live progress (tool calls / text) exactly like
     stage runs — same return contract either way."""
+    # G1: mint a per-repo short-lived installation token for the run's GH_TOKEN
+    # (falls back to the PAT when the app is off / can't reach the repo). The
+    # app private key never enters the subprocess — only this minted token does.
+    git_token = await mint_git_token(settings, target.repo)
     if on_event is not None:
         raw = await run_claude_stream(
             settings, workspace, prompt,
             allowed_tools=BASE_ALLOWED_TOOLS + target.allow,
             timeout=settings.claude_timeout_seconds,
             on_event=on_event,
+            git_token=git_token,
         )
     else:
         raw = await run_claude_raw(
             settings, workspace, prompt,
             allowed_tools=BASE_ALLOWED_TOOLS + target.allow,
             timeout=settings.claude_timeout_seconds,
+            git_token=git_token,
         )
     if raw.status == "timeout":
         return FixResult("timeout", detail=raw.text, meta=raw.meta)
