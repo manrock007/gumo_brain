@@ -96,6 +96,13 @@ existing SQLite instance with `alembic upgrade head` + `scripts/sqlite_to_pg.py`
 container` sandboxes each run (FLAG, off). `LOG_FORMAT=json` for structured logs.
 See OPERATIONS.md §20 and docs/ENGINE.md §19.
 
+**Swappable integrations (Epic H).** CtrLoop's tracker, VCS, agent-runtime, and
+analytics all sit behind published interfaces — ClickUp / GitHub / the Claude
+CLI / Mixpanel are the current drivers, each selected by a fail-closed factory
+(`TRACKER_PROVIDER` / `VCS_PROVIDER` / `AGENT_RUNTIME` / `ANALYTICS_PROVIDER`).
+Jira, GitLab, and Agent-SDK drivers are scaffolded (inert by default). See
+OPERATIONS.md §21 and docs/ENGINE.md "Abstraction seams".
+
 - `GET /` — dashboard: intake (Sentry fix / request / **feature pipeline**), queue
   columns with inline gate answering (Proceed / Redo / Skip), feature **stage strips**
   P0–P9, per-feature stats (cost/duration/gate-wait per stage), and the **Product

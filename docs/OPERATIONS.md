@@ -539,6 +539,27 @@ SQLite instance keeps working byte-for-byte with no new config.
   structured logs carrying `request_id` (from/into the `X-Request-ID` header)
   and `job_id` (set around each job's processing).
 
+## 21. Abstraction seams (Epic H)
+
+Swappable drivers behind published interfaces (see ENGINE.md "Abstraction
+seams"). Every key defaults to the current driver — an unconfigured instance is
+unchanged. Each factory fails **closed to the working default driver** for an
+empty or unknown value (there is no null tracker/VCS/runtime steady state), so a
+typo can never silently disable ClickUp/GitHub/the CLI.
+
+| Env var | Default | Meaning |
+| --- | --- | --- |
+| `TRACKER_PROVIDER` | `clickup` | issue tracker: `clickup` (default, today's behavior) or `jira` (scaffold → inert, degrades to dashboard-only). Empty/unknown → `clickup`. |
+| `VCS_PROVIDER` | `github` | version-control / PR host: `github` (default) or `gitlab` (scaffold → inert PR ops, PAT-only, clone still works). Empty/unknown → `github`. |
+| `AGENT_RUNTIME` | `cli` | agent implementation: `cli` (default, the `claude -p` subprocess) or `agent-sdk` (scaffold → raises on run). Empty/unknown → `cli`. |
+
+`ANALYTICS_PROVIDER` (§8) is the fourth seam (H4), already delivered by B3;
+unlike the three above it DOES have a null steady state (empty = no analytics,
+verdicts stay `unmeasured`), which is why it alone defaults to empty.
+
+The Jira/GitLab mapping notes and the Agent-SDK migration sketch live in
+`docs/TRACKER-JIRA.md`, `docs/VCS-GITLAB.md`, and `docs/CONVERSATIONS.md` §7.
+
 ## Appendix — Example configuration: the original Gumo instance
 
 The values that used to ship as code defaults, now purely this one customer's

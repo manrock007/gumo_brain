@@ -1272,3 +1272,41 @@ by default, Bearer with `METRICS_TOKEN`; TTL-cached). `/health/ready` (DB hard
 dependency → 503; worker/scheduler heartbeats; booleans only). Structured JSON
 logs (`LOG_FORMAT=json`) carry `request_id` (X-Request-ID middleware) and
 `job_id` (set around each job's processing).
+## Abstraction seams (Epic H)
+
+The four operator-facing integrations sit behind published interfaces so a
+deployment can swap a driver without touching engine/worker call sites. Each
+follows the same pattern (`name`/`enabled`, a `*_PROVIDERS` allow-list, a
+fail-closed `*_for(settings)` factory) established by the G2 secrets seam
+(`app/secrets.py`) and the B3 analytics seam. All four default to the current
+driver, so a zero-config instance is byte-for-byte unchanged.
+
+| Seam | Interface | Current driver (default) | Stub / migration target | Config key → default |
+| --- | --- | --- | --- | --- |
+| H1 Tracker | `app/tracker.py` `Tracker` | `ClickUpTracker` (`app/clickup.py`) | `JiraTracker` (inert, `docs/TRACKER-JIRA.md`) | `TRACKER_PROVIDER` → `clickup` |
+| H2 VCS | `app/vcs.py` `VCS` | `GitHubVCS` (`app/github.py`) | `GitLabVCS` (inert, `docs/VCS-GITLAB.md`) | `VCS_PROVIDER` → `github` |
+| H3 AgentRuntime | `app/runtime.py` `AgentRuntime` | `CLIRuntime` (`fixer._run_claude_*_impl`) | `AgentSDKRuntime` (raises `NotConfigured`; `docs/CONVERSATIONS.md` §7) | `AGENT_RUNTIME` → `cli` |
+| H4 Analytics | `app/analytics.py` `AnalyticsProvider` | `MixpanelAnalytics` | `NullAnalytics` (verdicts stay `unmeasured`) | `ANALYTICS_PROVIDER` → *(empty=null)* |
+
+**H4 is fulfilled by B3** — the analytics seam already ships to this exact
+pattern (`provider_for(settings, ws, transport)`); no H code was added, only
+this cross-reference. Its factory is named `provider_for` (vs
+`tracker_for`/`vcs_for`/`runtime_for`) — kept as-is to avoid churning B3/B4 call
+sites; the naming convention is otherwise identical.
+
+**Zero-config / no-behavior-change contract.** Every factory returns the current
+driver for an empty OR unknown provider name (fail closed to the *working*
+driver — Tracker/VCS/runtime have no null steady state, unlike analytics). The
+trackers and VCS stay best-effort: a stub driver reports `enabled=False` and
+degrades to dashboard-only / PAT-only, exactly like tracker-off / GitHub-off
+today — it never raises into control flow. The runtime stub is the one that
+raises (a run cannot proceed without a runtime), but the default is `cli`, so a
+zero-config install never reaches it.
+
+**Seam reach after the SCAFFOLD.** The engine and worker still reach each
+integration through a single client object (`self.clickup: Tracker`,
+`self.github: VCS`) constructed once via the factory, and the runtime through
+the `fixer.run_claude_*` shims. The factories are exercised at those
+construction/dispatch points — not per call — so "all call sites go through the
+interface" means the single client object conforms to the ABC, not that the
+factory runs on every method.
