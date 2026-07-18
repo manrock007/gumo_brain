@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 
-from app.worker import GateConflict, extract_questions
+from app.worker import GateConflict, GateForbidden, extract_questions
 
 
 class TestExtractQuestions:
@@ -202,6 +202,153 @@ class TestAnswerFeature:
         job_id = self._park_feature(worker, stage=6)
         status = asyncio.run(worker.answer_job(job_id, "skip", "not now", via="dashboard"))
         assert status == "skipped"
+
+
+class TestRoleExclusiveGates:
+    """Epic A3: _answer_feature refuses non-owners at the single choke point,
+    before any CAS — and stays INERT when no explicit DRIs are recorded."""
+
+    def _park(self, worker, job_id="feat-rx1", stage=5, status="awaiting_input", **fields):
+        worker.intake_feature(job_id, title="F", project="web", request="r", **fields)
+        worker.store.set_fields(job_id, stage=stage, parked_head="abc123")
+        worker.store.set_status(job_id, status)
+        return job_id
+
+    def _user(self, worker, username, cu_id="", role="member"):
+        worker.store.user_create(username, "hash", role=role)
+        if cu_id:
+            worker.store.user_set(username, clickup_user_id=cu_id)
+        return worker.store.user_get(username)
+
+    def test_gate_forbidden_is_not_a_value_error(self):
+        # main.py maps ValueError->409 and _scan_verbs swallows it with a
+        # generic reply — a ValueError subclass would silently break the 403
+        assert not issubclass(GateForbidden, ValueError)
+        assert issubclass(GateForbidden, Exception)
+
+    def test_no_dris_any_actor_proceeds(self, worker):
+        """Solo-mode regression lock: enforcement is N/A without DRIs."""
+        job_id = self._park(worker)
+        anyone = self._user(worker, "someone")
+        status = asyncio.run(worker.answer_job(job_id, "proceed", "", via="dashboard:someone",
+                                               actor=anyone))
+        assert status == "queued"
+
+    def test_legacy_owner_only_never_enforces(self, worker):
+        """Blocker 1 / upgrade shape: a pre-existing job with a numeric legacy
+        `owner`, no DRI columns and zero mappings must answer normally — no
+        override, no 403 — or an upgrade bricks every in-flight gate."""
+        job_id = self._park(worker, "feat-rx2")
+        worker.store.set_fields(job_id, owner="4242", founder_dri="", dev_dri="")
+        member = self._user(worker, "olduser")
+        status = asyncio.run(worker.answer_job(job_id, "proceed", "", via="dashboard:olduser",
+                                               actor=member))
+        assert status == "queued"
+        assert worker.store.gate_events_for(job_id) == []  # no override needed/recorded
+
+    def test_wrong_role_is_refused(self, worker):
+        dev = self._user(worker, "dev1", cu_id="222")
+        job_id = self._park(worker, "feat-rx3", stage=0,  # P0 = founder gate
+                            founder_dri="111", dev_dri="222")
+        with pytest.raises(GateForbidden) as e:
+            asyncio.run(worker.answer_job(job_id, "proceed", "", via="dashboard:dev1",
+                                          actor=dev))
+        assert "founder gate" in str(e.value)
+        assert worker.store.get(job_id)["status"] == "awaiting_input"
+
+    def test_owner_proceeds_by_clickup_id_mapping(self, worker):
+        dev = self._user(worker, "dev1", cu_id="222")
+        job_id = self._park(worker, "feat-rx4", stage=5, dev_dri="222")
+        status = asyncio.run(worker.answer_job(job_id, "proceed", "", via="dashboard:dev1",
+                                               actor=dev))
+        assert status == "queued"
+
+    def test_owner_proceeds_by_username_dri(self, worker):
+        jane = self._user(worker, "jane")
+        job_id = self._park(worker, "feat-rx5", stage=0, founder_dri="jane")
+        status = asyncio.run(worker.answer_job(job_id, "proceed", "", via="dashboard:jane",
+                                               actor=jane))
+        assert status == "queued"
+
+    def test_admin_override_proceeds_and_is_audited(self, worker):
+        admin = self._user(worker, "boss", role="admin")
+        job_id = self._park(worker, "feat-rx6", stage=5, dev_dri="222")
+        # without override even the admin is refused
+        with pytest.raises(GateForbidden):
+            asyncio.run(worker.answer_job(job_id, "proceed", "", via="dashboard:boss",
+                                          actor=admin))
+        status = asyncio.run(worker.answer_job(job_id, "proceed", "", via="dashboard:boss",
+                                               actor=admin, override=True))
+        assert status == "queued"
+        events = worker.store.gate_events_for(job_id)
+        assert [e["kind"] for e in events] == ["admin_override"]
+        assert events[0]["actor"] == "dashboard:boss"
+        assert "dev gate" in events[0]["detail"]
+
+    def test_member_override_flag_is_ignored(self, worker):
+        member = self._user(worker, "sneak")
+        job_id = self._park(worker, "feat-rx7", stage=5, dev_dri="222")
+        with pytest.raises(GateForbidden):
+            asyncio.run(worker.answer_job(job_id, "proceed", "", via="dashboard:sneak",
+                                          actor=member, override=True))
+
+    def test_lost_cas_leaves_no_override_audit_row(self, worker):
+        """Blocker 2: an override that never took effect (lost the race) must
+        not leave an audit record claiming it did."""
+        admin = self._user(worker, "boss", role="admin")
+        dev = self._user(worker, "dev1", cu_id="222")
+        job_id = self._park(worker, "feat-rx8", stage=5, dev_dri="222")
+        asyncio.run(worker.answer_job(job_id, "proceed", "", via="dashboard:dev1", actor=dev))
+        with pytest.raises((GateConflict, ValueError)):
+            asyncio.run(worker.answer_job(job_id, "proceed", "", via="dashboard:boss",
+                                          actor=admin, override=True))
+        assert worker.store.gate_events_for(job_id) == []
+
+    def test_two_overrides_both_audited(self, worker):
+        """Blocker 2b: audit rows must never be dedupe-dropped — two overrides
+        in the same second are two records."""
+        admin = self._user(worker, "boss", role="admin")
+        job_id = self._park(worker, "feat-rx9", stage=5, dev_dri="222")
+        asyncio.run(worker.answer_job(job_id, "redo", "again", via="dashboard:boss",
+                                      actor=admin, override=True))
+        worker.store.set_status(job_id, "awaiting_input")
+        asyncio.run(worker.answer_job(job_id, "redo", "again2", via="dashboard:boss",
+                                      actor=admin, override=True))
+        events = worker.store.gate_events_for(job_id)
+        assert [e["kind"] for e in events] == ["admin_override", "admin_override"]
+
+    def test_ask_gate_is_enforced_too(self, worker):
+        dev = self._user(worker, "dev1", cu_id="222")
+        jane = self._user(worker, "jane", cu_id="111")
+        job_id = self._park(worker, "feat-rx10", stage=0, founder_dri="111", dev_dri="222")
+        worker.store.set_fields(job_id, gate_kind="ask", resume_session_id="s1",
+                                resume_stage=0, resume_answer="")
+        with pytest.raises(GateForbidden):
+            asyncio.run(worker.answer_job(job_id, "proceed", "answer", via="dashboard:dev1",
+                                          actor=dev))
+        status = asyncio.run(worker.answer_job(job_id, "proceed", "answer",
+                                               via="dashboard:jane", actor=jane))
+        assert status == "queued"
+
+    def test_redo_from_error_is_enforced(self, worker):
+        dev = self._user(worker, "dev1", cu_id="222")
+        job_id = self._park(worker, "feat-rx11", stage=0, status="error",
+                            founder_dri="111", dev_dri="222")
+        with pytest.raises(GateForbidden):
+            asyncio.run(worker.answer_job(job_id, "redo", "", via="dashboard:dev1",
+                                          actor=dev))
+
+    def test_other_dri_covers_an_empty_slot(self, worker):
+        """A dev-owned stage with only a founder DRI recorded: the founder is
+        the effective owner (fallback), and enforcement holds."""
+        jane = self._user(worker, "jane", cu_id="111")
+        rando = self._user(worker, "rando")
+        job_id = self._park(worker, "feat-rx12", stage=5, founder_dri="111")
+        with pytest.raises(GateForbidden):
+            asyncio.run(worker.answer_job(job_id, "proceed", "", via="dashboard:rando",
+                                          actor=rando))
+        assert asyncio.run(worker.answer_job(job_id, "proceed", "", via="dashboard:jane",
+                                             actor=jane)) == "queued"
 
 
 class TestSentryLaneGate:

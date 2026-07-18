@@ -371,6 +371,9 @@ class WorkspaceCreateBody(BaseModel):
     clickup_enabled: bool | None = None
     slack_webhook_url: str | None = None
     gate_mode_default: str | None = None
+    require_attributed_answers: str | None = None  # Epic A1: auto | on | off
+    stage_role_map: str | None = None              # Epic A3: JSON overrides; '' = inherit
+    gate_sla_hours: int | str | None = None        # Epic A5: '' = inherit instance default
 
 
 class WorkspacePatchBody(WorkspaceCreateBody):

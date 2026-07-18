@@ -231,7 +231,12 @@ class TestDriAdoption:
         fake.fields = {"td1": {"assigned dev dri": [{"id": 4242, "username": "dev"}]}}
         worker.clickup = fake
         asyncio.run(worker._poll_intake())
-        assert worker.store.get("feat-td1")["owner"] == "4242"
+        job = worker.store.get("feat-td1")
+        # Epic A2: the DRI lands in its own column; `owner` stays as the
+        # computed legacy alias (dev first, founder fallback)
+        assert job["dev_dri"] == "4242"
+        assert job["founder_dri"] == ""
+        assert job["owner"] == "4242"
 
 
 class TestDecisionsFieldSync:

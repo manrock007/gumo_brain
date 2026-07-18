@@ -1,3 +1,5 @@
+import asyncio
+
 from app.engine import BUILD_GROUP_RE, extract_questions_last, parse_stage_output
 
 
@@ -104,3 +106,88 @@ class TestBranchResolution:
         job = worker.store.get("mem-web")
         assert worker.engine._branch(job) == "ctrlloop/memory-web"
         assert worker.store.get("mem-web")["branch"] == "ctrlloop/memory-web"
+
+
+class ParkFakeCU:
+    enabled = True
+
+    def __init__(self):
+        self.assigned = []  # (task_id, user_id)
+        self.posted = []    # (task_id, text)
+
+    async def comments(self, task_id):
+        return []
+
+    async def comment(self, task_id, text):
+        self.posted.append((task_id, text))
+
+    async def set_status(self, task_id, state):
+        pass
+
+    async def set_assignee(self, task_id, user_id):
+        self.assigned.append((task_id, str(user_id)))
+
+    async def field_set(self, task_id, field, value):
+        return True
+
+    async def field_append(self, task_id, field, line):
+        return True
+
+
+class TestParkOwnership:
+    """Epic A3: at gate park the OWNING DRI is assigned and named — founder at
+    P0/P1/P9, dev at P2–P8 — with the legacy `owner` column as an
+    assignment-only fallback (no ownership claim in the comment)."""
+
+    def _park(self, worker, tmp_path, job_id, stage, **fields):
+        worker.intake_feature(job_id, title="F", project="web", request="r",
+                              clickup_task_id="cu1", **fields)
+        worker.store.set_fields(job_id, stage=stage, stage_attempts=1)
+        run_id = worker.store.stage_run_open(job_id, stage, 1)
+        job = worker.store.get(job_id)
+        target = worker.settings.repo_for_project("web")
+        asyncio.run(worker.engine._park(
+            job, stage, run_id, str(tmp_path), target, "",
+            "done\n## Questions\n1. Approve?", None))
+        return worker.store.get(job_id)
+
+    def test_founder_assigned_at_p0(self, worker, tmp_path):
+        fake = ParkFakeCU()
+        worker.engine.clickup = fake
+        row = self._park(worker, tmp_path, "feat-pk1", 0,
+                         founder_dri="111", dev_dri="222")
+        assert row["status"] == "awaiting_input"
+        assert fake.assigned == [("cu1", "111")]
+        gate = next(t for _, t in fake.posted if "Gate: P0" in t)
+        assert "Owned by ClickUp user 111 (founder gate)" in gate
+        assert "Only ClickUp user 111" in gate and "admin override" in gate
+
+    def test_dev_assigned_at_p5(self, worker, tmp_path):
+        fake = ParkFakeCU()
+        worker.engine.clickup = fake
+        self._park(worker, tmp_path, "feat-pk2", 5, founder_dri="111", dev_dri="222")
+        assert fake.assigned == [("cu1", "222")]
+        gate = next(t for _, t in fake.posted if "Gate: P5" in t)
+        assert "Owned by ClickUp user 222 (dev gate)" in gate
+
+    def test_legacy_owner_fallback_assigns_without_claim(self, worker, tmp_path):
+        fake = ParkFakeCU()
+        worker.engine.clickup = fake
+        worker.intake_feature("feat-pk3", title="F", project="web", request="r",
+                              clickup_task_id="cu1")
+        worker.store.set_fields("feat-pk3", owner="4242")  # pre-upgrade shape
+        worker.store.set_fields("feat-pk3", stage=3, stage_attempts=1)
+        run_id = worker.store.stage_run_open("feat-pk3", 3, 1)
+        target = worker.settings.repo_for_project("web")
+        asyncio.run(worker.engine._park(
+            worker.store.get("feat-pk3"), 3, run_id, str(tmp_path), target, "",
+            "done\n## Questions\n1. Approve?", None))
+        assert fake.assigned == [("cu1", "4242")]  # assignment unchanged...
+        gate = next(t for _, t in fake.posted if "Gate: P3" in t)
+        assert "Owned by" not in gate  # ...but no enforcement claim
+
+    def test_no_owner_no_assignment(self, worker, tmp_path):
+        fake = ParkFakeCU()
+        worker.engine.clickup = fake
+        self._park(worker, tmp_path, "feat-pk4", 2)
+        assert fake.assigned == []

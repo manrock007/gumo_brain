@@ -224,6 +224,56 @@ class TestClickUpIntake:
         assert worker.store.get("task-t10") is not None
 
 
+class TestDualDriAdoption:
+    """Epic A2: feature adoption captures BOTH DRI people fields independently
+    (names resolved via clickup_dri_field_map); the legacy `owner` column is a
+    computed alias (dev first, founder as fallback)."""
+
+    def _adopt(self, worker, fields):
+        fake = FakeClickUp(tasks=[_cu_task("td9", "[feature] dual dri")],
+                           bodies={"td9": "project: web\nbuild it"})
+        fake.fields = {"td9": fields}
+        worker.clickup = fake
+        asyncio.run(worker._poll_intake())
+        return worker.store.get("feat-td9")
+
+    def test_both_fields_captured(self, worker):
+        job = self._adopt(worker, {
+            "assigned founder dri": [{"id": 111, "username": "founder"}],
+            "assigned dev dri": [{"id": 4242, "username": "dev"}]})
+        assert job["founder_dri"] == "111"
+        assert job["dev_dri"] == "4242"
+        assert job["owner"] == "4242"  # alias = dev first
+
+    def test_founder_only(self, worker):
+        job = self._adopt(worker, {
+            "assigned founder dri": [{"id": 111, "username": "founder"}]})
+        assert job["founder_dri"] == "111"
+        assert job["dev_dri"] == ""
+        assert job["owner"] == "111"  # alias falls back to the founder
+
+    def test_neither_leaves_solo_mode(self, worker):
+        job = self._adopt(worker, {})
+        assert job["founder_dri"] == "" and job["dev_dri"] == "" and job["owner"] == ""
+
+    def test_configured_field_names_win(self, worker):
+        import json
+
+        worker.settings.clickup_dri_field_map = json.dumps(
+            {"founder": "Product Owner", "dev": "Tech Lead"})
+        job = self._adopt(worker, {
+            "product owner": [{"id": 5, "username": "po"}],
+            "tech lead": [{"id": 6, "username": "tl"}],
+            "assigned dev dri": [{"id": 4242, "username": "ignored"}]})
+        assert job["founder_dri"] == "5" and job["dev_dri"] == "6"
+
+    def test_empty_map_disables_the_reads(self, worker):
+        worker.settings.clickup_dri_field_map = "{}"
+        job = self._adopt(worker, {
+            "assigned dev dri": [{"id": 4242, "username": "dev"}]})
+        assert job["founder_dri"] == "" and job["dev_dri"] == "" and job["owner"] == ""
+
+
 class TestSentryIntakeUnconfigured:
     def test_sentry_ticket_reject_pins_when_sentry_unconfigured(self, worker):
         """On a Sentry-less instance a [sentry] ticket must be reject-pinned

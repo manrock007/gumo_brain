@@ -475,6 +475,142 @@ def test_admin_cannot_reset_own_password(client):
                         json={"disabled": True}).status_code == 400
 
 
+def test_feature_submit_persists_both_dris(client):
+    """Epic A2: POST /api/features carries founder_dri + dev_dri; the legacy
+    `owner` field is a deprecated alias for dev_dri (applied only when dev_dri
+    is empty); `owner` column = computed alias."""
+    r = client.post("/api/features", headers=AUTH,
+                    json={"project": "web", "title": "dual dri",
+                          "founder_dri": "111", "dev_dri": "222"})
+    assert r.status_code == 200
+    job = client.app.state.store.get(r.json()["job_id"])
+    assert job["founder_dri"] == "111" and job["dev_dri"] == "222"
+    assert job["owner"] == "222"
+
+    r = client.post("/api/features", headers=AUTH,
+                    json={"project": "web", "title": "legacy owner", "owner": "4242"})
+    job = client.app.state.store.get(r.json()["job_id"])
+    assert job["dev_dri"] == "4242" and job["founder_dri"] == ""
+    assert job["owner"] == "4242"
+
+    # dev_dri wins over the deprecated alias when both are sent
+    r = client.post("/api/features", headers=AUTH,
+                    json={"project": "web", "title": "both", "owner": "1", "dev_dri": "2"})
+    assert client.app.state.store.get(r.json()["job_id"])["dev_dri"] == "2"
+
+
+def test_user_clickup_mapping_admin_api(client):
+    """Epic A1: PATCH /api/users/{u} links/clears clickup_user_id with
+    digits-only validation and duplicate 409."""
+    client.post("/api/users", headers=AUTH,
+                json={"username": "mapme", "password": "password1"})
+    client.post("/api/users", headers=AUTH,
+                json={"username": "mapme2", "password": "password1"})
+    r = client.patch("/api/users/mapme", headers=AUTH, json={"clickup_user_id": "4242"})
+    assert r.status_code == 200 and r.json()["clickup_user_id"] == "4242"
+    assert any(u["username"] == "mapme" and u["clickup_user_id"] == "4242"
+               for u in client.get("/api/users", headers=AUTH).json())
+    # non-numeric -> 400
+    r = client.patch("/api/users/mapme2", headers=AUTH, json={"clickup_user_id": "jane"})
+    assert r.status_code == 400
+    # duplicate -> 409 naming the holder
+    r = client.patch("/api/users/mapme2", headers=AUTH, json={"clickup_user_id": "4242"})
+    assert r.status_code == 409 and "mapme" in r.json()["detail"]
+    # re-saving your own mapping is fine; empty clears
+    assert client.patch("/api/users/mapme", headers=AUTH,
+                        json={"clickup_user_id": "4242"}).status_code == 200
+    r = client.patch("/api/users/mapme", headers=AUTH, json={"clickup_user_id": ""})
+    assert r.status_code == 200 and r.json()["clickup_user_id"] == ""
+    # freed id can be claimed now
+    assert client.patch("/api/users/mapme2", headers=AUTH,
+                        json={"clickup_user_id": "4242"}).status_code == 200
+
+
+def test_answer_role_gate_403_and_admin_override(client):
+    """Epic A3: the dashboard returns 403 with the ownership detail for a
+    non-owner; an admin passes with the explicit (audited) override flag."""
+    store = client.app.state.store
+    default_ws = client.get("/api/workspaces", headers=AUTH).json()[0]["id"]
+    client.post("/api/users", headers=AUTH,
+                json={"username": "adev", "password": "password1"})
+    client.put(f"/api/workspaces/{default_ws}/members", headers=AUTH,
+               json={"username": "adev", "member": True})
+    store.feature_intake("feat-role1", title="F", project="demo", stage=0)
+    store.set_fields("feat-role1", founder_dri="111", dev_dri="222",
+                     workspace_id=default_ws, question="q")
+    store.set_status("feat-role1", "awaiting_input")
+
+    member = {"Authorization": "Basic " + base64.b64encode(b"adev:password1").decode()}
+    r = client.post("/api/jobs/feat-role1/answer", headers=member,
+                    json={"action": "proceed", "answer": ""})
+    assert r.status_code == 403
+    assert "founder gate" in r.json()["detail"] and "owned by" in r.json()["detail"]
+    # a member's override flag is ignored — still 403
+    r = client.post("/api/jobs/feat-role1/answer", headers=member,
+                    json={"action": "proceed", "answer": "", "override": True})
+    assert r.status_code == 403
+    # the admin without override is refused too...
+    r = client.post("/api/jobs/feat-role1/answer", headers=AUTH,
+                    json={"action": "proceed", "answer": ""})
+    assert r.status_code == 403
+    # ...and passes with the explicit override, audited in gate_events
+    r = client.post("/api/jobs/feat-role1/answer", headers=AUTH,
+                    json={"action": "proceed", "answer": "", "override": True})
+    assert r.status_code == 200
+    events = store.gate_events_for("feat-role1")
+    assert [e["kind"] for e in events] == ["admin_override"]
+    assert events[0]["actor"] == "dashboard:gumo"
+
+
+def test_session_snapshot_carries_gate_owner(client):
+    store = client.app.state.store
+    default_ws = client.get("/api/workspaces", headers=AUTH).json()[0]["id"]
+    store.feature_intake("feat-snap1", title="F", project="demo", stage=5)
+    store.set_fields("feat-snap1", dev_dri="222", workspace_id=default_ws)
+    store.set_status("feat-snap1", "awaiting_input")
+    snap = client.get("/api/jobs/feat-snap1/session", headers=AUTH).json()
+    assert snap["job"]["dev_dri"] == "222"
+    go = snap["gate_owner"]
+    assert go["role"] == "dev" and go["enforce"] is True and go["is_you"] is False
+    assert "222" in go["display"]
+    assert snap["gate_events"] == []
+
+
+def test_workspace_team_coordination_fields(client):
+    """Epic A: workspace PATCH validation for require_attributed_answers,
+    stage_role_map (fail-closed) and gate_sla_hours (empty -> inherit)."""
+    ws_id = client.get("/api/workspaces", headers=AUTH).json()[0]["id"]
+    # bad values are 400s and change nothing
+    assert client.patch(f"/api/workspaces/{ws_id}", headers=AUTH,
+                        json={"require_attributed_answers": "maybe"}).status_code == 400
+    assert client.patch(f"/api/workspaces/{ws_id}", headers=AUTH,
+                        json={"stage_role_map": '{"12": "dev"}'}).status_code == 400
+    assert client.patch(f"/api/workspaces/{ws_id}", headers=AUTH,
+                        json={"stage_role_map": '{"3": "boss"}'}).status_code == 400
+    assert client.patch(f"/api/workspaces/{ws_id}", headers=AUTH,
+                        json={"stage_role_map": "not json"}).status_code == 400
+    assert client.patch(f"/api/workspaces/{ws_id}", headers=AUTH,
+                        json={"gate_sla_hours": -1}).status_code == 400
+    # valid partial map merges into the effective ladder in public()
+    r = client.patch(f"/api/workspaces/{ws_id}", headers=AUTH,
+                     json={"require_attributed_answers": "on",
+                           "stage_role_map": '{"7": "founder"}',
+                           "gate_sla_hours": 48})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["require_attributed_answers"] == "on"
+    assert data["gate_sla_hours"] == 48
+    assert data["stage_roles"]["7"] == "founder"   # override applied
+    assert data["stage_roles"]["5"] == "dev"       # default ladder fills the rest
+    assert data["stage_roles"]["0"] == "founder"
+    # empty string clears the SLA back to inherit (NULL)
+    r = client.patch(f"/api/workspaces/{ws_id}", headers=AUTH,
+                     json={"gate_sla_hours": "", "stage_role_map": ""})
+    assert r.status_code == 200
+    assert r.json()["gate_sla_hours"] is None
+    assert r.json()["stage_roles"]["7"] == "dev"  # back to the default ladder
+
+
 def test_change_password_rotates_session(client):
     """A self password change revokes every OTHER session and the old token,
     but the caller stays signed in on a freshly rotated cookie — being dumped
