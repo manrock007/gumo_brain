@@ -107,8 +107,54 @@ function renderInbox() {
   const empty = (ME && ME.role === 'member' && WORKSPACES && !WORKSPACES.length)
     ? 'no workspace access yet &mdash; ask your CtrlLoop admin to assign you to a workspace'
     : 'nothing here';
-  document.getElementById('inbox-list').innerHTML =
-    items.length ? items.map(row).join('') : `<div class="empty">${empty}</div>`;
+  const strip = candidateStrip();
+  document.getElementById('inbox-list').innerHTML = strip
+    + (items.length ? items.map(row).join('') : `<div class="empty">${empty}</div>`);
+}
+
+// Epic D3: parked Slack decision candidates — confirm (scope picker) / dismiss
+function candidateStrip() {
+  const cands = (inboxCache && inboxCache.candidates) || [];
+  if (!cands.length) return '';
+  const rows = cands.map((c) => `
+    <div class="panel" style="margin:6px 0; padding:8px">
+      <div><strong>${esc(c.title || 'decision candidate')}</strong>
+        <span class="hint" style="display:inline">&mdash; ${esc(c.origin_author || c.decided_by || '')} &middot; ${fmtAgo(c.created_at)}</span></div>
+      <div style="margin:4px 0">${esc((c.text || '').slice(0, 300))}</div>
+      <div class="u-row">
+        <select id="cand-scope-${Number(c.id)}">
+          <option value="product" selected>product</option>
+          <option value="repo">repo</option>
+          <option value="org">org (admin)</option>
+        </select>
+        <button onclick="confirmCandidate(${Number(c.id)})">Confirm</button>
+        <button onclick="dismissCandidate(${Number(c.id)})">Dismiss</button>
+        ${(c.links || []).map((u) => `<a href="${attr(u)}" target="_blank" rel="noopener">thread</a>`).join(' ')}
+      </div>
+    </div>`).join('');
+  return `<div class="section-label" style="margin:8px 10px 0">Decision candidates (from Slack)</div>${rows}`;
+}
+
+async function confirmCandidate(id) {
+  const scope = (document.getElementById('cand-scope-' + id) || {}).value || 'product';
+  try {
+    const r = await fetch('api/decisions/' + id + '/confirm', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ scope }),
+    });
+    const data = await r.json();
+    if (!r.ok) uiMsg('Error: ' + (data.detail || r.status));
+    lastInbox = ''; refreshInbox(); loadDecisions();
+  } catch (e) { uiMsg('Error: ' + e); }
+}
+
+async function dismissCandidate(id) {
+  try {
+    const r = await fetch('api/decisions/' + id + '/dismiss', { method: 'POST' });
+    const data = await r.json();
+    if (!r.ok) uiMsg('Error: ' + (data.detail || r.status));
+    lastInbox = ''; refreshInbox();
+  } catch (e) { uiMsg('Error: ' + e); }
 }
 
 let lastJobs = '';
@@ -891,6 +937,94 @@ function renderOutcomes(data) {
       : '<div class="empty">no measured outcomes yet &mdash; ship a feature with a success metric</div>');
 }
 
+// ---------- decision registry (api/decisions, Epic D2) ----------
+
+let decFilters = { q: '', scope: '', status: '', source: '' };
+
+async function loadDecisions() {
+  try {
+    const p = new URLSearchParams();
+    Object.entries(decFilters).forEach(([k, v]) => { if (v) p.set(k, v); });
+    const r = await fetch('api/decisions?' + p.toString());
+    if (!r.ok) return;
+    renderDecisions(await r.json());
+  } catch (e) { /* keep the previous view */ }
+}
+
+function decSetFilter(key, value) { decFilters[key] = value; loadDecisions(); }
+
+function renderDecisions(data) {
+  const el = document.getElementById('decisions-body');
+  if (!el) return;
+  const opts = (list, cur) => ['', ...list].map((v) =>
+    `<option value="${attr(v)}"${v === cur ? ' selected' : ''}>${v || 'any'}</option>`).join('');
+  const controls = `<div class="u-row" style="margin:10px 0">
+    <input id="dec-q" placeholder="search decisions&hellip;" value="${attr(decFilters.q)}"
+      onchange="decSetFilter('q', this.value)">
+    <select onchange="decSetFilter('scope', this.value)">${opts(['job', 'repo', 'product', 'org'], decFilters.scope)}</select>
+    <select onchange="decSetFilter('status', this.value)">${opts(['active', 'superseded', 'dismissed'], decFilters.status)}</select>
+    <select onchange="decSetFilter('source', this.value)">${opts(['gate', 'manual', 'slack'], decFilters.source)}</select>
+  </div>`;
+  const rows = (data.decisions || []).map((d) => {
+    const links = (d.links || []).map((u, i) =>
+      `<a href="${attr(u)}" target="_blank" rel="noopener">link${i ? i + 1 : ''}</a>`).join(' ');
+    const act = d.status === 'active'
+      ? `<button onclick="patchDecision(${Number(d.id)}, 'supersede')">Supersede</button>`
+      : (d.status === 'superseded'
+        ? `<button onclick="patchDecision(${Number(d.id)}, 'reactivate')">Reactivate</button>` : '');
+    return `<tr>
+      <td>${esc(d.scope)}${d.job_id ? ' &middot; <a href="#/job/' + esc(d.job_id) + '">' + esc(d.job_id) + '</a>' : ''}</td>
+      <td><strong>${esc(d.title || '')}</strong> ${esc((d.text || '').slice(0, 200))}</td>
+      <td>${esc(d.status)}</td>
+      <td>${esc(d.decided_by || '')} &middot; ${fmtAgo(d.updated_at || d.created_at)} ${links}</td>
+      <td>${act}</td>
+    </tr>`;
+  }).join('');
+  el.innerHTML = controls
+    + (rows
+      ? `<table><tr><th>scope</th><th>decision</th><th>status</th><th>decided</th><th></th></tr>${rows}</table>`
+      : '<div class="empty">no decisions recorded yet &mdash; substantive gate answers register automatically</div>')
+    + `<form onsubmit="return addDecision(event)"><div class="u-row" style="margin-top:10px">
+        <select id="dec-new-scope"><option value="repo">repo</option><option value="product">product</option>
+          <option value="job">job</option><option value="org">org (admin)</option></select>
+        <input id="dec-new-project" placeholder="project slug (routes the workspace)">
+        <input id="dec-new-title" placeholder="title (optional)">
+        <input id="dec-new-text" placeholder="the decision + rationale" required>
+        <button id="dec-new-go">Record decision</button>
+      </div></form>`;
+}
+
+async function addDecision(ev) {
+  ev.preventDefault();
+  try {
+    const r = await fetch('api/decisions', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        scope: document.getElementById('dec-new-scope').value,
+        project: document.getElementById('dec-new-project').value.trim() || null,
+        title: document.getElementById('dec-new-title').value.trim(),
+        text: document.getElementById('dec-new-text').value.trim(),
+      }),
+    });
+    const data = await r.json();
+    if (!r.ok) { uiMsg('Error: ' + (data.detail || r.status)); return false; }
+    loadDecisions();
+  } catch (e) { uiMsg('Error: ' + e); }
+  return false;
+}
+
+async function patchDecision(id, action) {
+  try {
+    const r = await fetch('api/decisions/' + id, {
+      method: 'PATCH', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ action }),
+    });
+    const data = await r.json();
+    if (!r.ok) uiMsg('Error: ' + (data.detail || r.status));
+    loadDecisions();
+  } catch (e) { uiMsg('Error: ' + e); }
+}
+
 // ---------- autonomy (api/autonomy, Epic C) ----------
 
 let autonomyData = null;
@@ -1244,7 +1378,7 @@ document.addEventListener('keydown', (e) => {
 });
 window.addEventListener('hashchange', routeHash);
 
-loadProjects(); refresh(true); refreshMemory(true); loadContext(); loadOutcomes(); loadAutonomy(); routeHash();
+loadProjects(); refresh(true); refreshMemory(true); loadContext(); loadOutcomes(); loadDecisions(); loadAutonomy(); routeHash();
 setInterval(() => refresh(false), 10000);
 setInterval(() => refreshMemory(false), 60000);
 setInterval(() => loadOutcomes(), 60000);
@@ -1587,6 +1721,10 @@ async function renderWorkspacesAdmin() {
         <div><label>ClickUp list id (optional)</label><input class="w-culist" value="${attr(w.clickup_list_id)}"></div>
         <div><label>Slack webhook URL (gate nudges, optional)</label><input class="w-slack" value="${attr(w.slack_webhook_url)}"></div>
       </div>
+      <div class="ws-inline" style="margin-top:8px">
+        <div><label>Slack ingest channels (comma-separated channel ids; needs SLACK_INGEST_ENABLED + bot token)</label>
+          <input class="w-slackch" value="${attr((w.slack_channels || []).join(', '))}"></div>
+      </div>
       <div class="ws-flags">
         <label style="display:inline-flex;gap:5px;align-items:center">
           <input type="checkbox" class="w-cuon" ${w.clickup_enabled ? 'checked' : ''}> ClickUp mirroring</label>
@@ -1627,6 +1765,8 @@ async function saveWorkspace(id, btn) {
         product_name: v('w-product'), canonical_project: v('w-canon'),
         workspace_context: card.querySelector('.w-ctx').value,
         clickup_list_id: v('w-culist'), slack_webhook_url: v('w-slack'),
+        slack_channels: v('w-slackch')
+          ? v('w-slackch').split(',').map((s) => s.trim()).filter(Boolean) : '',
         clickup_enabled: card.querySelector('.w-cuon').checked, repos,
       }),
     });

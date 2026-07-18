@@ -31,7 +31,10 @@ WORKSPACE_FIELDS = ("name", "product_name", "workspace_context", "canonical_proj
                     "clickup_list_id", "clickup_enabled", "slack_webhook_url",
                     "gate_mode_default", "require_attributed_answers",
                     "stage_role_map", "gate_sla_hours",
-                    "analytics_provider", "analytics_config")
+                    "analytics_provider", "analytics_config",
+                    "slack_channels")
+
+SLACK_CHANNELS_MAX = 50
 
 WORKSPACE_CONTEXT_CAP = 4000
 
@@ -202,7 +205,11 @@ class WorkspaceService:
         if clean.get("clickup_enabled") and not str(clean.get("clickup_list_id") or "").strip():
             raise WorkspaceError(
                 "ClickUp mirroring needs this workspace's list id — set it or disable mirroring")
+        if "slack_channels" in clean:
+            self._check_slack_channels_unique(clean["slack_channels"], None)
         ws = self.store.workspace_create(slug, (name or slug).strip(), **clean)
+        if "slack_channels" in clean:
+            self._init_slack_cursors(clean["slack_channels"])
         self.sync_settings()
         return ws
 
@@ -240,10 +247,55 @@ class WorkspaceService:
                 not str(clean.get("clickup_list_id", ws["clickup_list_id"]) or "").strip():
             raise WorkspaceError(
                 "ClickUp mirroring needs this workspace's list id — set it or disable mirroring")
+        if "slack_channels" in clean:
+            # a channel routes candidates to exactly ONE workspace (same
+            # determinism rationale as global repo slugs). Read-check only —
+            # acceptable under today's single-process SQLite because the check
+            # and the write share this synchronous section with NO await
+            # between them; re-verify under Epic F2 (ENGINE.md §16 recorded
+            # edges, same treatment as the auto-advance non-CAS note).
+            self._check_slack_channels_unique(clean["slack_channels"], ws["id"])
         if clean:
             self.store.workspace_set(ws["id"], **clean)
+        if "slack_channels" in clean:
+            self._init_slack_cursors(clean["slack_channels"])
         self.sync_settings()
         return self.store.workspace_get(ws["id"])
+
+    @staticmethod
+    def slack_channels_of(ws: dict) -> list[str]:
+        """Read-tolerant decode of a workspace row's channel allowlist."""
+        raw = (ws.get("slack_channels") or "").strip()
+        if not raw:
+            return []
+        try:
+            parsed = json.loads(raw)
+            return [str(c) for c in parsed if str(c).strip()] \
+                if isinstance(parsed, list) else []
+        except (ValueError, TypeError):
+            return []
+
+    def _check_slack_channels_unique(self, channels_json: str, ws_id: int | None):
+        wanted = set(json.loads(channels_json) if channels_json else [])
+        if not wanted:
+            return
+        for other in self.store.workspace_list():
+            if ws_id is not None and other["id"] == ws_id:
+                continue
+            clash = wanted & set(self.slack_channels_of(other))
+            if clash:
+                raise WorkspaceError(
+                    f"Slack channel(s) {', '.join(sorted(clash))} already "
+                    f"allowlisted by workspace '{other['slug']}' — a channel "
+                    "routes to exactly one workspace")
+
+    def _init_slack_cursors(self, channels_json: str):
+        """Initialize NEW channels' watermarks to NOW (forward-only ingestion —
+        blocker: the first pass after enabling must never flood the inbox with
+        historical candidates). Existing watermarks are never moved."""
+        import time
+        for ch in (json.loads(channels_json) if channels_json else []):
+            self.store.slack_cursor_init(ch, f"{time.time():.6f}")
 
     @staticmethod
     def _clean_fields(fields: dict) -> dict:
@@ -297,6 +349,29 @@ class WorkspaceService:
                 except (ValueError, TypeError) as e:
                     raise WorkspaceError(f"analytics_config: {e}")
                 clean[key] = json.dumps(parsed)
+            elif key == "slack_channels":
+                # Epic D3: list (API body) or JSON string of channel ids;
+                # '' / [] clears. Fail closed: malformed -> 400, nothing changes.
+                if isinstance(value, str) and not value.strip():
+                    clean[key] = ""
+                    continue
+                try:
+                    parsed = json.loads(value) if isinstance(value, str) else value
+                    if not isinstance(parsed, list):
+                        raise ValueError("must be a list of channel ids")
+                    channels = []
+                    for ch in parsed:
+                        ch = str(ch or "").strip()
+                        if not ch:
+                            raise ValueError("channel ids must be non-empty strings")
+                        if ch not in channels:
+                            channels.append(ch)
+                    if len(channels) > SLACK_CHANNELS_MAX:
+                        raise ValueError(
+                            f"at most {SLACK_CHANNELS_MAX} channels per workspace")
+                except (ValueError, TypeError) as e:
+                    raise WorkspaceError(f"slack_channels: {e}")
+                clean[key] = json.dumps(channels) if channels else ""
             elif key == "gate_sla_hours":
                 # empty string -> NULL = inherit the instance default
                 if isinstance(value, str) and not value.strip():
@@ -357,6 +432,8 @@ class WorkspaceService:
             "gate_sla_hours": ws.get("gate_sla_hours"),
             "analytics_provider": ws.get("analytics_provider") or "",
             "analytics_configured": self._analytics_configured(ws),
+            # channel ids are not secrets (the bot token is, and lives in env)
+            "slack_channels": self.slack_channels_of(ws),
             # the fully-merged 0–9 ownership ladder, so the UI shows effective
             # ownership without duplicating the merge logic client-side
             "stage_roles": {str(i): roles.role_for_stage(self.settings, ws, i)
