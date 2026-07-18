@@ -188,6 +188,52 @@ after ship.
   documented migration target.
 - **H4 · Analytics adapter** — delivered in B3 (same seam).
 
+## Epic I — Proactive routines & planning cadence
+
+The engine stops being purely reactive: it runs the team's operating rhythm
+and proposes work from signals it already holds. (No new external
+ingestion here — support/NPS/interviews stay Tier 3; this epic uses
+outcomes, receipts, frictions, Sentry trends, and memory freshness.)
+
+- **I1 · Routine engine — BUILD.** Generalize today's hardcoded loops
+  (sweep, shepherd, janitor, reaper) into configurable per-workspace
+  **routines**: a `routines` table (kind, schedule, config, enabled,
+  last_run, last_result), a scheduler driving them, run history on the
+  dashboard, and every routine's output landing as inbox items — never
+  silent side effects.
+- **I2 · Daily standup digest — BUILD.** The gumo-standup skill productized
+  as a routine: each workday morning, a digest to Slack + dashboard —
+  gates overdue or breaching SLA, blocked/stalled pipelines (shepherd
+  `stalled`, error/timeout parks), watch jobs trending off-goal, budget
+  position, autonomy changes since yesterday. Exceptions only; a quiet day
+  sends nothing.
+- **I3 · Memory upkeep routine — BUILD.** Freshness already exists as a
+  metric; now something acts on it: when staleness crosses a threshold, a
+  memory-refresh job is auto-queued (bounded: one per repo per week,
+  budget-aware) and the resulting PR parks for review like any other.
+- **I4 · Risk surfacing — BUILD.** A watch routine that scans for
+  conditions a human should hear about *before* asking: Sentry issue
+  velocity spikes in a mapped project, a regressing watch metric mid-window
+  (don't wait for day 14 to say it's tanking), repeated redos on the same
+  stage (trust decaying), spend pacing above budget. Each emits one
+  attributed, deduplicated inbox alert.
+- **I5 · Proposal lane — BUILD.** The engine recommends work as **parked
+  candidate briefs** a human adopts or dismisses — never self-initiated
+  pipelines. Sources: outcome verdicts (flat/regressed → iterate
+  candidates beyond B4's single gate), the FRICTION log (recurring process
+  pain → improvement briefs), Sentry clusters (recurring error areas →
+  hardening briefs), stale high-traffic memory areas. Dismissals are
+  remembered — the engine never re-proposes a rejected idea unchanged.
+- **I6 · Weekly planning pack — BUILD.** A weekly routine that assembles
+  the review ENGINE.md §8 promised: receipts (cost, gate latency, redo
+  rate, trend vs last week), outcome-ledger movement, autonomy shifts,
+  open proposals from I5 — rendered on the dashboard and posted to Slack,
+  ending with the engine's ranked "what I'd do next lap" list for the
+  founder's weekly planning session.
+
+Dependencies: I1 first (everything rides it); I2/I4 need A4/A5 (inbox +
+SLA); I5/I6 need B5 (outcome ledger) and C1 (autonomy data).
+
 ## Out of scope (Tier 3 — future)
 
 Listen-grader generalization, the Plan/objectives layer, Cowork-skill
@@ -203,10 +249,10 @@ Phased workflow runs, human-checkpointed between phases:
 1. **Plan verification** — per-epic design agents produce file-level change
    plans; adversarial reviewers attack each plan (migration safety, CAS
    races, fail-closed invariants) before any code.
-2. **Implementation** — epics A→H in dependency order (A1 before A3; B3
-   before B4; F1 before F2; E4 consumes A1). Parallel agents within an
-   epic on disjoint modules; serialized across epics touching
-   `worker.py`/`engine.py`.
+2. **Implementation** — epics A→I in dependency order (A1 before A3; B3
+   before B4; F1 before F2; E4 consumes A1; I1 before I2–I6, which also
+   consume A4/A5, B5, C1). Parallel agents within an epic on disjoint
+   modules; serialized across epics touching `worker.py`/`engine.py`.
 3. **Review & test** — every epic: full test suite + new tests; then an
    adversarial review pass (correctness, security, the ENGINE.md
    invariants: human-edits-win, fail-closed, single-writer CAS) with
