@@ -141,6 +141,7 @@ upper-cased field name):
 | `PRODUCT_NAME` | `your product` | prompt identity ("the `<name>` Engine") |
 | `BUSINESS_CONTEXT` | *(empty)* | free text injected into every run prompt; template in the dashboard's context panel |
 | `MEMORY_CANONICAL_PROJECT` | *(empty)* | slug hosting product-scope memory; empty = repo-scope only |
+| `BRANCH_PREFIX` | `ctrlloop` | prefix for engine-created branches (`<prefix>/feat-…`, `<prefix>/sentry-…`, `<prefix>/memory-…`, `<prefix>/outcome-…`). Must be ONE git-valid branch segment — starts alphanumeric, chars `A-Za-z0-9._-`, no `/`, no `.lock` suffix (validated at boot; e.g. `team/bot` is rejected). Jobs record their branch at first use, so changing it never strands in-flight work; pre-rename rows keep their historical `brain/…` branches. |
 | `SENTRY_ORG`, `SENTRY_AUTH_TOKEN` | *(empty)* | BOTH required to enable the Sentry lane |
 | `SENTRY_API_BASE` | `https://sentry.io/api/0` | EU-region orgs set `https://de.sentry.io/api/0` |
 | `CLICKUP_TOKEN`, `CLICKUP_LIST_ID` | *(empty)* | BOTH required to enable ClickUp (list may also be per-workspace) |
