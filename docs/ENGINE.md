@@ -109,10 +109,51 @@ stage start.
 evidence, never self-reported: `git diff --stat` vs `stage_base_sha`, files
 changed, and a GitHub compare link (enabled by per-stage push).
 
-**Gate notifications.** Features have an `owner` (set at submit). At every
-gate the engine assigns the owner on the ClickUp task and posts the gate
-comment — ClickUp's native push/email does the nudging. (Optional Slack
-webhook is the documented follow-up.)
+**Gate ownership & notifications (Epic A).** Features carry **two DRIs** —
+`founder_dri` + `dev_dri` (ClickUp person id or CtrlLoop username; set at
+submit, or read from the workspace's people fields at ClickUp adoption via
+`clickup_dri_field_map`). Every stage has an **owning role** resolved from
+the stage→role map (default ladder: P0/P1 → founder, P2–P8 → dev, P9 →
+founder; overridable per workspace via `stage_role_map`, instance-wide via
+`STAGE_ROLE_MAP`). The gate owner = the owning role's DRI, falling back to
+the other DRI when the slot is empty. At every park the engine assigns the
+owner on the ClickUp task, names them in the gate comment ("Owned by <name>
+(<role> gate)") and in the Slack nudge — ClickUp's native push/email does
+the nudging.
+
+**Role-exclusive enforcement** happens at the single answer choke point
+(both channels), before the CAS: a `proceed`/`redo`/`skip` — ask-gates and
+redo-from-error included — from anyone who is not the owner is refused
+(dashboard: HTTP 403 with "this is a <role> gate, owned by <name>"; ClickUp:
+one explanatory reply per comment, deduped through `gate_events`).
+Non-owners keep gate chat, steering visibility and plain comments. The only
+bypass is an **explicit, audited admin override** from the dashboard (a
+checkbox; recorded in `gate_events` only after the transition actually won
+its CAS) — ClickUp offers no override path. Enforcement keys EXCLUSIVELY on
+the explicit DRI columns: a job with neither DRI recorded (solo installs;
+pre-upgrade jobs whose legacy `owner` column is set) is **inert** — anyone
+may answer, exactly as before Epic A; the legacy `owner` still drives
+assignment/display. NOTE the fail-closed corollary: with
+`require_attributed_answers=off` but DRIs recorded, an *unmapped* ClickUp
+commenter can never be the owner — their verbs are refused with the
+ownership reply ("link your ClickUp account or answer on the dashboard");
+A3 effectively implies A1 over the ClickUp channel.
+
+**Gate SLA & escalation.** Effective SLA = workspace `gate_sla_hours` (NULL
+= inherit `GATE_SLA_HOURS`, default 24; 0 disables). A sweep (every
+`SLA_CHECK_INTERVAL_SECONDS`) escalates overdue gates of DRI'd features:
+≥1.0×SLA re-assigns + nudges the owner; ≥1.5×SLA notifies the OTHER DRI —
+visibility, never authority; ≥2.0×SLA records a standup flag. Each step is
+keyed on the gated run's `stage_runs.id` in `gate_events` (fires once per
+gate attempt; a `/redo` re-park re-arms the ladder; events are written
+BEFORE any send, so a crash under-notifies, never double-fires). Jobs
+without explicit DRIs and v1 items never escalate (the inbox `overdue` flag
+covers them). Everything here is visibility only — no job state changes.
+
+**Per-person queues.** `GET /api/inbox` is the "Awaiting you" surface:
+gates the authed user owns + unassigned gates (plus feature error/timeout
+parks, which are answerable), membership-scoped, sorted overdue-first then
+oldest-gate-first, with `counts.mine` as the badge number.
 
 **Gate-park ordering (crash-safe).** The DB transition to `awaiting_input`
 (with the current comment marker) commits BEFORE the gate comment is posted;
@@ -228,9 +269,17 @@ guidance > older guidance; superseded guidance is marked.
 ## 5. State machine & storage
 
 - `jobs` gains: `stage`, `stage_attempts`, `mirror_ok`, `cu_list_id`,
-  `owner`, `related_jobs`, `run_started_at`.
+  `owner`, `founder_dri`, `dev_dri` (Epic A2 — `owner` is the legacy
+  computed alias, dev first then founder), `related_jobs`, `run_started_at`.
 - Child tables (INSERT-only or row-per-key — no JSON blob read-modify-write):
   - `guidance_log(job_id, stage, action, text, via, artifact_sha, at)`
+  - `gate_events(job_id, stage, kind, ref, detail, actor, at)` — Epic A's
+    append-only audit substrate AND idempotence store
+    (`UNIQUE(job_id, kind, ref)`): attribution/role refusals (ref = comment
+    id), admin overrides (ref = uuid, recorded only after a won CAS), SLA
+    escalation steps (ref = `run<stage_runs.id>-step<k>`). Deliberately NOT
+    `guidance_log` — refusals and escalations must never render into stage
+    prompts as "human decisions".
   - `artifact_state(job_id, artifact, subtask_id, synced_hash, flags)`
   - `stage_state(job_id, stage, base_sha, attempts)`
   - `stage_runs(job_id, stage, attempt, queued_at, started_at, ended_at,
@@ -257,10 +306,13 @@ guidance > older guidance; superseded guidance is marked.
   context. GET returns `{context, defaults, overridden}`; PUT validates
   atomically (400 changes nothing) and applies live; DELETE reverts to the
   env/code defaults.
-- `POST /api/features` — `{project, clickup? | title+summary, owner?,
-  related_to?}`.
-- `POST /api/jobs/{id}/answer` — `{action: proceed|redo|skip, answer}`,
-  CAS-guarded, 409 on lost race.
+- `POST /api/features` — `{project, clickup? | title+summary, founder_dri?,
+  dev_dri?, related_to?}` (`owner` = deprecated alias for `dev_dri`).
+- `POST /api/jobs/{id}/answer` — `{action: proceed|redo|skip, answer,
+  override?}`, CAS-guarded, 409 on lost race, 403 for a non-owner on a
+  role-exclusive gate (`override: true` = the audited admin bypass).
+- `GET /api/inbox` — the per-person queue (§2): owned + unassigned gates,
+  overdue-first, with `counts` for the badge.
 - `GET /api/jobs` — feature rows carry `stage`, `stage_name`, `mirror_ok`.
 - `GET /api/features/{id}/stats` — stage_runs rows.
 - `GET /api/memory/{project}`, `POST /api/memory/{project}/bootstrap`.
@@ -485,6 +537,17 @@ themselves. Password changes revoke all of the user's sessions.
 **Attribution**: every gate decision, steer, and chat turn records the acting
 user (`guidance_log.via = "dashboard:<username>"`, `gate_chat.author`), and
 ClickUp gate comments carry it — "who approved P3" is always answerable.
+The ClickUp channel is no longer anonymous (Epic A1): each user may carry a
+`clickup_user_id` (admin-linked in Settings → Users; one ClickUp identity
+per user, enforced by a partial UNIQUE index), and gate verbs by comment
+resolve their commenter — `via` becomes `clickup:<username>` for mapped
+commenters and `clickup:<cu-name>#<cu-id>` otherwise, so even permissive
+modes record WHO. Strictness is `require_attributed_answers` (workspace
+value > instance `REQUIRE_ATTRIBUTED_ANSWERS`): `on` refuses verbs from
+unmapped commenters with one explanatory reply per comment (deduped via
+`gate_events`, so a refused comment can never wedge a stream), `off` never
+refuses, and the default `auto` turns strict as soon as ANY enabled user has
+a mapping. Applies to feature AND v1 (sentry/task) verbs alike.
 
 The UI is served from `app/static/` (index behind auth with the product-name
 substitution, login page + assets public; all paths relative so reverse-proxy

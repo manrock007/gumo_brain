@@ -161,6 +161,46 @@ the workspace lacks them: `Stage` (inert anyway until
 `CLICKUP_STAGE_FIELD_MAP` is populated), `Dashboard` (inert until
 `PUBLIC_BASE_URL` is set), and `Decisions` (substantive gate answers append
 there). They are engine-generic mirror fields, not customer branding.
+`CLICKUP_DRI_FIELD_MAP` (default `{"founder": "Assigned Founder DRI",
+"dev": "Assigned Dev DRI"}`) follows the same posture: engine-generic role
+field names, read-side lookups against your workspace's own schema, a quiet
+no-op when the fields don't exist, `{}` to disable the reads entirely.
+
+## 7. Team coordination (Epic A: dual DRIs, role gates, attribution, SLA)
+
+| Env var | Default | Meaning |
+| --- | --- | --- |
+| `REQUIRE_ATTRIBUTED_ANSWERS` | `auto` | ClickUp gate verbs must come from a mapped commenter: `on` / `off` / `auto` (= strict once ANY user has a ClickUp link). Instance fallback; each workspace can override. |
+| `STAGE_ROLE_MAP` | *(empty)* | JSON overrides of the stage→role ladder (keys `"0"`..`"9"`, values `founder`/`dev`); empty = built-in (P0/P1/P9 founder, P2–P8 dev). Workspace `stage_role_map` overrides it. |
+| `GATE_SLA_HOURS` | `24` | gate SLA before escalation; `0` disables. Workspace `gate_sla_hours` overrides (empty string in a PATCH clears back to inherit). |
+| `SLA_CHECK_INTERVAL_SECONDS` | `900` | escalation sweep cadence. |
+| `CLICKUP_DRI_FIELD_MAP` | `{"founder": "Assigned Founder DRI", "dev": "Assigned Dev DRI"}` | role → the ClickUp people field feature adoption reads that DRI from; `{}` disables. |
+
+How it fits together:
+
+- **Linking people**: Settings → Users → "Link ClickUp id" (or
+  `PATCH /api/users/{u} {"clickup_user_id": "<numeric id>"}`). One ClickUp
+  identity per user (409 + a DB unique index). Once anyone is linked, the
+  default `auto` strictness starts refusing gate verbs from unmapped
+  ClickUp commenters (one explanatory reply per comment).
+- **DRIs**: set per feature at submit (dashboard fields / API
+  `founder_dri`+`dev_dri`; the old `owner` field is a deprecated alias for
+  `dev_dri`) or via the ClickUp people fields at `[feature]` adoption.
+  A job with NO explicit DRIs stays in solo mode — no role enforcement, no
+  SLA escalation. **Re-submitting a feature replaces its DRIs from the fresh
+  submission** — a dashboard resubmit that omits both clears previously
+  recorded (e.g. ClickUp-sourced) DRIs and turns enforcement off for that
+  pipeline.
+- **Fail-closed corner**: `REQUIRE_ATTRIBUTED_ANSWERS=off` with DRIs set
+  still refuses unmapped ClickUp commenters on role-owned gates (an
+  unresolved commenter can never be the owner) — if a DRI'd feature's gate
+  channel looks dead from ClickUp, link the ClickUp ids or answer on the
+  dashboard. Admin override (audited) exists only on the dashboard.
+- **Upgrades**: pre-existing jobs carry only the legacy `owner` column —
+  they keep today's behavior verbatim (assignment yes, enforcement and
+  escalation no). The first SLA sweep after a deploy escalates only gates
+  that are ALREADY over the SLA *and* carry explicit DRIs — a freshly
+  upgraded instance (no DRI columns populated yet) sends nothing.
 
 ## Appendix — Example configuration: the original Gumo instance
 
