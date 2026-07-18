@@ -310,6 +310,11 @@ class Settings(BaseSettings):
     inbox_notice_ttl_days: int = 30
     routine_run_ttl_days: int = 90
 
+    # ---- Scoped API tokens (Epic E2) ----
+    # Default expiry (days) for a token created without an explicit ttl.
+    # 0 = no expiry (neutral).
+    api_token_default_ttl_days: int = 0
+
     # ---- Secrets provider & subprocess env allow-list (Epic G2) ----
     # Where sensitive config is read from: 'env' (default — the process
     # environment, what Settings already does), 'file' (SECRETS_DIR/<name>

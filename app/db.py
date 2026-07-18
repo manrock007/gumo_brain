@@ -1,5 +1,7 @@
+import hashlib
 import json
 import re
+import secrets
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -423,6 +425,50 @@ CREATE TABLE IF NOT EXISTS gate_chat (
     lane TEXT NOT NULL DEFAULT '',   -- '' = tool run | 'fast' = bundle-primed API call
     at REAL NOT NULL
 );
+
+-- Epic E2: scoped API tokens (ctl_ prefix). Only the sha256 of the token is
+-- stored — never the token. prefix_hint is a NON-SECRET display fragment.
+CREATE TABLE IF NOT EXISTS api_tokens (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    name TEXT NOT NULL DEFAULT '',
+    token_hash TEXT NOT NULL UNIQUE,      -- sha256 of the ctl_ token
+    prefix_hint TEXT NOT NULL DEFAULT '', -- 'ctl_…abcd' (last 4) — display only, not a secret leak
+    scopes TEXT NOT NULL DEFAULT '',      -- JSON list; '' = inherit the user's role (full)
+    created_at REAL NOT NULL,
+    last_used_at REAL,
+    expires_at REAL,                      -- NULL = no expiry
+    revoked_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_api_tokens_user ON api_tokens(user_id);
+
+-- Epic E1: single-use OIDC login transactions (state/nonce), pruned by TTL.
+-- DB-backed (no new signing secret; consistent with auth_sessions).
+CREATE TABLE IF NOT EXISTS auth_oidc_txn (
+    state TEXT PRIMARY KEY,
+    nonce TEXT NOT NULL,
+    redirect_after TEXT NOT NULL DEFAULT '/',
+    provider TEXT NOT NULL DEFAULT 'oidc',
+    created_at REAL NOT NULL
+);
+
+-- Epic E4: the canonical append-only audit log. SUPERSEDES admin_events
+-- (admin_event_add repoints here; a one-time boot-copy migrates legacy rows).
+-- Append-only: no update/delete helpers. `id` is the monotonic SIEM cursor.
+CREATE TABLE IF NOT EXISTS audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    at REAL NOT NULL,
+    actor TEXT NOT NULL DEFAULT '',        -- 'dashboard:<u>' | 'clickup:<u>#<id>' | 'token:<u>' | 'oidc:<u>' | 'engine'
+    actor_kind TEXT NOT NULL DEFAULT '',   -- user | token | engine | system
+    action TEXT NOT NULL,                  -- dotted verb (app/audit.py constants)
+    scope TEXT NOT NULL DEFAULT 'instance',-- instance | workspace | job
+    workspace_id INTEGER,
+    job_id TEXT NOT NULL DEFAULT '',
+    target TEXT NOT NULL DEFAULT '',       -- mutated entity id/name
+    channel TEXT NOT NULL DEFAULT '',      -- dashboard | clickup | api | system (gate channels)
+    detail TEXT NOT NULL DEFAULT ''        -- JSON; secrets redacted in audit_add
+);
+CREATE INDEX IF NOT EXISTS idx_audit_ws ON audit_log(workspace_id, id);
 """
 
 MIGRATIONS = {  # table -> columns added after that table first shipped (in-place upgrade)
@@ -467,6 +513,12 @@ MIGRATIONS = {  # table -> columns added after that table first shipped (in-plac
     },
     "users": {
         "clickup_user_id": "TEXT NOT NULL DEFAULT ''",  # Epic A1: ClickUp id ↔ CtrlLoop identity
+        # Epic E1: identity provider that owns this account. 'local' = password
+        # (the break-glass path — always present). SSO accounts carry the
+        # provider name and an UNUSABLE_PW sentinel pw_hash (no local password).
+        "auth_provider": "TEXT NOT NULL DEFAULT 'local'",
+        "external_id": "TEXT NOT NULL DEFAULT ''",  # provider-stable subject id (IdP `sub`)
+        "email": "TEXT NOT NULL DEFAULT ''",
     },
     "workspaces": {
         "require_attributed_answers": "TEXT NOT NULL DEFAULT 'auto'",  # Epic A1: auto | on | off
@@ -564,6 +616,32 @@ class JobStore:
                 self.fts_enabled = True
             except sqlite3.OperationalError:
                 self.fts_enabled = False
+            # Epic E4: one-time copy of legacy admin_events into the unified
+            # audit_log, gated on a DURABLE app_config marker (never on table
+            # emptiness — audit_retention pruning would otherwise re-copy). The
+            # shim (admin_event_add) mirrors NEW rows; this backfills OLD ones.
+            marker = c.execute(
+                "SELECT value FROM app_config WHERE key = 'audit_legacy_copied'"
+            ).fetchone()
+            if marker is None:
+                from .audit import LEGACY_KIND_MAP
+                legacy = c.execute(
+                    "SELECT kind, target, detail, actor, at FROM admin_events ORDER BY id"
+                ).fetchall()
+                for r in legacy:
+                    action = LEGACY_KIND_MAP.get(r["kind"], f"legacy.{r['kind']}")
+                    ak = "user" if (r["actor"] or "").startswith(
+                        ("dashboard:", "clickup:", "token:")) else "system"
+                    note = (r["detail"] or "")[:400]
+                    c.execute(
+                        "INSERT INTO audit_log (at, actor, actor_kind, action, scope, "
+                        "workspace_id, job_id, target, channel, detail) "
+                        "VALUES (?, ?, ?, ?, 'instance', NULL, '', ?, '', ?)",
+                        (r["at"], r["actor"] or "engine", ak, action, r["target"] or "",
+                         json.dumps({"kind": r["kind"], "note": note})))
+                c.execute(
+                    "INSERT INTO app_config (key, value, updated_at) VALUES "
+                    "('audit_legacy_copied', '1', ?)", (time.time(),))
 
     @contextmanager
     def _conn(self):
@@ -995,6 +1073,120 @@ class JobStore:
         with self._conn() as c:
             c.execute("DELETE FROM auth_sessions WHERE expires_at <= ?", (time.time(),))
 
+    # ---------- scoped API tokens (Epic E2) ----------
+
+    def api_token_create(self, user_id: int, name: str = "", scopes: str = "",
+                         ttl_days: int = 0) -> tuple[str, dict]:
+        """Generate a `ctl_` token, store ONLY its sha256, return the plaintext
+        ONCE plus the row. prefix_hint is a non-secret display fragment
+        ('ctl_…<last4>') — never the leading chars (those are secret entropy)."""
+        token = "ctl_" + secrets.token_urlsafe(32)
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        prefix_hint = f"ctl_…{token[-4:]}"
+        now = time.time()
+        expires_at = (now + ttl_days * 86400) if ttl_days and ttl_days > 0 else None
+        with self._conn() as c:
+            cur = c.execute(
+                "INSERT INTO api_tokens (user_id, name, token_hash, prefix_hint, scopes, "
+                "created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (int(user_id), name or "", token_hash, prefix_hint, scopes or "", now, expires_at),
+            )
+            row = c.execute("SELECT id, user_id, name, prefix_hint, scopes, created_at, "
+                            "last_used_at, expires_at, revoked_at FROM api_tokens WHERE id = ?",
+                            (cur.lastrowid,)).fetchone()
+        return token, dict(row)
+
+    def api_token_verify(self, token: str) -> dict | None:
+        """Resolve a `ctl_` token to its ENABLED user row (+ token scopes/id).
+        Rejects revoked/expired tokens. Touches last_used_at (throttled)."""
+        token = (token or "").strip()
+        if not token.startswith("ctl_"):
+            return None
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        now = time.time()
+        with self._conn() as c:
+            row = c.execute(
+                """SELECT t.id AS token_id, t.scopes AS token_scopes, t.last_used_at,
+                          t.expires_at, t.revoked_at, u.*
+                   FROM api_tokens t JOIN users u ON u.id = t.user_id
+                   WHERE t.token_hash = ? AND u.disabled = 0""",
+                (token_hash,)).fetchone()
+            if row is None:
+                return None
+            row = dict(row)
+            if row.get("revoked_at") is not None:
+                return None
+            if row.get("expires_at") is not None and row["expires_at"] <= now:
+                return None
+            # throttle last_used writes to ~1/min (like auth_session last_seen)
+            last = row.get("last_used_at") or 0
+            if now - last > 60:
+                c.execute("UPDATE api_tokens SET last_used_at = ? WHERE id = ?",
+                          (now, row["token_id"]))
+        return row
+
+    def api_token_list(self, user_id: int) -> list[dict]:
+        """A user's tokens WITHOUT any hash — safe for the API."""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT id, user_id, name, prefix_hint, scopes, created_at, last_used_at, "
+                "expires_at, revoked_at FROM api_tokens WHERE user_id = ? ORDER BY id DESC",
+                (int(user_id),)).fetchall()
+            return [dict(r) for r in rows]
+
+    def api_token_revoke(self, token_id: int, user_id: int | None = None) -> bool:
+        """Revoke a token. When user_id is given, only that owner's token is
+        revoked (self-service); None = admin revoke of any token. Idempotent."""
+        now = time.time()
+        with self._conn() as c:
+            if user_id is None:
+                cur = c.execute(
+                    "UPDATE api_tokens SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL",
+                    (now, int(token_id)))
+            else:
+                cur = c.execute(
+                    "UPDATE api_tokens SET revoked_at = ? WHERE id = ? AND user_id = ? "
+                    "AND revoked_at IS NULL",
+                    (now, int(token_id), int(user_id)))
+            return cur.rowcount > 0
+
+    def user_has_active_token(self, user_id: int) -> bool:
+        """Any non-revoked, non-expired token — drives the Basic deprecation."""
+        now = time.time()
+        with self._conn() as c:
+            return c.execute(
+                "SELECT 1 FROM api_tokens WHERE user_id = ? AND revoked_at IS NULL "
+                "AND (expires_at IS NULL OR expires_at > ?) LIMIT 1",
+                (int(user_id), now)).fetchone() is not None
+
+    # ---------- OIDC login transactions (Epic E1) ----------
+
+    def oidc_txn_create(self, state: str, nonce: str, redirect_after: str = "/",
+                        provider: str = "oidc"):
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO auth_oidc_txn (state, nonce, redirect_after, provider, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (state, nonce, redirect_after or "/", provider, time.time()))
+
+    def oidc_txn_take(self, state: str, max_age_seconds: int = 600) -> dict | None:
+        """Single-use: fetch and DELETE the txn row. Returns None when missing or
+        older than max_age (fail closed — an expired/replayed state is refused)."""
+        with self._conn() as c:
+            row = c.execute("SELECT * FROM auth_oidc_txn WHERE state = ?", (state,)).fetchone()
+            if row is None:
+                return None
+            c.execute("DELETE FROM auth_oidc_txn WHERE state = ?", (state,))
+            row = dict(row)
+        if time.time() - (row.get("created_at") or 0) > max_age_seconds:
+            return None
+        return row
+
+    def oidc_txn_prune(self, max_age_seconds: int = 600):
+        with self._conn() as c:
+            c.execute("DELETE FROM auth_oidc_txn WHERE created_at <= ?",
+                      (time.time() - max_age_seconds,))
+
     # ---------- app config (project-context overrides, key-value) ----------
 
     def config_all(self) -> dict:
@@ -1363,6 +1555,81 @@ class JobStore:
                     (*[int(w) for w in workspace_ids], int(limit))).fetchall()
             return [dict(r) for r in rows]
 
+    # ---------- audit_log (Epic E4 — canonical, append-only, SIEM cursor) ----------
+
+    # Allow-listed detail fields (redaction by allow-list, not denylist — a call
+    # site can never leak a secret by forgetting to redact a new key).
+    _AUDIT_DETAIL_ALLOW = frozenset({
+        "action", "method", "field", "fields", "from", "to", "role", "reason",
+        "verdict", "stage", "channel", "name", "ttl_days", "scopes", "count",
+        "level", "pin", "project", "provider", "state", "amount", "pct",
+        "budget", "spent", "clickup_user_id", "username", "kind", "note",
+        "forced", "override",
+    })
+
+    @classmethod
+    def _audit_redact(cls, detail: dict | None) -> str:
+        if not detail:
+            return "{}"
+        clean = {k: v for k, v in detail.items() if k in cls._AUDIT_DETAIL_ALLOW}
+        return json.dumps(clean, default=str)[:4000]
+
+    def audit_add(self, action: str, *, actor: str = "engine", actor_kind: str = "system",
+                  scope: str = "instance", workspace_id=None, job_id: str = "",
+                  target: str = "", channel: str = "", detail: dict | None = None):
+        """Append one audit row. Detail is redacted by allow-list here so no
+        call site can leak a secret. Append-only — no update/delete."""
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO audit_log (at, actor, actor_kind, action, scope, "
+                "workspace_id, job_id, target, channel, detail) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (time.time(), actor, actor_kind, action, scope, workspace_id,
+                 job_id or "", target or "", channel or "", self._audit_redact(detail)))
+
+    def audit_page(self, after_id: int = 0, limit: int = 500,
+                   workspace_ids: list[int] | None = None) -> list[dict]:
+        """Cursor-paged rows with id > after_id (ascending — monotonic SIEM
+        export). workspace_ids scopes to a workspace-admin's memberships;
+        instance-scoped rows (workspace_id IS NULL) are always visible to an
+        unscoped (instance-admin) reader; a scoped reader sees only their ws
+        rows (never the instance-wide firehose)."""
+        limit = max(1, min(int(limit), 5000))
+        q = "SELECT * FROM audit_log WHERE id > ?"
+        params: list = [int(after_id)]
+        if workspace_ids is not None:
+            if not workspace_ids:
+                return []
+            marks = ",".join("?" for _ in workspace_ids)
+            q += f" AND workspace_id IN ({marks})"
+            params += list(workspace_ids)
+        q += " ORDER BY id ASC LIMIT ?"
+        params.append(limit)
+        with self._conn() as c:
+            return [dict(r) for r in c.execute(q, params).fetchall()]
+
+    def audit_recent(self, limit: int = 100,
+                     workspace_ids: list[int] | None = None) -> list[dict]:
+        """Newest-first for the dashboard viewer (same scoping as audit_page)."""
+        q = "SELECT * FROM audit_log"
+        params: list = []
+        if workspace_ids is not None:
+            if not workspace_ids:
+                return []
+            marks = ",".join("?" for _ in workspace_ids)
+            q += f" WHERE workspace_id IN ({marks})"
+            params += list(workspace_ids)
+        q += " ORDER BY id DESC LIMIT ?"
+        params.append(max(1, min(int(limit), 1000)))
+        with self._conn() as c:
+            return [dict(r) for r in c.execute(q, params).fetchall()]
+
+    def audit_prune(self, older_than_days: int):
+        if older_than_days and older_than_days > 0:
+            cutoff = time.time() - older_than_days * 86400
+            with self._conn() as c:
+                c.execute("DELETE FROM audit_log WHERE at < ?", (cutoff,))
+
     # ---------- Slack ingest cursors (Epic D3) ----------
 
     def slack_cursor_get(self, channel: str) -> str | None:
@@ -1414,13 +1681,25 @@ class JobStore:
     def admin_event_add(self, kind: str, target: str = "", detail: str = "",
                         actor: str = ""):
         """Append-only admin/config mutation audit (see the admin_events DDL).
-        Callers redact secret values BEFORE they reach detail."""
+        Callers redact secret values BEFORE they reach detail.
+
+        Epic E4: admin_events is SUPERSEDED by audit_log. This shim keeps the
+        legacy INSERT (one release, rollback safety) AND mirrors the event into
+        the unified audit_log so the export/viewer is complete without every
+        legacy call site being rewritten at once."""
+        now = time.time()
         with self._conn() as c:
             c.execute(
                 "INSERT INTO admin_events (kind, target, detail, actor, at) "
                 "VALUES (?, ?, ?, ?, ?)",
-                (kind, target, detail, actor, time.time()),
+                (kind, target, detail, actor, now),
             )
+        # mirror to audit_log (actor_kind derived from the actor prefix)
+        from .audit import LEGACY_KIND_MAP
+        action = LEGACY_KIND_MAP.get(kind, f"legacy.{kind}")
+        actor_kind = "user" if (actor or "").startswith(("dashboard:", "clickup:", "token:")) else "system"
+        self.audit_add(action, actor=actor or "engine", actor_kind=actor_kind,
+                       target=target, detail={"kind": kind, "note": detail[:400] if detail else ""})
 
     def admin_events_recent(self, limit: int = 100) -> list[dict]:
         with self._conn() as c:

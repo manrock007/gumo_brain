@@ -37,7 +37,7 @@ from .feature_prompts import stage_name
 from .fixer import ensure_session_store
 from .memory import MemoryReader
 from .sentry_api import extract_issue_ref, verify_signature
-from . import autonomy, inboxlib, people, roles, routines
+from . import audit, autonomy, inboxlib, people, roles, routines
 from .worker import GateConflict, GateForbidden, Worker
 from .workspaces import WorkspaceError, WorkspaceNotFound, WorkspaceService
 from . import transcripts
@@ -258,6 +258,79 @@ async def change_password(body: PasswordBody, response: Response,
         max_age=settings.auth_session_ttl_days * 86400, path="/",
     )
     return {"ok": True, "detail": "password changed — other sessions signed out"}
+
+
+class TokenCreateBody(BaseModel):
+    name: str = ""
+    scopes: list | None = None   # reserved; '' = inherit the user's role (full)
+    ttl_days: int | None = None  # None = settings default; 0 = no expiry
+
+
+def _public_token(row: dict) -> dict:
+    return {"id": row["id"], "name": row.get("name") or "",
+            "prefix_hint": row.get("prefix_hint") or "",
+            "scopes": row.get("scopes") or "",
+            "created_at": row.get("created_at"),
+            "last_used_at": row.get("last_used_at"),
+            "expires_at": row.get("expires_at"),
+            "revoked_at": row.get("revoked_at")}
+
+
+@app.post("/api/tokens")
+async def create_token(body: TokenCreateBody, user: dict = Depends(require_user)):
+    """Mint a scoped API token (Epic E2). Returns the plaintext ONCE."""
+    store: JobStore = app.state.store
+    ttl = body.ttl_days if body.ttl_days is not None else settings.api_token_default_ttl_days
+    if ttl is not None and ttl < 0:
+        raise HTTPException(status_code=400, detail="ttl_days must be >= 0 (0 = no expiry)")
+    scopes = json.dumps(body.scopes) if body.scopes else ""
+    token, row = store.api_token_create(user["id"], name=(body.name or "").strip()[:80],
+                                        scopes=scopes, ttl_days=ttl or 0)
+    audit.record(store, audit.TOKEN_CREATE, actor=audit.dashboard_actor(user),
+                 actor_kind="user", target=str(row["id"]),
+                 detail={"name": row.get("name") or "", "ttl_days": ttl or 0})
+    return {"token": token, **_public_token(row),
+            "warning": "copy this token now — it is shown only once"}
+
+
+@app.get("/api/tokens")
+async def list_tokens(user: dict = Depends(require_user)):
+    return [_public_token(r) for r in app.state.store.api_token_list(user["id"])]
+
+
+@app.delete("/api/tokens/{token_id}")
+async def revoke_token(token_id: int, user: dict = Depends(require_user)):
+    store: JobStore = app.state.store
+    if not store.api_token_revoke(token_id, user["id"]):
+        raise HTTPException(status_code=404, detail="token not found")
+    audit.record(store, audit.TOKEN_REVOKE, actor=audit.dashboard_actor(user),
+                 actor_kind="user", target=str(token_id))
+    return {"ok": True}
+
+
+@app.get("/api/users/{username}/tokens", dependencies=[Depends(require_admin)])
+async def admin_list_user_tokens(username: str):
+    store: JobStore = app.state.store
+    target = store.user_get(username)
+    if target is None:
+        raise HTTPException(status_code=404, detail="user not found")
+    return [_public_token(r) for r in store.api_token_list(target["id"])]
+
+
+@app.delete("/api/users/{username}/tokens/{token_id}")
+async def admin_revoke_user_token(username: str, token_id: int,
+                                  admin: dict = Depends(require_admin)):
+    """Admin revoke for offboarding (Epic E2)."""
+    store: JobStore = app.state.store
+    target = store.user_get(username)
+    if target is None:
+        raise HTTPException(status_code=404, detail="user not found")
+    if not store.api_token_revoke(token_id, target["id"]):
+        raise HTTPException(status_code=404, detail="token not found")
+    audit.record(store, audit.TOKEN_REVOKE, actor=audit.dashboard_actor(admin),
+                 actor_kind="user", target=str(token_id),
+                 detail={"username": username})
+    return {"ok": True}
 
 
 def _decode_profile(row: dict) -> dict:
@@ -1374,10 +1447,15 @@ def _live_unmapped_warning(store: JobStore) -> str:
 
 
 def _context_payload(warning: str = "") -> dict:
+    from .config import RUNTIME_CONTEXT_KEYS
+    # only project-context keys are "overridden" — internal app_config markers
+    # (setup_done, audit_legacy_copied, …) are not context overrides.
+    overridden = sorted(k for k in app.state.store.config_all()
+                        if k in RUNTIME_CONTEXT_KEYS)
     return {
         "context": settings.project_context(),
         "defaults": _default_settings.project_context(),
-        "overridden": sorted(app.state.store.config_all().keys()),
+        "overridden": overridden,
         "warning": warning,
     }
 

@@ -31,6 +31,43 @@ log = logging.getLogger("brain.auth")
 SESSION_COOKIE = "ctrlloop_session"
 _hasher = PasswordHasher()  # argon2id, library defaults
 
+# Sentinel pw_hash for SSO-provisioned accounts: a value argon2.verify can never
+# match, so an SSO-only user has NO usable local password (Epic E1). It is not a
+# valid argon2 encoding, so _verify_hash returns False for any input.
+UNUSABLE_PW = "!sso-no-local-password!"
+
+
+def is_local_provider(user: dict) -> bool:
+    return (user.get("auth_provider") or "local") == "local"
+
+
+def has_usable_password(user: dict) -> bool:
+    """A local account with a real argon2 hash (not the SSO sentinel)."""
+    return bool(user.get("pw_hash")) and user.get("pw_hash") != UNUSABLE_PW
+
+
+def is_break_glass(user: dict) -> bool:
+    """The break-glass predicate (Epic E1/E2, amendment blocker 7): a
+    local-provider user with a usable password can ALWAYS password-login — the
+    credential is never invalidated for SSO reasons, so the instance can never
+    lock itself out of local auth."""
+    return is_local_provider(user) and has_usable_password(user)
+
+
+def _is_instance_admin(user: dict) -> bool:
+    # E3 renames 'admin' -> 'instance_admin'; accept both during transition.
+    return (user.get("role") or "") in ("admin", "instance_admin")
+
+
+def basic_deprecation_exempt(user: dict) -> bool:
+    """Who may still use HTTP Basic AFTER minting a token (Epic E2). Regular
+    accounts are nudged to their ctl_ token for automation; break-glass
+    instance admins (local provider, usable password) stay allowed so an ops
+    user is never locked out even after tokening. Faithful to blocker 7's core
+    guarantee — the admin can always get in — while the deprecation still bites
+    for non-admin automation accounts."""
+    return is_break_glass(user) and _is_instance_admin(user)
+
 
 def hash_password(password: str) -> str:
     return _hasher.hash(password)
@@ -84,6 +121,13 @@ def verify_login(store: JobStore, settings: Settings,
     if (user.get("locked_until") or 0) > time.time():
         raise HTTPException(status_code=429,
                             detail="account temporarily locked — try again later")
+    # Epic E1: an SSO-only account (non-local provider, no usable local
+    # password) can never password-auth — refused with the generic 401 so it
+    # cannot be distinguished from a wrong password. A local-provider account
+    # with a usable password is the break-glass path and is always honored.
+    if not is_local_provider(user) and not has_usable_password(user):
+        _verify_hash(_DUMMY_HASH, password)
+        raise generic
     if not _verify_hash(user["pw_hash"], password):
         store.user_record_failure(username, settings.auth_lockout_attempts,
                                   settings.auth_lockout_seconds)
@@ -120,19 +164,47 @@ def _basic_credentials(request: Request) -> tuple[str, str] | None:
         return None
 
 
+def _bearer_token(request: Request) -> str | None:
+    header = request.headers.get("Authorization", "")
+    if header.startswith("Bearer "):
+        return header[7:].strip()
+    return None
+
+
 def current_user(request: Request) -> dict | None:
-    """Resolve the acting user. An explicit Authorization header is a
-    deliberate credential and takes precedence over ambient cookies — and if
-    it is wrong, the request FAILS (verify_login's 401/429 propagates).
-    Swallowing that error and falling back to the cookie would let a script
-    with bad or revoked credentials silently act as whatever browser session
-    shares the cookie jar, and would mask a lockout (429) as a generic 401.
+    """Resolve the acting user. An explicit Authorization header is a deliberate
+    credential and takes precedence over ambient cookies — and if it is wrong,
+    the request FAILS (never silently falls through to the cookie).
+
+    Precedence (Epic E2):
+      1. `Authorization: Bearer ctl_…` -> API token; miss/expired/revoked -> 401.
+      2. `Authorization: Bearer <other>` -> reserved (OIDC access tokens); 401.
+      3. `Authorization: Basic` -> password. DEPRECATION: once the account has an
+         active API token, Basic password auth is refused (403) UNLESS the user
+         is a break-glass account (local provider + usable password) so an ops
+         user can always get in.
+      4. Cookie session.
     Returns None only when no credential was presented at all."""
     store: JobStore = request.app.state.store
     settings: Settings = request.app.state.settings
+    bearer = _bearer_token(request)
+    if bearer is not None:
+        if bearer.startswith("ctl_"):
+            user = store.api_token_verify(bearer)
+            if user is None:
+                raise HTTPException(status_code=401, detail="invalid or expired API token",
+                                    headers={"WWW-Authenticate": "Bearer"})
+            return user
+        raise HTTPException(status_code=401, detail="unsupported bearer token",
+                            headers={"WWW-Authenticate": "Bearer"})
     creds = _basic_credentials(request)
     if creds:
-        return verify_login(store, settings, creds[0], creds[1])  # raises on failure
+        user = verify_login(store, settings, creds[0], creds[1])  # raises on failure
+        if store.user_has_active_token(user["id"]) and not basic_deprecation_exempt(user):
+            raise HTTPException(
+                status_code=403,
+                detail="password auth is disabled for this account — use an API token (ctl_…)")
+        return user
     token = request.cookies.get(SESSION_COOKIE)
     if token:
         return store.auth_session_user(_token_hash(token))
