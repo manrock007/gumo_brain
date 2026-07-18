@@ -197,6 +197,19 @@ CREATE TABLE IF NOT EXISTS gate_events (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_gate_events_dedupe ON gate_events(job_id, kind, ref);
 
+-- Append-only audit of admin/config mutations that grant or move authority
+-- (user↔ClickUp identity links, workspace security config). INSERT-only —
+-- the minimal substrate the BUILD-PLAN invariant ("every new mutation is
+-- auditable") requires until Epic E4's full audit_log folds/exports it.
+CREATE TABLE IF NOT EXISTS admin_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL,              -- 'clickup_link' | 'workspace_config' | 'workspace_create'
+    target TEXT NOT NULL DEFAULT '', -- mutated entity: username / workspace id
+    detail TEXT DEFAULT '',          -- what changed (secrets redacted at the call site)
+    actor TEXT DEFAULT '',           -- acting principal, e.g. 'dashboard:<username>'
+    at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS metric_readings (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     job_id TEXT NOT NULL,            -- the watch job (INSERT-only, one row per read)
@@ -852,6 +865,24 @@ class JobStore:
                 (job_id, stage, kind, ref, detail, actor, time.time()),
             )
             return cur.rowcount == 1
+
+    def admin_event_add(self, kind: str, target: str = "", detail: str = "",
+                        actor: str = ""):
+        """Append-only admin/config mutation audit (see the admin_events DDL).
+        Callers redact secret values BEFORE they reach detail."""
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO admin_events (kind, target, detail, actor, at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (kind, target, detail, actor, time.time()),
+            )
+
+    def admin_events_recent(self, limit: int = 100) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM admin_events ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+            return [dict(r) for r in rows]
 
     def gate_events_for(self, job_id: str) -> list[dict]:
         with self._conn() as c:

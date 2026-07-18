@@ -324,6 +324,16 @@ async def users_patch(username: str, body: UserPatchBody,
         except sqlite3.IntegrityError:
             raise HTTPException(status_code=409,
                                 detail="ClickUp id already linked to another user")
+        # the mapping decides WHOSE ClickUp comments answer role-owned gates
+        # (gate-answer authority + attribution) — every link/relink/clear is
+        # audited with the acting admin, or an impersonating relink would be
+        # unreconstructable afterwards
+        old = (user.get("clickup_user_id") or "").strip()
+        if cu_id != old:
+            store.admin_event_add(
+                "clickup_link", target=username,
+                detail=f"clickup_user_id: {old or '(none)'} -> {cu_id or '(cleared)'}",
+                actor=f"dashboard:{admin['username']}")
     return _public_user(store.user_get(username))
 
 
@@ -416,19 +426,46 @@ async def workspaces_list(user: dict = Depends(require_user)):
     return [svc.public(w) for w in svc.user_workspaces(user)]
 
 
-@app.post("/api/workspaces", dependencies=[Depends(require_admin)])
-async def workspaces_create(body: WorkspaceCreateBody):
+def _audit_workspace_mutation(kind: str, workspace_id, admin: dict, provided: dict):
+    """Audit a workspace config mutation with the acting admin (BUILD-PLAN:
+    every new mutation is auditable). These keys are security-relevant —
+    stage_role_map reassigns gate ownership, require_attributed_answers='off'
+    disables ClickUp attribution enforcement — so the change and its author
+    must be reconstructable. Secret-bearing values are redacted, never stored
+    in the audit row."""
+    if not provided:
+        return
+    redacted = {}
+    for k, v in provided.items():
+        if k in ("analytics_config", "slack_webhook_url"):
+            redacted[k] = "(redacted)"
+        elif k == "repos":
+            redacted[k] = sorted(str((r or {}).get("slug") or "?") for r in (v or []))
+        else:
+            redacted[k] = v
+    app.state.store.admin_event_add(
+        kind, target=str(workspace_id),
+        detail=json.dumps(redacted, default=str)[:1000],
+        actor=f"dashboard:{admin['username']}")
+
+
+@app.post("/api/workspaces")
+async def workspaces_create(body: WorkspaceCreateBody,
+                            admin: dict = Depends(require_admin)):
     svc = _ws_svc()
     try:
         ws = svc.create(body.slug, body.name,
                         **body.model_dump(exclude={"slug", "name"}, exclude_none=True))
     except WorkspaceError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    _audit_workspace_mutation("workspace_create", ws["id"], admin,
+                              body.model_dump(exclude_none=True))
     return svc.public(ws)
 
 
-@app.patch("/api/workspaces/{workspace_id}", dependencies=[Depends(require_admin)])
-async def workspaces_patch(workspace_id: int, body: WorkspacePatchBody):
+@app.patch("/api/workspaces/{workspace_id}")
+async def workspaces_patch(workspace_id: int, body: WorkspacePatchBody,
+                           admin: dict = Depends(require_admin)):
     svc = _ws_svc()
     try:
         ws = svc.update(workspace_id, repos=body.repos,
@@ -437,6 +474,10 @@ async def workspaces_patch(workspace_id: int, body: WorkspacePatchBody):
         raise HTTPException(status_code=404, detail=str(e))
     except WorkspaceError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    # recorded only after the validated update landed — a 400 changes nothing
+    # and audits nothing
+    _audit_workspace_mutation("workspace_config", workspace_id, admin,
+                              body.model_dump(exclude={"slug"}, exclude_none=True))
     return svc.public(ws) | {"warning": _live_unmapped_warning(app.state.store)}
 
 
