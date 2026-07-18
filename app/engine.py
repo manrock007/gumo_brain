@@ -96,6 +96,10 @@ class RepoLocks:
 # definition for both the feature pipeline and the v1 lifecycle capture.
 QUESTION_HEADING_RE = re.compile(r"^#{1,4}\s*(?:open\s+)?questions?\b.*$", re.IGNORECASE | re.MULTILINE)
 BUILD_GROUP_RE = re.compile(r"^#{1,4}\s*build\s+group\b", re.IGNORECASE | re.MULTILINE)
+# Epic B1: the P0/P1 artifact contract demands a '## Success metric' section —
+# a STAGE_DONE lacking it parks flagged (fail closed), never advances silently.
+SUCCESS_METRIC_HEADING_RE = re.compile(r"^#{1,4}[ \t]*success[ \t]+metric\b",
+                                       re.IGNORECASE | re.MULTILINE)
 
 
 def all_pr_urls(text: str) -> list[str]:
@@ -485,6 +489,11 @@ class Engine:
         marker, payload, pr_url = parse_stage_output(raw.text)
         # track EVERY PR this run mentioned (not just the last) + lifecycle kickoff
         await self.record_prs(job_id, all_pr_urls(raw.text))
+        # Epic B: harvest SUCCESS_METRIC/METRIC_TARGET/METRIC_WINDOW_DAYS/
+        # METRIC_EVENT protocol lines onto the job row — the engine's own
+        # record, NOT gated by the ClickUp field-sync flag (mirror stays
+        # best-effort visibility; the row is what the watcher reads)
+        self.harvest_metric_lines(job, raw.text)
         # conveyor mirror: FRICTION -> improvements log, FLAG/METRIC -> launch fields
         await self.sync_run_report_fields(job, stage, raw.text)
 
@@ -530,6 +539,25 @@ class Engine:
             await self._park(job, stage, run_id, workspace, target, base_sha,
                              payload[-4000:] if payload else "(empty output)", pr_url,
                              flag="UNPARSED — the run ended without STAGE_DONE/STAGE_FAIL; treat with suspicion",
+                             conflicted=conflicted)
+            return
+
+        # Epic B1 fail-closed check: a P0/P1 STAGE_DONE without the mandatory
+        # '## Success metric' section parks FLAGGED instead of closing 'done' —
+        # a sibling of the fail/ask/unparsed branches, deliberately AFTER the
+        # artifact commit + checkpoint push (the payload is on the branch and
+        # the gate) and INSTEAD of the 'done' close (first-close-wins in
+        # stage_run_close would make 'missing_metric' unrecordable afterwards).
+        # It also precedes the light-mode auto-advance: the flag always parks.
+        # A human '/proceed' on this park is a deliberate override of the
+        # metric requirement (documented in ENGINE.md).
+        if stage in (0, 1) and not SUCCESS_METRIC_HEADING_RE.search(payload or ""):
+            self.store.stage_run_close(run_id, "missing_metric", **self._meta(raw))
+            await self._park(job, stage, run_id, workspace, target, base_sha,
+                             payload or "(empty output)", pr_url,
+                             flag="MISSING '## Success metric' — the P0/P1 artifact "
+                                  "contract requires it; /redo to regenerate "
+                                  "(or /proceed to deliberately continue without one)",
                              conflicted=conflicted)
             return
 
@@ -999,6 +1027,39 @@ class Engine:
     FRICTION_RE = re.compile(r"^FRICTION:\s*(.+)$", re.MULTILINE)
     FLAG_RE = re.compile(r"^FLAG_NAME:\s*(.+)$", re.MULTILINE)
     METRIC_RE = re.compile(r"^SUCCESS_METRIC:\s*(.+)$", re.MULTILINE)
+    # Epic B: the outcome loop's protocol lines (harvested onto the JOB ROW —
+    # engine record, independent of any ClickUp mirroring)
+    METRIC_TARGET_RE = re.compile(r"^METRIC_TARGET:\s*(.+)$", re.MULTILINE)
+    METRIC_WINDOW_RE = re.compile(r"^METRIC_WINDOW_DAYS:\s*(\d{1,3})\s*$", re.MULTILINE)
+    METRIC_EVENT_RE = re.compile(r"^METRIC_EVENT:\s*(.+)$", re.MULTILINE)
+
+    def harvest_metric_lines(self, job: dict, text: str):
+        """Harvest the run's metric protocol lines onto the job row (Epic B).
+        Human intake wins — success_metric / metric_target / metric_window_days
+        fill ONLY when the row's value is empty/NULL. metric_event is
+        engine-owned and always updates from the latest emission. Runs even
+        with ClickUp field sync disabled: the job row is the record."""
+        if (job.get("kind") or "") != "feature":
+            return
+        text = text or ""
+        row = self.store.get(job["issue_id"]) or job
+        updates: dict = {}
+        m = self.METRIC_RE.search(text)
+        if m and not (row.get("success_metric") or "").strip():
+            updates["success_metric"] = m.group(1).strip()[:300]
+        t = self.METRIC_TARGET_RE.search(text)
+        if t and not (row.get("metric_target") or "").strip():
+            updates["metric_target"] = t.group(1).strip()[:300]
+        w = self.METRIC_WINDOW_RE.search(text)
+        if w and row.get("metric_window_days") is None:
+            days = int(w.group(1))
+            if 1 <= days <= 365:  # same clamp as the API/intake — never silently accept
+                updates["metric_window_days"] = days
+        e = self.METRIC_EVENT_RE.search(text)
+        if e and (e.group(1).strip() != (row.get("metric_event") or "")):
+            updates["metric_event"] = e.group(1).strip()[:300]
+        if updates:
+            self.store.set_fields(job["issue_id"], **updates)
 
     async def sync_run_report_fields(self, job: dict, stage: int, text: str):
         """Harvest the run's self-reported protocol lines into the workflow

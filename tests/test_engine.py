@@ -191,3 +191,142 @@ class TestParkOwnership:
         worker.engine.clickup = fake
         self._park(worker, tmp_path, "feat-pk4", 2)
         assert fake.assigned == []
+
+
+class TestSuccessMetricHeading:
+    def test_matches_h2_h3_and_case(self):
+        from app.engine import SUCCESS_METRIC_HEADING_RE as RE
+        assert RE.search("## Success metric\ntext")
+        assert RE.search("### Success Metric\ntext")
+        assert RE.search("#### success metric (proposed)\n")
+        assert RE.search("intro\n\n## Success metric\n")
+
+    def test_mid_line_and_prose_do_not_match(self):
+        from app.engine import SUCCESS_METRIC_HEADING_RE as RE
+        assert not RE.search("the success metric is signups")
+        assert not RE.search("see ## Success metric above")
+        assert not RE.search("## Success\nmetric later")
+
+
+class TestMissingMetricGate:
+    """Epic B1 fail-closed check: a P0/P1 STAGE_DONE without '## Success
+    metric' closes the run 'missing_metric' and parks flagged — after the
+    artifact commit + checkpoint, before auto-advance (light mode included)."""
+
+    PAYLOAD_NO_METRIC = ("table\nSTAGE_DONE:\n## Understanding\nstuff\n"
+                         "## Questions\n1. Approve and continue to the next stage?")
+    PAYLOAD_WITH_METRIC = ("table\nSTAGE_DONE:\n## Understanding\nstuff\n"
+                           "## Success metric\nsignups +10% in 14 days\n"
+                           "## Questions\n1. Approve and continue to the next stage?")
+
+    def _after_run(self, worker, monkeypatch, tmp_path, job_id, stage, text,
+                   gate_mode="full"):
+        eng = worker.engine
+        worker.intake_feature(job_id, title="F", project="web", request="r",
+                              gate_mode=gate_mode)
+        worker.store.set_fields(job_id, stage=stage, stage_attempts=1)
+        job = worker.store.get(job_id)
+        run_id = worker.store.stage_run_open(job_id, stage, 1, None)
+
+        class Raw:
+            status = "ok"
+            meta = {}
+
+        Raw.text = text
+
+        async def truthy(*a, **k):
+            return True
+
+        async def empty_list(*a, **k):
+            return []
+
+        async def anoop(*a, **k):
+            return None
+
+        monkeypatch.setattr(eng, "_checkpoint", truthy)
+        monkeypatch.setattr(eng.sync, "push", empty_list)
+        monkeypatch.setattr(eng.sync, "commit_file", truthy)
+        monkeypatch.setattr(eng, "_comment", anoop)
+        target = worker.settings.repo_for_project("web")
+        asyncio.run(eng._after_run(job, stage, run_id, target, "b",
+                                   str(tmp_path), Raw(), "base"))
+        return worker.store.get(job_id), worker.store.stage_runs_for(job_id)[-1]
+
+    def test_p0_without_section_parks_missing_metric(self, worker, monkeypatch, tmp_path):
+        row, run = self._after_run(worker, monkeypatch, tmp_path,
+                                   "feat-mm1", 0, self.PAYLOAD_NO_METRIC)
+        assert run["result_status"] == "missing_metric"  # never closed 'done'
+        assert row["status"] == "awaiting_input"
+        assert row["stage"] == 0  # did NOT advance
+        assert "MISSING '## Success metric'" in row["evidence"]
+
+    def test_p1_without_section_parks_in_light_mode_too(self, worker, monkeypatch, tmp_path):
+        row, run = self._after_run(worker, monkeypatch, tmp_path,
+                                   "feat-mm2", 1, self.PAYLOAD_NO_METRIC,
+                                   gate_mode="light")
+        assert run["result_status"] == "missing_metric"
+        assert row["status"] == "awaiting_input" and row["stage"] == 1
+
+    def test_p0_with_section_parks_normally(self, worker, monkeypatch, tmp_path):
+        row, run = self._after_run(worker, monkeypatch, tmp_path,
+                                   "feat-mm3", 0, self.PAYLOAD_WITH_METRIC)
+        assert run["result_status"] == "done"
+        assert row["status"] == "awaiting_input"
+        assert "MISSING" not in (row["evidence"] or "")
+
+    def test_p2_without_section_is_unaffected(self, worker, monkeypatch, tmp_path):
+        row, run = self._after_run(worker, monkeypatch, tmp_path,
+                                   "feat-mm4", 2, self.PAYLOAD_NO_METRIC)
+        assert run["result_status"] == "done"
+
+    def test_light_mode_p2_still_auto_advances(self, worker, monkeypatch, tmp_path):
+        row, run = self._after_run(worker, monkeypatch, tmp_path,
+                                   "feat-mm5", 2, self.PAYLOAD_NO_METRIC,
+                                   gate_mode="light")
+        assert run["result_status"] == "done"
+        assert row["stage"] == 3  # auto-advanced — the check is P0/P1-scoped
+
+
+class TestHarvestMetricLines:
+    def _job(self, worker, job_id="feat-hv1", **fields):
+        worker.intake_feature(job_id, title="F", project="web", request="r",
+                              **fields)
+        return worker.store.get(job_id)
+
+    def test_fills_only_empty_fields_intake_wins(self, worker):
+        job = self._job(worker, success_metric="human metric",
+                        metric_target="human target")
+        worker.engine.harvest_metric_lines(job, (
+            "SUCCESS_METRIC: engine metric\nMETRIC_TARGET: engine target\n"
+            "METRIC_WINDOW_DAYS: 21\nMETRIC_EVENT: signup_done\n"))
+        row = worker.store.get("feat-hv1")
+        assert row["success_metric"] == "human metric"   # intake wins
+        assert row["metric_target"] == "human target"
+        assert row["metric_window_days"] == 21           # was NULL — filled
+        assert row["metric_event"] == "signup_done"      # engine-owned
+
+    def test_fills_empty_fields_and_event_always_updates(self, worker):
+        job = self._job(worker, "feat-hv2")
+        worker.engine.harvest_metric_lines(job, "SUCCESS_METRIC: signups\n"
+                                                "METRIC_EVENT: old_event\n")
+        row = worker.store.get("feat-hv2")
+        assert row["success_metric"] == "signups"
+        worker.engine.harvest_metric_lines(row, "METRIC_EVENT: new_event\n")
+        assert worker.store.get("feat-hv2")["metric_event"] == "new_event"
+
+    def test_out_of_range_window_is_ignored(self, worker):
+        job = self._job(worker, "feat-hv3")
+        worker.engine.harvest_metric_lines(job, "METRIC_WINDOW_DAYS: 999\n")
+        assert worker.store.get("feat-hv3")["metric_window_days"] is None
+
+    def test_runs_with_clickup_field_sync_disabled(self, worker):
+        worker.settings.clickup_field_sync_enabled = False
+        job = self._job(worker, "feat-hv4")
+        worker.engine.harvest_metric_lines(job, "SUCCESS_METRIC: still lands\n")
+        assert worker.store.get("feat-hv4")["success_metric"] == "still lands"
+
+    def test_non_feature_jobs_are_ignored(self, worker):
+        worker.store.insert("task-hv", source="manual", kind="task", project="web")
+        worker.engine.harvest_metric_lines(worker.store.get("task-hv"),
+                                           "SUCCESS_METRIC: nope\n")
+        assert (worker.store.get("task-hv")["success_metric"] or "") == ""

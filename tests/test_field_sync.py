@@ -260,3 +260,22 @@ class TestDecisionsFieldSync:
         worker.store.set_status("feat-fs10", "awaiting_input")
         asyncio.run(worker.answer_job("feat-fs10", "proceed", "", via="clickup"))
         assert fake.appends == []
+
+
+class TestMetricEventHarvestVsMirror:
+    def test_metric_event_lands_on_the_row_mirror_stays_gated(self, worker):
+        """Epic B2: METRIC_EVENT is harvested to the JOB ROW even with the
+        ClickUp field sync disabled — the mirror is visibility, the row is the
+        record the watcher reads."""
+        worker.settings.clickup_field_sync_enabled = False
+        fake = FakeFieldClickUp()
+        worker.engine.clickup = fake
+        job = _feature(worker, "feat-me1", stage=9)
+        text = ("FLAG_NAME: f\nSUCCESS_METRIC: signups\nMETRIC_EVENT: signup_done\n"
+                "STAGE_DONE: shipped\n## Questions\n1. Approve?")
+        worker.engine.harvest_metric_lines(job, text)
+        asyncio.run(worker.engine.sync_run_report_fields(job, 9, text))
+        row = worker.store.get("feat-me1")
+        assert row["metric_event"] == "signup_done"
+        assert row["success_metric"] == "signups"
+        assert fake.sets == [] and fake.appends == []  # mirror stayed gated
