@@ -20,6 +20,34 @@
 
 ---
 
+## Epic 0 — Built for the world (generalization mandate)
+
+**Cross-cutting and first.** CtrLoop is a product any team installs — Gumo
+is one customer whose values live in *its instance's config*, never in
+code. This epic removes every Gumo-ism and is also a standing constraint on
+every other epic: **no new code may hardcode a customer, vendor default, or
+team-specific value.**
+
+- **0.1 · Neutral defaults — BUILD.** Code defaults become generic: empty
+  repo map (first-run wizard demands one), product name "your product",
+  neutral business-context template. The Gumo map/context moves to a
+  documented example config. Hardcoded ClickUp list id, gumo-speed field
+  names (`clickup_*_field_map` defaults), and Sentry EU-region URLs become
+  empty/exampled config, never baked-in values.
+- **0.2 · Engine namespace — BUILD.** `.gumo/` becomes `.ctrlloop/` via a
+  single namespace constant; existing repos with `.gumo/` keep working
+  (read-side fallback, documented migration note). Branch prefixes
+  (`brain/…`), git author, and comment prefixes similarly resolve from
+  config with neutral defaults.
+- **0.3 · Naming sweep — BUILD.** User-facing strings, prompts, docs, and
+  test fixtures stop referencing Gumo except as an explicit example;
+  internal module names may migrate opportunistically (no big-bang rename
+  of `brain.db` etc. — compat matters more than purity).
+- **0.4 · Install-from-zero proof — BUILD.** A test (and doc walkthrough)
+  that boots a fresh instance with no Gumo assumptions: empty config →
+  first-run wizard → add a workspace/repo → submit a feature — green
+  without touching any Gumo value.
+
 ## Epic A — Team coordination & dual DRIs (bet 4)
 
 The core team-backwards change: two DRIs, role-exclusive gates, attributed
