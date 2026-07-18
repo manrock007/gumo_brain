@@ -123,7 +123,7 @@ CREATE TABLE IF NOT EXISTS workspaces (
     name TEXT NOT NULL,              -- display name, e.g. 'App'
     product_name TEXT NOT NULL DEFAULT '',
     workspace_context TEXT NOT NULL DEFAULT '',  -- injected into runs (§10 hierarchy)
-    canonical_project TEXT NOT NULL DEFAULT '',  -- project slug hosting .gumo/product
+    canonical_project TEXT NOT NULL DEFAULT '',  -- project slug hosting product-scope memory
     clickup_list_id TEXT NOT NULL DEFAULT '',    -- empty + disabled -> dashboard-only
     clickup_enabled INTEGER NOT NULL DEFAULT 0,
     slack_webhook_url TEXT NOT NULL DEFAULT '',  -- gate nudges when ClickUp is off (or always)

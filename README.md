@@ -1,4 +1,4 @@
-# CtrlLoop (formerly gumo_brain — the Gumo Engine)
+# CtrlLoop (formerly gumo_brain)
 
 Self-hosted **software-development engine**: Sentry errors, manual requests, and full
 **feature pipelines** in; **draft PRs** out — with humans approving every consequential
@@ -12,7 +12,7 @@ Four job kinds:
 | `sentry` | alert webhook / manual / sweep | grade → fix → draft PR (HITL only if COMPLEX) |
 | `task` | dashboard (title or ClickUp URL) | analyse → **gate** → implement → draft PR |
 | `feature` | dashboard (title or ClickUp URL) | **P0 Intake → P9 Ship, human gate after every stage** |
-| `memory` | dashboard, per project | bootstrap `.gumo/` product memory → draft PR |
+| `memory` | dashboard, per project | bootstrap `.ctrlloop/` product memory → draft PR |
 
 The engine's three core mechanics (full spec: **[docs/ENGINE.md](docs/ENGINE.md)**;
 running an instance — install/backup/upgrade: **[docs/OPERATIONS.md](docs/OPERATIONS.md)**):
@@ -23,11 +23,11 @@ running an instance — install/backup/upgrade: **[docs/OPERATIONS.md](docs/OPER
   too) or `/skip` on the ticket or inline on the dashboard. Code gates show
   harness-captured evidence (diffstat, compare link, draft PR from P5 on).
 - **Shared artifacts.** Every stage's document (PRD, design, plan…) lives in git on the
-  feature branch (`.gumo/features/<job>/`) AND as an editable ClickUp subtask. Humans
+  feature branch (`.ctrlloop/features/<job>/` — legacy repos keep `.gumo/`) AND as an editable ClickUp subtask. Humans
   edit in ClickUp — even mid-run — and the engine folds edits back into git with
   human-wins reconciliation that tolerates ClickUp's markdown mangling. Git is the
   source of truth; ClickUp is the editing surface; neither side's work is ever lost.
-- **Product memory.** `.gumo/memory/` (per repo) + `.gumo/product/` (canonical repo)
+- **Product memory.** `.ctrlloop/memory/` (per repo) + `.ctrlloop/product/` (canonical repo)
   hold curated, git-versioned knowledge — what the product is, how it's built, the
   codebase map, conventions, per-entry ADRs and changelog. Every stage prompt warms up
   from it (capped excerpts + file pointers); every shipped PR feeds it back. Bootstrap
@@ -44,7 +44,7 @@ compare-and-set).
 measured, not asserted.
 
 ```
-Sentry alert rule ──webhook──▶ gumo_brain (FastAPI) ◀──trigger / submit request── dashboard
+Sentry alert rule ──webhook──▶ CtrlLoop (FastAPI) ◀──trigger / submit request── dashboard
                                  │ verify signature            │
                                  ▼                             ▼
                                GRADING (sentry only)     ClickUp ticket created or adopted
@@ -126,7 +126,7 @@ The pipeline runs one gated stage at a time:
 
 Every gate: answer on the dashboard (buttons + guidance box) or comment `/proceed …`,
 `/redo …` (`/redo P3 …` re-targets an earlier stage; code-stage redos hard-reset to the
-stage baseline and preserve the failed attempt under `refs/gumo/`), or `/skip` — on the
+stage baseline and preserve the failed attempt under `refs/ctrlloop/`), or `/skip` — on the
 parent ticket or any artifact subtask. Cross-repo features: one pipeline per repo,
 server first, linked via `related_to`.
 
@@ -151,7 +151,8 @@ grading and the daily cap (a human vouched for them), and always run in two phas
    `## Questions` list. It is forbidden from changing code in this phase. The write-up
    lands on the ClickUp ticket and the job parks as `awaiting_input`.
 2. **Implement** — after a human answers, Claude implements with the guidance treated as
-   the decision, runs the tests, and opens a draft PR (branch `brain/task-<id>`). If a new
+   the decision, runs the tests, and opens a draft PR (branch `<prefix>/task-<id>`,
+   `BRANCH_PREFIX` default `ctrlloop`). If a new
    decision surfaces mid-fix it can ask again, and the loop repeats.
 
 Every hand-off is a ClickUp comment, so the ticket is the full record of the work.
@@ -174,12 +175,12 @@ to the ClickUp ticket. Answer wherever is convenient:
 
 Per-repo `setup_cmd` / `test_cmd` in `REPO_MAP` tell Claude how to run the suite inside the
 container (Node 22 is bundled; `npm ci` results persist across runs in the workspace volume).
-Currently: `web` → vitest, `react-native` → jest. `gumo` (Django) needs postgres/GDAL and is
-not runnable in-container yet — Claude is told to say so in the PR body.
+A repo without a `test_cmd` (e.g. one whose suite needs services the container lacks) is
+fine — Claude is told to say in the PR body that tests were not run here.
 
 ## Other guardrails
 
-- One branch/PR per job (`brain/sentry-<id>` / `brain/task-<id>`); a job with an open PR
+- One branch/PR per job (`<prefix>/sentry-<id>` / `<prefix>/task-<id>`); a job with an open PR
   is never re-run.
 - Failed runs respect `ISSUE_COOLDOWN_HOURS`; `MAX_RUNS_PER_DAY` caps Claude invocations
   (manual triggers and requests exempt). One job runs at a time.
@@ -204,29 +205,29 @@ Fine-grained PAT scoped to the mapped repos: `Contents: RW` + `Pull requests: RW
 
 ### 3. ClickUp
 
-Personal API token (ClickUp → Settings → Apps) → `CLICKUP_TOKEN`. The "Sentry Autofix"
-list in Gumo Space is `901615853762` (default). Status sync adapts to whatever statuses
-the list has; comments always work.
+Personal API token (ClickUp → Settings → Apps) → `CLICKUP_TOKEN`, plus your autofix
+list's id → `CLICKUP_LIST_ID` (or set a list per workspace in Settings → Workspaces).
+Status sync adapts to whatever statuses the list has; comments always work.
 
 ### 4. Sentry internal integration
 
 Sentry → Settings → Custom Integrations → "Claude Autofix":
 
-- **Webhook URL:** `https://gumo.co.in/brain/webhooks/sentry`
+- **Webhook URL:** `https://<your host>/webhooks/sentry`
 - **Alert Action:** ON; **Permissions:** Issue & Event = Read & Write
 - **Client Secret** → `SENTRY_CLIENT_SECRET`; create a **Token** → `SENTRY_AUTH_TOKEN`
+- Set `SENTRY_ORG` (and `SENTRY_API_BASE=https://de.sentry.io/api/0` for EU orgs)
 
 Then per project, create Alert Rules for what should auto-fire (grading still filters).
 
-### 5. Secrets & deploy (via gumoiac)
+### 5. Secrets & deploy
 
-AWS Secrets Manager secret `gumo/brain` (JSON): `CLAUDE_CODE_OAUTH_TOKEN`, `GITHUB_TOKEN`,
-`SENTRY_CLIENT_SECRET`, `SENTRY_AUTH_TOKEN`, `CLICKUP_TOKEN`, `DASHBOARD_PASSWORD`.
-Ansible renders `/opt/gumo/.env.brain`; nginx exposes `/brain/` on gumo.co.in.
-Dashboard: `https://gumo.co.in/brain/` (user `gumo` + `DASHBOARD_PASSWORD`).
-
-GitHub Actions needs repo secrets: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
-`AWS_REGION`, `ECR_BRAIN_REPO`, `EC2_SSH_PRIVATE_KEY`, `EC2_HOST`.
+Provide the tokens (`CLAUDE_CODE_OAUTH_TOKEN`/`ANTHROPIC_API_KEY`, `GITHUB_TOKEN`,
+`SENTRY_*`, `CLICKUP_TOKEN`, `CTRLLOOP_ADMIN_PASSWORD`) via your secret store of
+choice and run the container with a persistent `DATA_DIR` volume — the from-zero
+walkthrough is in [docs/OPERATIONS.md](docs/OPERATIONS.md). (Example deployment:
+the original Gumo instance wires these through AWS Secrets Manager + Ansible in
+its own `gumoiac` repo.)
 
 ## Local development
 

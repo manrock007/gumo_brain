@@ -729,7 +729,7 @@ function renderMemory(mem) {
     const fetched = m.fetched_at ? new Date(m.fetched_at * 1000).toLocaleString() : '&mdash;';
     const dis = pendingBoot.has(p) ? ' disabled' : '';
     return `<tr><td>${esc(p)}</td><td>${exists}</td><td>${stale}</td><td>${fetched}</td>
-      <td><button onclick="bootstrap('${esc(p)}',this)"${dis} title="Bootstrap .gumo memory via a draft PR">Bootstrap</button></td></tr>`;
+      <td><button onclick="bootstrap('${esc(p)}',this)"${dis} title="Bootstrap engine memory via a draft PR">Bootstrap</button></td></tr>`;
   }).join('');
   document.getElementById('brain-body').innerHTML = rows
     ? `<table><tr><th>project</th><th>memory</th><th>staleness</th><th>fetched</th><th></th></tr>${rows}</table>`
@@ -1005,7 +1005,7 @@ const SETUP_STEPS = [
   ['github_token', 'Provide a GitHub token',
    'Set GITHUB_TOKEN in the deploy environment and restart — the engine clones and pushes with it.'],
   ['memory', 'Bootstrap product memory',
-   'In the Project memory panel, Bootstrap reads a repo and opens its .gumo memory PR.'],
+   'In the Project memory panel, Bootstrap reads a repo and opens its engine-memory PR.'],
   ['team', 'Invite your team',
    'Settings → Users: add members with temporary passwords, then assign them to workspaces.'],
 ];
@@ -1248,7 +1248,7 @@ async function renderWorkspacesAdmin() {
       <h3>${esc(w.name)} <span class="chip">${esc(w.slug)}</span></h3>
       <div class="ws-inline">
         <div><label>Product name</label><input class="w-product" value="${attr(w.product_name)}"></div>
-        <div><label>Canonical project (hosts .gumo/product/)</label><input class="w-canon" value="${attr(w.canonical_project)}"></div>
+        <div><label>Canonical project (hosts product-scope memory)</label><input class="w-canon" value="${attr(w.canonical_project)}"></div>
       </div>
       <label>Repositories (slug &rarr; repo &middot; base &middot; setup &middot; test)</label>
       <div class="ws-repos">${repos}</div>

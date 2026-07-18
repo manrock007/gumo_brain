@@ -508,8 +508,8 @@ async def projects(user: dict = Depends(require_user)):
 
 # ---------- project context (docs/ENGINE.md §10) ----------
 # What the engine works ON — repos, canonical project, product name, business
-# context. Env/code defaults (the Gumo repos) apply until an operator saves
-# overrides here; overrides persist in the DB and survive restarts.
+# context. Env/code defaults (neutral out of the box) apply until an operator
+# saves overrides here; overrides persist in the DB and survive restarts.
 
 
 class ContextBody(BaseModel):

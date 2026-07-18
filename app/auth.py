@@ -57,7 +57,9 @@ def bootstrap_admin(store: JobStore, settings: Settings):
         username, password = settings.ctrlloop_admin_user.strip() or "admin", \
             settings.ctrlloop_admin_password
     elif settings.dashboard_password:
-        # legacy deployments: same credentials keep working after the upgrade
+        # LEGACY (deliberate, kept for upgrade compat — ENGINE.md §11): the
+        # pre-CtrlLoop single-credential era bootstraps its admin as user
+        # "gumo" so existing deployments keep their credentials unchanged.
         username, password = "gumo", settings.dashboard_password
     else:
         log.warning("no users and no CTRLLOOP_ADMIN_PASSWORD/DASHBOARD_PASSWORD set — "

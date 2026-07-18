@@ -32,7 +32,8 @@ class ClickUp:
         self._headers = {"Authorization": settings.clickup_token}
         self._statuses: list[str] = []
         # custom-field defs by lowercased name: {name: {id, type, options{name: option_id}}}
-        # — the gumo-speed conveyor contract (Stage board, PR fields, Decisions)
+        # — the workflow-conveyor mirror contract (Stage board, PR fields,
+        # Decisions; originally the gumo-speed workflow)
         self._fields: dict[str, dict] = {}
 
     async def load_statuses(self):

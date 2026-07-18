@@ -983,9 +983,9 @@ class Engine:
 
     async def sync_run_report_fields(self, job: dict, stage: int, text: str):
         """Harvest the run's self-reported protocol lines into the workflow
-        fields: FRICTION -> the append-only improvements log (the gumo-improve
-        harvest loop reads it), FLAG_NAME / SUCCESS_METRIC (P9) -> their
-        launch fields."""
+        fields: FRICTION -> the append-only improvements log (a team's
+        improvement-harvest loop can read it), FLAG_NAME / SUCCESS_METRIC
+        (P9) -> their configured launch fields."""
         if not self.settings.clickup_field_sync_enabled:
             return
         task_id = job.get("clickup_task_id") or ""

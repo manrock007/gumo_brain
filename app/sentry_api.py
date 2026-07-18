@@ -75,7 +75,7 @@ class SentryClient:
             return r.json()
 
     async def resolve_short_id(self, short_id: str) -> str | None:
-        """Resolve a short id like GUMO-1A to a numeric issue id."""
+        """Resolve a short id like PROJ-1A to a numeric issue id."""
         try:
             async with httpx.AsyncClient(timeout=30) as client:
                 r = await client.get(
