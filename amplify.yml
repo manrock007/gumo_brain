@@ -1,0 +1,14 @@
+version: 1
+frontend:
+  phases:
+    build:
+      # The landing page is a single self-contained static file — nothing to
+      # compile. Amplify just publishes the `landing/` folder as the site root.
+      commands:
+        - echo "static landing page — no build step"
+  artifacts:
+    baseDirectory: landing
+    files:
+      - '**/*'
+  cache:
+    paths: []
