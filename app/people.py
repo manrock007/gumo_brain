@@ -204,13 +204,21 @@ def ownership_block(store, ws: dict | None, project: str,
         for st, role in sorted(stage_roles.items(), key=lambda kv: int(kv[0])):
             role_stages.setdefault(role, []).append(f"P{st}")
         for role in ("founder", "dev"):
-            value = (founder or dev) if role == "founder" else (dev or founder)
+            own = founder if role == "founder" else dev
+            value = own or (dev if role == "founder" else founder)
             if not value or role not in role_stages:
                 continue
             display = roles.dri_display(store, value)
             stages = ", ".join(role_stages[role])
-            lines.append(f"- {role} decisions here ({stages} gates) belong to "
-                         f"{_line(display, 64)}")
+            if own:
+                lines.append(f"- {role} decisions here ({stages} gates) belong to "
+                             f"{_line(display, 64)}")
+            else:
+                # no DRI for this role — the gates fall to the other DRI as the
+                # fallback owner (matches roles.gate_owner); say so explicitly
+                # rather than implying this person holds the {role} role
+                lines.append(f"- {role} decisions here ({stages} gates): no {role} "
+                             f"DRI set — they fall to {_line(display, 64)}")
     if not lines:
         return ""
     block = ("## Ownership & decision authority\n\n"

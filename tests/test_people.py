@@ -206,6 +206,23 @@ class TestOwnershipBlock:
         assert "someone-else" in block
         assert "belong to fiona" not in block
 
+    def test_fallback_wording_when_role_dri_missing(self, store, settings):
+        # only a dev DRI is set: the founder gates fall to the dev as the
+        # fallback owner (matches roles.gate_owner), but the text must NOT imply
+        # the dev person holds the founder role (Seer 1603265)
+        svc = _svc(store, settings)
+        ws = store.workspace_get_by_slug("default")
+        store.feature_intake("feat-obfb", title="F", project="web", dev_dri="devon")
+        from app import roles
+        stage_roles = {str(i): roles.role_for_stage(settings, ws, i) for i in range(10)}
+        block = people.ownership_block(store, ws, "web", stage_roles,
+                                       store.get("feat-obfb"))
+        # founder gates have no founder DRI -> explicit fallback wording
+        assert "no founder DRI set — they fall to devon" in block
+        assert "founder decisions here (P0, P1 gates) belong to" not in block
+        # dev gates have a dev DRI -> the plain ownership form
+        assert "dev decisions here" in block and "belong to devon" in block
+
     def test_omitted_when_no_coverage_and_no_dris(self, store, settings):
         svc = _svc(store, settings)
         ws = store.workspace_get_by_slug("default")

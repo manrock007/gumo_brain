@@ -121,6 +121,10 @@ class OIDCProvider(IdentityProvider):
             raise NotConfigured("id_token audience mismatch")
         if claims.get("exp") and claims["exp"] < time.time():
             raise NotConfigured("id_token expired")
+        # reject a token presented before its 'not before' time (with a small
+        # skew allowance for clock drift), mirroring the exp check above
+        if claims.get("nbf") and claims["nbf"] > time.time() + 60:
+            raise NotConfigured("id_token not yet valid (nbf)")
         if settings.oidc_issuer and claims.get("iss") and \
                 claims["iss"].rstrip("/") != settings.oidc_issuer.rstrip("/"):
             raise NotConfigured("id_token issuer mismatch")
