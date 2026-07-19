@@ -55,12 +55,14 @@ nav{position:sticky; top:0; z-index:50; backdrop-filter:blur(14px);
 .nav-links{display:flex;gap:30px;align-items:center}
 .nav-links a{color:var(--mut);font-size:14px;font-weight:500;transition:.2s}
 .nav-links a:hover{color:var(--ink)}
+.nav-cta{display:flex;align-items:center;gap:12px}
 .btn{display:inline-flex;align-items:center;gap:8px;font-weight:600;font-size:14px;padding:11px 20px;border-radius:11px;cursor:pointer;border:0;transition:.22s;font-family:inherit}
 .btn-primary{background:linear-gradient(100deg,var(--orange),var(--orange2));color:#150a05;box-shadow:0 0 0 1px rgba(255,138,92,.4),0 8px 30px -8px var(--glow-o)}
 .btn-primary:hover{transform:translateY(-2px);box-shadow:0 0 0 1px rgba(255,138,92,.6),0 14px 40px -8px var(--glow-o)}
 .btn-ghost{background:rgba(255,255,255,.05);color:var(--ink);border:1px solid var(--panel-brd)}
 .btn-ghost:hover{background:rgba(255,255,255,.1)}
 @media(max-width:820px){.nav-links{display:none}}
+@media(max-width:560px){.nav-cta{gap:8px}.nav-cta .btn{padding:10px 14px;font-size:13px}}
 
 /* ---------- reveal ---------- */
 .reveal{opacity:0;transform:translateY(24px);transition:.7s cubic-bezier(.2,.7,.2,1)}
@@ -206,7 +208,10 @@ footer{border-top:1px solid rgba(255,255,255,.06);padding:40px 0;margin-top:40px
     <a href="#partners">Partners</a>
     <a href="#contact">Contact</a>
   </div>
-  <a href="#contact" class="btn btn-primary">Get early access →</a>
+  <div class="nav-cta">
+    <a href="https://app.ctrloop.ai" class="btn btn-ghost">Go to App</a>
+    <a href="#contact" class="btn btn-primary">Get early access →</a>
+  </div>
 </div></nav>
 
 <!-- HERO -->
