@@ -13,8 +13,16 @@ which publishes this `landing/` folder as the site root.
   deploys automatically.
 - No local build/tooling required; open `index.html` in a browser to preview.
 
-> This lives in the engine repo by request. Because Amplify watches `main`,
-> every merge triggers a (fast, no-op) build. To rebuild only when this folder
-> changes, configure the Amplify app as a monorepo with app root `landing/`
-> (`AMPLIFY_MONOREPO_APP_ROOT=landing` + `AMPLIFY_DIFF_DEPLOY`), or set an
-> "Ignore build" command in the Amplify console.
+## Amplify only sees this folder
+
+`../amplify.yml` is a **monorepo** spec with `appRoot: landing`, so:
+
+- **Only `landing/` is published** — the engine code is never served (Amplify
+  deploys only the artifacts baseDirectory).
+- **Only `landing/` changes trigger a build** — set
+  `AMPLIFY_MONOREPO_APP_ROOT=landing` on the Amplify app (and
+  `AMPLIFY_DIFF_DEPLOY=true`) so engine commits don't rebuild the site.
+
+If you ever want literal repo-level isolation, split this into a dedicated
+`ctrloop-site` repo — but the monorepo config already keeps Amplify scoped to
+this folder.
