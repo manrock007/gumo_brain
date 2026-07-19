@@ -40,7 +40,7 @@ def test_projects_lists_repo_map(client):
     r = client.get("/api/projects", headers=AUTH)
     assert r.status_code == 200
     slugs = {p["slug"] for p in r.json()}
-    assert "web" in slugs and "gumo" in slugs
+    assert "web" in slugs and "demo" in slugs
 
 
 def test_task_validation(client):
@@ -96,10 +96,10 @@ def test_context_roundtrip(client):
     r = client.get("/api/context", headers=AUTH)
     assert r.status_code == 200
     data = r.json()
-    assert data["context"]["product_name"] == "Gumo"
-    assert "gumo" in data["context"]["repo_map"]
+    assert data["context"]["product_name"] == "your product"
+    assert "demo" in data["context"]["repo_map"]
     assert data["overridden"] == []
-    assert data["defaults"]["canonical_project"] == "gumo"
+    assert data["defaults"]["canonical_project"] == "demo"
 
     # repo topology moved to workspaces (Phase 2) — the context API refuses it
     # explicitly rather than accepting-and-ignoring
@@ -118,11 +118,11 @@ def test_context_roundtrip(client):
     assert set(data["overridden"]) == {"product_name", "business_context"}
     # workspace-owned repos are untouched by instance-context edits
     slugs = {p["slug"] for p in client.get("/api/projects", headers=AUTH).json()}
-    assert "gumo" in slugs
+    assert "demo" in slugs
 
     r = client.delete("/api/context", headers=AUTH)
     assert r.status_code == 200
-    assert r.json()["context"]["product_name"] == "Gumo"
+    assert r.json()["context"]["product_name"] == "your product"
     assert r.json()["overridden"] == []
 
 
@@ -131,7 +131,7 @@ def test_workspace_crud_and_repo_move(client):
     live-jobs warning rides workspace PATCH responses."""
     ws_list = client.get("/api/workspaces", headers=AUTH).json()
     assert len(ws_list) == 1 and ws_list[0]["slug"] == "default"
-    assert "gumo" in ws_list[0]["repos"]  # migration wrapped the §10 map
+    assert "demo" in ws_list[0]["repos"]  # migration wrapped the §10 map
     default_id = ws_list[0]["id"]
 
     # all-numeric slugs must not be misrouted into id lookups (finding 1595569):
@@ -172,7 +172,7 @@ def test_workspace_crud_and_repo_move(client):
     assert r.status_code == 200
     app_id = r.json()["id"]
     r = client.patch(f"/api/workspaces/{app_id}", headers=AUTH,
-                     json={"repos": [{"slug": "gumo", "repo": "acme/api"}]})
+                     json={"repos": [{"slug": "demo", "repo": "acme/api"}]})
     assert r.status_code == 400 and "already used" in r.json()["detail"]
 
     # enabling ClickUp without the workspace's own list id would silently
@@ -210,8 +210,8 @@ def test_workspace_crud_and_repo_move(client):
     client.patch(f"/api/workspaces/{bare_id}", headers=AUTH,
                  json={"repos": [{"slug": "bare-api", "repo": "bare/api"}]})
     assert svc.canonical_for("bare-api") == ""      # own workspace, no canonical
-    assert svc.canonical_for("gumo") == "gumo"      # own workspace's canonical
-    assert svc.canonical_for("unmapped") == "gumo"  # legacy fallback only when unmapped
+    assert svc.canonical_for("demo") == "demo"      # own workspace's canonical
+    assert svc.canonical_for("unmapped") == "demo"  # legacy fallback only when unmapped
 
     # membership enforcement: a member sees only assigned workspaces' jobs
     client.post("/api/users", headers=AUTH,
@@ -224,7 +224,7 @@ def test_workspace_crud_and_repo_move(client):
     assert [w["slug"] for w in client.get("/api/workspaces", headers=member).json()] == ["app"]
     assert client.get("/api/jobs/task-w1/session", headers=member).status_code == 200
     # ...but not the default workspace's jobs
-    store.insert("task-w2", source="manual", title="t", project="gumo", kind="task")
+    store.insert("task-w2", source="manual", title="t", project="demo", kind="task")
     store.set_fields("task-w2", workspace_id=default_id)
     assert client.get("/api/jobs/task-w2/session", headers=member).status_code == 404
     ids = {j["issue_id"] for j in client.get("/api/jobs", headers=member).json()}
@@ -252,7 +252,7 @@ def test_context_put_persist_failure_leaves_live_state(client, monkeypatch):
     monkeypatch.setattr(store, "config_set_many", boom)
     with _pytest.raises(sqlite3.OperationalError):
         client.put("/api/context", headers=AUTH, json={"product_name": "Acme"})
-    assert client.get("/api/context", headers=AUTH).json()["context"]["product_name"] == "Gumo"
+    assert client.get("/api/context", headers=AUTH).json()["context"]["product_name"] == "your product"
 
 
 def test_dashboard_rebrands_from_context(client):
@@ -260,12 +260,12 @@ def test_dashboard_rebrands_from_context(client):
     and prove the rendered page follows the configured product name."""
     from app.main import _INDEX_HTML
 
-    assert "the Gumo Engine" in _INDEX_HTML  # main.dashboard() replaces this
-    assert "the Gumo Engine" in client.get("/", headers=AUTH).text
+    assert "{{product_name}}" in _INDEX_HTML  # main.dashboard() replaces this
+    assert "the your product Engine" in client.get("/", headers=AUTH).text
     r = client.put("/api/context", headers=AUTH, json={"product_name": "Acme"})
     assert r.status_code == 200
     page = client.get("/", headers=AUTH).text
-    assert "the Acme Engine" in page and "the Gumo Engine" not in page
+    assert "the Acme Engine" in page and "{{product_name}}" not in page
     client.delete("/api/context", headers=AUTH)
 
 
@@ -302,6 +302,8 @@ def test_dashboard_shell_is_balanced():
                 'id="dpane"', 'id="d-thread"', 'id="d-title"', 'id="c-in"',
                 'id="brain-body"', 'id="task-project"', 'id="feat-project"', 'id="ref"',
                 'id="ctx-body"',
+                # autonomy surface (Epic C3)
+                'id="autonomy-panel"', 'id="autonomy-body"',
                 # auth chrome (docs/ENGINE.md §11)
                 'id="me-chip"', 'id="settings-pane"', 'id="sp-users"', 'id="users-list"',
                 'src="static/app.js"', 'href="static/style.css"'):
@@ -312,14 +314,18 @@ def test_dashboard_shell_is_balanced():
                 'function saveContext', 'function resetContext', 'function loadContext',
                 # auth (docs/ENGINE.md §11)
                 'function loadMe', 'function signOut', 'function createUser',
-                'function changePassword'):
+                'function changePassword',
+                # autonomy surface (Epic C3)
+                'function loadAutonomy', 'function renderAutonomy',
+                'function pinStage', 'function clawback'):
         assert tok in js, tok
 
 
 def test_login_flow_and_roles(client):
     # cookie session end to end
     r = client.post("/api/login", json={"username": "gumo", "password": "test"})
-    assert r.status_code == 200 and r.json()["role"] == "admin"
+    # Epic E3: the bootstrap admin's instance role is now 'instance_admin'
+    assert r.status_code == 200 and r.json()["role"] == "instance_admin"
     assert client.get("/api/me").json()["username"] == "gumo"  # cookie carried
     # wrong password is a generic 401
     bad = client.post("/api/login", json={"username": "gumo", "password": "nope"})
@@ -340,7 +346,7 @@ def test_login_flow_and_roles(client):
     default_ws = client.get("/api/workspaces", headers=AUTH).json()[0]["id"]
     client.put(f"/api/workspaces/{default_ws}/members", headers=AUTH,
                json={"username": "dev1", "member": True})
-    store.insert("task-attr", source="manual", title="t", project="gumo", kind="task")
+    store.insert("task-attr", source="manual", title="t", project="demo", kind="task")
     store.set_fields("task-attr", status="awaiting_input", analysis="a", question="q",
                      workspace_id=default_ws)
     r = client.post("/api/jobs/task-attr/answer", headers=member,
@@ -389,8 +395,8 @@ def test_setup_wizard_lifecycle(client):
     reset; members never see instance onboarding."""
     data = client.get("/api/setup", headers=AUTH).json()
     assert data["needed"] is True
-    # code-default Gumo context/repos are not "configured" — they must be made
-    # the operator's own (semantic compare vs the normalized default map)
+    # default context/repos are not "configured" — they must be made the
+    # operator's own (semantic compare vs the normalized default map)
     assert data["steps"]["business_context"] is False
     assert data["steps"]["repos"] is False
     assert data["steps"]["team"] is False
@@ -415,7 +421,7 @@ def test_run_transcripts_recorded_and_scoped(client):
     store = client.app.state.store
     settings = client.app.state.settings
     ws = client.get("/api/workspaces", headers=AUTH).json()[0]
-    store.insert("task-tr1", source="manual", title="t", project="gumo", kind="task")
+    store.insert("task-tr1", source="manual", title="t", project="demo", kind="task")
     store.set_fields("task-tr1", workspace_id=ws["id"])
     # simulate a run writing its activity through the writer
     w = transcripts.open_writer(settings, "task-tr1", "v1-p1-123", {"kind": "v1", "phase": 1})
@@ -475,6 +481,142 @@ def test_admin_cannot_reset_own_password(client):
                         json={"disabled": True}).status_code == 400
 
 
+def test_feature_submit_persists_both_dris(client):
+    """Epic A2: POST /api/features carries founder_dri + dev_dri; the legacy
+    `owner` field is a deprecated alias for dev_dri (applied only when dev_dri
+    is empty); `owner` column = computed alias."""
+    r = client.post("/api/features", headers=AUTH,
+                    json={"project": "web", "title": "dual dri",
+                          "founder_dri": "111", "dev_dri": "222"})
+    assert r.status_code == 200
+    job = client.app.state.store.get(r.json()["job_id"])
+    assert job["founder_dri"] == "111" and job["dev_dri"] == "222"
+    assert job["owner"] == "222"
+
+    r = client.post("/api/features", headers=AUTH,
+                    json={"project": "web", "title": "legacy owner", "owner": "4242"})
+    job = client.app.state.store.get(r.json()["job_id"])
+    assert job["dev_dri"] == "4242" and job["founder_dri"] == ""
+    assert job["owner"] == "4242"
+
+    # dev_dri wins over the deprecated alias when both are sent
+    r = client.post("/api/features", headers=AUTH,
+                    json={"project": "web", "title": "both", "owner": "1", "dev_dri": "2"})
+    assert client.app.state.store.get(r.json()["job_id"])["dev_dri"] == "2"
+
+
+def test_user_clickup_mapping_admin_api(client):
+    """Epic A1: PATCH /api/users/{u} links/clears clickup_user_id with
+    digits-only validation and duplicate 409."""
+    client.post("/api/users", headers=AUTH,
+                json={"username": "mapme", "password": "password1"})
+    client.post("/api/users", headers=AUTH,
+                json={"username": "mapme2", "password": "password1"})
+    r = client.patch("/api/users/mapme", headers=AUTH, json={"clickup_user_id": "4242"})
+    assert r.status_code == 200 and r.json()["clickup_user_id"] == "4242"
+    assert any(u["username"] == "mapme" and u["clickup_user_id"] == "4242"
+               for u in client.get("/api/users", headers=AUTH).json())
+    # non-numeric -> 400
+    r = client.patch("/api/users/mapme2", headers=AUTH, json={"clickup_user_id": "jane"})
+    assert r.status_code == 400
+    # duplicate -> 409 naming the holder
+    r = client.patch("/api/users/mapme2", headers=AUTH, json={"clickup_user_id": "4242"})
+    assert r.status_code == 409 and "mapme" in r.json()["detail"]
+    # re-saving your own mapping is fine; empty clears
+    assert client.patch("/api/users/mapme", headers=AUTH,
+                        json={"clickup_user_id": "4242"}).status_code == 200
+    r = client.patch("/api/users/mapme", headers=AUTH, json={"clickup_user_id": ""})
+    assert r.status_code == 200 and r.json()["clickup_user_id"] == ""
+    # freed id can be claimed now
+    assert client.patch("/api/users/mapme2", headers=AUTH,
+                        json={"clickup_user_id": "4242"}).status_code == 200
+
+
+def test_answer_role_gate_403_and_admin_override(client):
+    """Epic A3: the dashboard returns 403 with the ownership detail for a
+    non-owner; an admin passes with the explicit (audited) override flag."""
+    store = client.app.state.store
+    default_ws = client.get("/api/workspaces", headers=AUTH).json()[0]["id"]
+    client.post("/api/users", headers=AUTH,
+                json={"username": "adev", "password": "password1"})
+    client.put(f"/api/workspaces/{default_ws}/members", headers=AUTH,
+               json={"username": "adev", "member": True})
+    store.feature_intake("feat-role1", title="F", project="demo", stage=0)
+    store.set_fields("feat-role1", founder_dri="111", dev_dri="222",
+                     workspace_id=default_ws, question="q")
+    store.set_status("feat-role1", "awaiting_input")
+
+    member = {"Authorization": "Basic " + base64.b64encode(b"adev:password1").decode()}
+    r = client.post("/api/jobs/feat-role1/answer", headers=member,
+                    json={"action": "proceed", "answer": ""})
+    assert r.status_code == 403
+    assert "founder gate" in r.json()["detail"] and "owned by" in r.json()["detail"]
+    # a member's override flag is ignored — still 403
+    r = client.post("/api/jobs/feat-role1/answer", headers=member,
+                    json={"action": "proceed", "answer": "", "override": True})
+    assert r.status_code == 403
+    # the admin without override is refused too...
+    r = client.post("/api/jobs/feat-role1/answer", headers=AUTH,
+                    json={"action": "proceed", "answer": ""})
+    assert r.status_code == 403
+    # ...and passes with the explicit override, audited in gate_events
+    r = client.post("/api/jobs/feat-role1/answer", headers=AUTH,
+                    json={"action": "proceed", "answer": "", "override": True})
+    assert r.status_code == 200
+    events = store.gate_events_for("feat-role1")
+    assert [e["kind"] for e in events] == ["admin_override"]
+    assert events[0]["actor"] == "dashboard:gumo"
+
+
+def test_session_snapshot_carries_gate_owner(client):
+    store = client.app.state.store
+    default_ws = client.get("/api/workspaces", headers=AUTH).json()[0]["id"]
+    store.feature_intake("feat-snap1", title="F", project="demo", stage=5)
+    store.set_fields("feat-snap1", dev_dri="222", workspace_id=default_ws)
+    store.set_status("feat-snap1", "awaiting_input")
+    snap = client.get("/api/jobs/feat-snap1/session", headers=AUTH).json()
+    assert snap["job"]["dev_dri"] == "222"
+    go = snap["gate_owner"]
+    assert go["role"] == "dev" and go["enforce"] is True and go["is_you"] is False
+    assert "222" in go["display"]
+    assert snap["gate_events"] == []
+
+
+def test_workspace_team_coordination_fields(client):
+    """Epic A: workspace PATCH validation for require_attributed_answers,
+    stage_role_map (fail-closed) and gate_sla_hours (empty -> inherit)."""
+    ws_id = client.get("/api/workspaces", headers=AUTH).json()[0]["id"]
+    # bad values are 400s and change nothing
+    assert client.patch(f"/api/workspaces/{ws_id}", headers=AUTH,
+                        json={"require_attributed_answers": "maybe"}).status_code == 400
+    assert client.patch(f"/api/workspaces/{ws_id}", headers=AUTH,
+                        json={"stage_role_map": '{"12": "dev"}'}).status_code == 400
+    assert client.patch(f"/api/workspaces/{ws_id}", headers=AUTH,
+                        json={"stage_role_map": '{"3": "boss"}'}).status_code == 400
+    assert client.patch(f"/api/workspaces/{ws_id}", headers=AUTH,
+                        json={"stage_role_map": "not json"}).status_code == 400
+    assert client.patch(f"/api/workspaces/{ws_id}", headers=AUTH,
+                        json={"gate_sla_hours": -1}).status_code == 400
+    # valid partial map merges into the effective ladder in public()
+    r = client.patch(f"/api/workspaces/{ws_id}", headers=AUTH,
+                     json={"require_attributed_answers": "on",
+                           "stage_role_map": '{"7": "founder"}',
+                           "gate_sla_hours": 48})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["require_attributed_answers"] == "on"
+    assert data["gate_sla_hours"] == 48
+    assert data["stage_roles"]["7"] == "founder"   # override applied
+    assert data["stage_roles"]["5"] == "dev"       # default ladder fills the rest
+    assert data["stage_roles"]["0"] == "founder"
+    # empty string clears the SLA back to inherit (NULL)
+    r = client.patch(f"/api/workspaces/{ws_id}", headers=AUTH,
+                     json={"gate_sla_hours": "", "stage_role_map": ""})
+    assert r.status_code == 200
+    assert r.json()["gate_sla_hours"] is None
+    assert r.json()["stage_roles"]["7"] == "dev"  # back to the default ladder
+
+
 def test_change_password_rotates_session(client):
     """A self password change revokes every OTHER session and the old token,
     but the caller stays signed in on a freshly rotated cookie — being dumped
@@ -495,3 +637,267 @@ def test_change_password_rotates_session(client):
     assert client.get("/api/me").status_code == 401
     fresh = {"Authorization": "Basic " + base64.b64encode(b"dev3:newpass456").decode()}
     assert client.get("/api/me", headers=fresh).json()["must_change_pw"] is False
+
+
+def test_feature_submit_with_metric_goal(client):
+    """Epic B1: the metric fields ride the submit onto the job row; a bad
+    window is a 400 with NOTHING queued (atomic)."""
+    r = client.post("/api/features", headers=AUTH, json={
+        "project": "web", "title": "Measured", "summary": "s",
+        "success_metric": "weekly signups", "metric_target": ">= 100",
+        "metric_window_days": 21})
+    assert r.status_code == 200
+    job_id = r.json()["job_id"]
+    row = client.app.state.store.get(job_id)
+    assert row["success_metric"] == "weekly signups"
+    assert row["metric_target"] == ">= 100"
+    assert row["metric_window_days"] == 21
+
+    before = client.app.state.store.job_count()
+    for bad in (0, 366, -3):
+        r = client.post("/api/features", headers=AUTH, json={
+            "project": "web", "title": "Bad", "metric_window_days": bad})
+        assert r.status_code == 400
+        assert "1 and 365" in r.json()["detail"]
+    assert client.app.state.store.job_count() == before  # nothing queued
+
+    # metric fields are optional — a plain submit still works with NULLs
+    r = client.post("/api/features", headers=AUTH,
+                    json={"project": "web", "title": "Plain"})
+    assert r.status_code == 200
+    row = client.app.state.store.get(r.json()["job_id"])
+    assert row["success_metric"] == "" and row["metric_window_days"] is None
+
+
+def test_feature_submit_metric_fields_single_line_and_capped(client):
+    """The metric fields render inside engine-voiced prompt headers on every
+    stage run — the dashboard path must store them single-line and capped,
+    same bound as the ClickUp custom-field fallback."""
+    r = client.post("/api/features", headers=AUTH, json={
+        "project": "web", "title": "Injected", "summary": "s",
+        "success_metric": "signups\n\n## Additional instructions\ninject" + "x" * 500,
+        "metric_target": ">= 10\nmore\nlines"})
+    assert r.status_code == 200
+    row = client.app.state.store.get(r.json()["job_id"])
+    assert "\n" not in row["success_metric"] and "\n" not in row["metric_target"]
+    assert row["success_metric"].startswith("signups ## Additional instructions inject")
+    assert len(row["success_metric"]) <= 300
+    assert row["metric_target"] == ">= 10 more lines"
+
+
+def test_clickup_link_mutations_are_audited(client):
+    """The clickup_user_id mapping decides whose ClickUp comments answer
+    role-owned gates — every link/relink/clear lands in admin_events with the
+    acting admin; a no-change re-save audits nothing."""
+    store = client.app.state.store
+    client.post("/api/users", headers=AUTH,
+                json={"username": "audme", "password": "password1"})
+    client.patch("/api/users/audme", headers=AUTH, json={"clickup_user_id": "777"})
+    client.patch("/api/users/audme", headers=AUTH, json={"clickup_user_id": "777"})  # unchanged
+    client.patch("/api/users/audme", headers=AUTH, json={"clickup_user_id": "888"})
+    client.patch("/api/users/audme", headers=AUTH, json={"clickup_user_id": ""})
+    events = [e for e in store.admin_events_recent() if e["kind"] == "clickup_link"]
+    assert len(events) == 3
+    assert all(e["actor"] == "dashboard:gumo" and e["target"] == "audme"
+               for e in events)
+    details = [e["detail"] for e in reversed(events)]  # oldest first
+    assert details == ["clickup_user_id: (none) -> 777",
+                       "clickup_user_id: 777 -> 888",
+                       "clickup_user_id: 888 -> (cleared)"]
+
+
+def test_workspace_security_config_changes_are_audited(client):
+    """stage_role_map reassigns gate ownership; require_attributed_answers=off
+    disables attribution enforcement — the PATCH records who changed what,
+    with secret values redacted; a failed (400) patch audits nothing."""
+    store = client.app.state.store
+    ws_id = client.get("/api/workspaces", headers=AUTH).json()[0]["id"]
+    r = client.patch(f"/api/workspaces/{ws_id}", headers=AUTH, json={
+        "require_attributed_answers": "off",
+        "stage_role_map": "{\"0\": \"dev\"}",
+        "analytics_provider": "mixpanel",
+        "analytics_config": {"project_id": "1", "secret": "s3cr3t-value"}})
+    assert r.status_code == 200
+    events = [e for e in store.admin_events_recent()
+              if e["kind"] == "workspace_config"]
+    assert len(events) == 1
+    e = events[0]
+    assert e["actor"] == "dashboard:gumo" and e["target"] == str(ws_id)
+    assert "require_attributed_answers" in e["detail"] and "off" in e["detail"]
+    assert "stage_role_map" in e["detail"]
+    assert "s3cr3t-value" not in e["detail"] and "(redacted)" in e["detail"]
+    # a rejected patch changes nothing and audits nothing
+    r = client.patch(f"/api/workspaces/{ws_id}", headers=AUTH,
+                     json={"stage_role_map": "{\"0\": \"boss\"}"})
+    assert r.status_code == 400
+    assert len([e for e in store.admin_events_recent()
+                if e["kind"] == "workspace_config"]) == 1
+
+
+def test_workspace_create_is_audited(client):
+    store = client.app.state.store
+    r = client.post("/api/workspaces", headers=AUTH,
+                    json={"slug": "aud", "name": "Aud",
+                          "require_attributed_answers": "on"})
+    assert r.status_code == 200
+    events = [e for e in store.admin_events_recent()
+              if e["kind"] == "workspace_create"]
+    assert len(events) == 1
+    assert events[0]["target"] == str(r.json()["id"])
+    assert events[0]["actor"] == "dashboard:gumo"
+    assert "require_attributed_answers" in events[0]["detail"]
+
+
+def test_outcomes_endpoint_shape_and_auth(client):
+    assert client.get("/api/outcomes").status_code == 401
+    store = client.app.state.store
+    ws = client.get("/api/workspaces", headers=AUTH).json()[0]
+    store.outcome_add("watch-feat-o1", "feat-o1", ws["id"], metric="m",
+                      target="10", observed=12.0, verdict="moved")
+    store.outcome_add("watch-feat-o2", "feat-o2", ws["id"], verdict="unmeasured")
+    r = client.get("/api/outcomes", headers=AUTH)
+    assert r.status_code == 200
+    data = r.json()
+    assert {o["feature_id"] for o in data["outcomes"]} == {"feat-o1", "feat-o2"}
+    assert data["verdicts"] == {"moved": 1, "flat": 0, "regressed": 0,
+                                "unmeasured": 1}
+
+
+def test_autonomy_surface_and_pins_api(client):
+    """Epic C3: GET /api/autonomy is membership-scoped; pins are admin-only
+    config mutations with fail-closed validation (stage-9 always_auto refused);
+    every pin change is audited."""
+    assert client.get("/api/autonomy").status_code == 401
+    data = client.get("/api/autonomy", headers=AUTH).json()
+    assert data["enabled"] is True and data["auto_level"] == 0  # opt-in default OFF
+    ws = data["workspaces"][0]
+    assert ws["slug"] == "default" and "web" in ws["repos"]
+    assert ws["pins"] == {} and ws["cells"] == [] and ws["events"] == []
+    ws_id = ws["id"]
+
+    client.post("/api/users", headers=AUTH,
+                json={"username": "amem", "password": "password1"})
+    member = {"Authorization": "Basic " + base64.b64encode(b"amem:password1").decode()}
+    assert client.put(f"/api/workspaces/{ws_id}/autonomy/pins", headers=member,
+                      json={"stage": 7, "pin": "always_gate"}).status_code == 403
+    assert client.put(f"/api/workspaces/{ws_id}/autonomy/pins", headers=AUTH,
+                      json={"stage": 12, "pin": "always_gate"}).status_code == 400
+    assert client.put(f"/api/workspaces/{ws_id}/autonomy/pins", headers=AUTH,
+                      json={"stage": 9, "pin": "always_auto"}).status_code == 400
+    assert client.put(f"/api/workspaces/{ws_id}/autonomy/pins", headers=AUTH,
+                      json={"stage": 7, "pin": "sometimes"}).status_code == 400
+    assert client.put("/api/workspaces/9999/autonomy/pins", headers=AUTH,
+                      json={"stage": 7, "pin": "always_gate"}).status_code == 404
+
+    r = client.put(f"/api/workspaces/{ws_id}/autonomy/pins", headers=AUTH,
+                   json={"stage": 7, "pin": "always_gate"})
+    assert r.status_code == 200
+    assert r.json()["pins"]["7"]["pin"] == "always_gate"
+    assert r.json()["pins"]["7"]["set_by"] == "dashboard:gumo"
+    # always_gate IS valid on P9 (extra belt over the terminal gate)
+    assert client.put(f"/api/workspaces/{ws_id}/autonomy/pins", headers=AUTH,
+                      json={"stage": 9, "pin": "always_gate"}).status_code == 200
+    r = client.put(f"/api/workspaces/{ws_id}/autonomy/pins", headers=AUTH,
+                   json={"stage": 7, "pin": None})
+    assert r.status_code == 200 and "7" not in r.json()["pins"]
+    events = client.get("/api/autonomy", headers=AUTH).json()["workspaces"][0]["events"]
+    assert [e["kind"] for e in events] == ["pin_clear", "pin_set", "pin_set"]
+    assert all(e["actor"] == "dashboard:gumo" for e in events)
+    # an unassigned member sees an empty surface (no existence leak)
+    assert client.get("/api/autonomy", headers=member).json()["workspaces"] == []
+
+
+def test_autonomy_clawback_membership_and_validation(client):
+    """Epic C3: clawback is member-allowed (it only reduces autonomy) but
+    membership-gated with a 404, and validates stage/project fail-closed."""
+    import time as _time
+
+    store = client.app.state.store
+    ws_id = client.get("/api/workspaces", headers=AUTH).json()[0]["id"]
+    store.autonomy_score_upsert(ws_id, "web", 5, 3, 0.95, "{}", 9, _time.time())
+    client.post("/api/users", headers=AUTH,
+                json={"username": "cmem", "password": "password1"})
+    member = {"Authorization": "Basic " + base64.b64encode(b"cmem:password1").decode()}
+    assert client.post(f"/api/workspaces/{ws_id}/autonomy/clawback", headers=member,
+                       json={"stage": 5, "project": "web"}).status_code == 404
+    client.put(f"/api/workspaces/{ws_id}/members", headers=AUTH,
+               json={"username": "cmem", "member": True})
+    assert client.post(f"/api/workspaces/{ws_id}/autonomy/clawback", headers=member,
+                       json={"stage": 11}).status_code == 400
+    assert client.post(f"/api/workspaces/{ws_id}/autonomy/clawback", headers=member,
+                       json={"stage": 5, "project": "nope"}).status_code == 400
+    r = client.post(f"/api/workspaces/{ws_id}/autonomy/clawback", headers=member,
+                    json={"stage": 5, "project": "web"})
+    assert r.status_code == 200 and r.json()["clawed"] == 1
+    row = store.autonomy_score_get(ws_id, "web", 5)
+    assert row["level"] == 0 and row["clawback_at"] is not None
+    ev = store.autonomy_events_recent([ws_id])
+    assert ev[0]["kind"] == "clawback" and ev[0]["actor"] == "dashboard:cmem"
+
+
+def test_autonomy_recompute_and_job_annotations(client):
+    """Epic C3: recompute is admin-only; /api/jobs feature rows carry
+    autonomy_level + autonomy_pin; the session snapshot carries the
+    per-stage autonomy block."""
+    import time as _time
+
+    store = client.app.state.store
+    ws_id = client.get("/api/workspaces", headers=AUTH).json()[0]["id"]
+    client.post("/api/users", headers=AUTH,
+                json={"username": "rmem", "password": "password1"})
+    member = {"Authorization": "Basic " + base64.b64encode(b"rmem:password1").decode()}
+    assert client.post("/api/autonomy/recompute", headers=member).status_code == 403
+    r = client.post("/api/autonomy/recompute", headers=AUTH)
+    assert r.status_code == 200 and set(r.json()) == {"cells", "changed"}
+
+    store.feature_intake("feat-aut1", title="F", project="web", stage=5)
+    store.set_fields("feat-aut1", workspace_id=ws_id)
+    store.autonomy_score_upsert(ws_id, "web", 5, 2, 0.8, "{}", 6, _time.time())
+    store.autonomy_pin_set(ws_id, 5, "always_gate", "dashboard:gumo")
+    jobs = client.get("/api/jobs", headers=AUTH).json()
+    row = next(j for j in jobs if j["issue_id"] == "feat-aut1")
+    assert row["autonomy_level"] == 2
+    assert row["autonomy_pin"] == "always_gate"
+    snap = client.get("/api/jobs/feat-aut1/session", headers=AUTH).json()
+    aut = snap["autonomy"]
+    assert aut["enabled"] is True and aut["auto_level"] == 0
+    assert aut["pins"]["5"] == "always_gate"
+    assert aut["levels"]["5"] == {"level": 2, "score": 0.8, "sample_runs": 6,
+                                  "clawed_back": False}
+    # non-feature snapshots carry no autonomy block
+    store.insert("task-aut1", source="manual", title="t", project="web", kind="task")
+    store.set_fields("task-aut1", workspace_id=ws_id)
+    assert client.get("/api/jobs/task-aut1/session",
+                      headers=AUTH).json()["autonomy"] is None
+
+
+def test_workspace_analytics_fields(client):
+    """Epic B3: analytics settings store via PATCH; the secret config is NEVER
+    echoed back; an invalid provider is a 400."""
+    ws = client.get("/api/workspaces", headers=AUTH).json()[0]
+    r = client.patch(f"/api/workspaces/{ws['id']}", headers=AUTH, json={
+        "analytics_provider": "mixpanel",
+        "analytics_config": {"project_id": "123", "service_account": "sa",
+                             "secret": "sup3rs3cret"}})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["analytics_provider"] == "mixpanel"
+    assert body["analytics_configured"] is True
+    assert "analytics_config" not in body
+    assert "sup3rs3cret" not in r.text
+    # the row itself carries the secret (at rest)
+    raw = client.app.state.store.workspace_get(ws["id"])
+    assert "sup3rs3cret" in raw["analytics_config"]
+    # list endpoint never leaks it either
+    assert "sup3rs3cret" not in client.get("/api/workspaces", headers=AUTH).text
+
+    r = client.patch(f"/api/workspaces/{ws['id']}", headers=AUTH,
+                     json={"analytics_provider": "amplitude"})
+    assert r.status_code == 400
+    r = client.patch(f"/api/workspaces/{ws['id']}", headers=AUTH,
+                     json={"analytics_config": "not json {{"})
+    assert r.status_code == 400
+    # clearing the provider flips configured off
+    r = client.patch(f"/api/workspaces/{ws['id']}", headers=AUTH,
+                     json={"analytics_provider": ""})
+    assert r.json()["analytics_configured"] is False

@@ -3,3 +3,5 @@ uvicorn[standard]==0.34.*
 httpx==0.28.*
 pydantic-settings==2.*
 argon2-cffi
+# Epic G1 — GitHub App installation-token minting (RS256 app JWT)
+PyJWT[crypto]==2.*

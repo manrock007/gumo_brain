@@ -19,7 +19,8 @@ import logging
 import re
 import sqlite3
 
-from .config import Settings, validate_repo_map
+from . import analytics, db as db_mod, roles
+from .config import DEFAULT_PRODUCT_NAME, Settings, validate_repo_map, validate_stage_role_map
 from .db import JobStore
 
 log = logging.getLogger("brain.workspaces")
@@ -28,7 +29,12 @@ SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 
 WORKSPACE_FIELDS = ("name", "product_name", "workspace_context", "canonical_project",
                     "clickup_list_id", "clickup_enabled", "slack_webhook_url",
-                    "gate_mode_default")
+                    "gate_mode_default", "require_attributed_answers",
+                    "stage_role_map", "gate_sla_hours",
+                    "analytics_provider", "analytics_config",
+                    "slack_channels", "budget_monthly_usd")
+
+SLACK_CHANNELS_MAX = 50
 
 WORKSPACE_CONTEXT_CAP = 4000
 
@@ -55,10 +61,18 @@ class WorkspaceService:
             self.sync_settings()
             return
         mapping = json.loads(self.settings.repo_map)
+        # a still-default product name is NOT the operator's choice: name the
+        # migrated workspace "Default" and store an EMPTY product_name so the
+        # row falls through to the instance value (product_name_for) — persisting
+        # the code default here would permanently shadow later PUT /api/context
+        # edits in every prompt
+        configured = (self.settings.product_name or "").strip()
+        if configured == DEFAULT_PRODUCT_NAME:
+            configured = ""
         ws = self.store.migrate_default_workspace(
-            "default", self.settings.product_name or "Default",
+            "default", configured or "Default",
             fields=dict(
-                product_name=self.settings.product_name,
+                product_name=configured,
                 workspace_context="",  # business_context stays instance-level (§10)
                 canonical_project=self.settings.memory_canonical_project,
                 clickup_list_id=self.settings.clickup_list_id,
@@ -107,7 +121,7 @@ class WorkspaceService:
     def user_can_access(self, user: dict, workspace_id: int | None) -> bool:
         """Admins see everything; members only assigned workspaces. Jobs with
         no resolvable workspace stay admin-only rather than leaking."""
-        if user.get("role") == "admin":
+        if user.get("role") in ("admin", "instance_admin"):
             return True
         if workspace_id is None:
             return False
@@ -115,7 +129,7 @@ class WorkspaceService:
 
     def user_workspaces(self, user: dict) -> list[dict]:
         all_ws = self.store.workspace_list()
-        if user.get("role") == "admin":
+        if user.get("role") in ("admin", "instance_admin"):
             return all_ws
         allowed = self.store.workspace_ids_for_user(user["id"])
         return [w for w in all_ws if w["id"] in allowed]
@@ -162,20 +176,29 @@ class WorkspaceService:
         return bool(self.settings.clickup_token and ws["clickup_enabled"] and list_id), \
             (list_id or None)
 
+    async def notify_text(self, ws: dict | None, text: str):
+        """Best-effort Slack send to a workspace's incoming webhook — never
+        raises, never drives control flow (Epic I2 digests + gate nudges both
+        funnel through here)."""
+        url = (ws or {}).get("slack_webhook_url") or ""
+        if not url:
+            return
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=10) as client:
+                await client.post(url, json={"text": text})
+        except Exception:  # visibility only — never let a send break anything
+            log.warning("slack notify failed for workspace %s (non-fatal)",
+                        (ws or {}).get("slug"))
+
     async def notify_gate(self, job: dict, text: str):
         """Best-effort Slack nudge at gate park — the dashboard-only nudge
         channel for workspaces without ClickUp (and extra signal with it)."""
         ws = self.for_job(job)
-        url = (ws or {}).get("slack_webhook_url") or ""
-        if not url:
-            return
-        link = f"{self.settings.public_base_url}/#/job/{job.get('issue_id')}"
-        try:
-            import httpx
-            async with httpx.AsyncClient(timeout=10) as client:
-                await client.post(url, json={"text": f"{text}\n{link}"})
-        except Exception:  # visibility only — never let a nudge break a gate
-            log.warning("slack gate nudge failed for %s (non-fatal)", job.get("issue_id"))
+        link = ""  # deep link only when a public base is configured
+        if self.settings.public_base_url:
+            link = f"\n{self.settings.public_base_url}/#/job/{job.get('issue_id')}"
+        await self.notify_text(ws, f"{text}{link}")
 
     # ---------- validated writes ----------
 
@@ -189,7 +212,15 @@ class WorkspaceService:
         if clean.get("clickup_enabled") and not str(clean.get("clickup_list_id") or "").strip():
             raise WorkspaceError(
                 "ClickUp mirroring needs this workspace's list id — set it or disable mirroring")
+        if "slack_channels" in clean:
+            self._check_slack_channels_unique(clean["slack_channels"], None)
         ws = self.store.workspace_create(slug, (name or slug).strip(), **clean)
+        if "slack_channels" in clean:
+            self._init_slack_cursors(clean["slack_channels"])
+        # Epic I1: every workspace gets its proactive-routine rows at birth.
+        # Lazy import — routines must stay importable without this module.
+        from . import routines
+        routines.ensure_seeds_for_workspace(self.store, self.settings, ws["id"])
         self.sync_settings()
         return ws
 
@@ -213,7 +244,7 @@ class WorkspaceService:
             try:
                 self.store.workspace_repos_replace(
                     ws["id"], [{"slug": s, **e} for s, e in mapping.items()])
-            except sqlite3.IntegrityError:
+            except db_mod.IntegrityError:
                 raise WorkspaceError(
                     "a project slug is already used by another workspace — slugs are global")
         elif "canonical_project" in clean and clean["canonical_project"]:
@@ -227,10 +258,55 @@ class WorkspaceService:
                 not str(clean.get("clickup_list_id", ws["clickup_list_id"]) or "").strip():
             raise WorkspaceError(
                 "ClickUp mirroring needs this workspace's list id — set it or disable mirroring")
+        if "slack_channels" in clean:
+            # a channel routes candidates to exactly ONE workspace (same
+            # determinism rationale as global repo slugs). Read-check only —
+            # acceptable under today's single-process SQLite because the check
+            # and the write share this synchronous section with NO await
+            # between them; re-verify under Epic F2 (ENGINE.md §16 recorded
+            # edges, same treatment as the auto-advance non-CAS note).
+            self._check_slack_channels_unique(clean["slack_channels"], ws["id"])
         if clean:
             self.store.workspace_set(ws["id"], **clean)
+        if "slack_channels" in clean:
+            self._init_slack_cursors(clean["slack_channels"])
         self.sync_settings()
         return self.store.workspace_get(ws["id"])
+
+    @staticmethod
+    def slack_channels_of(ws: dict) -> list[str]:
+        """Read-tolerant decode of a workspace row's channel allowlist."""
+        raw = (ws.get("slack_channels") or "").strip()
+        if not raw:
+            return []
+        try:
+            parsed = json.loads(raw)
+            return [str(c) for c in parsed if str(c).strip()] \
+                if isinstance(parsed, list) else []
+        except (ValueError, TypeError):
+            return []
+
+    def _check_slack_channels_unique(self, channels_json: str, ws_id: int | None):
+        wanted = set(json.loads(channels_json) if channels_json else [])
+        if not wanted:
+            return
+        for other in self.store.workspace_list():
+            if ws_id is not None and other["id"] == ws_id:
+                continue
+            clash = wanted & set(self.slack_channels_of(other))
+            if clash:
+                raise WorkspaceError(
+                    f"Slack channel(s) {', '.join(sorted(clash))} already "
+                    f"allowlisted by workspace '{other['slug']}' — a channel "
+                    "routes to exactly one workspace")
+
+    def _init_slack_cursors(self, channels_json: str):
+        """Initialize NEW channels' watermarks to NOW (forward-only ingestion —
+        blocker: the first pass after enabling must never flood the inbox with
+        historical candidates). Existing watermarks are never moved."""
+        import time
+        for ch in (json.loads(channels_json) if channels_json else []):
+            self.store.slack_cursor_init(ch, f"{time.time():.6f}")
 
     @staticmethod
     def _clean_fields(fields: dict) -> dict:
@@ -244,6 +320,95 @@ class WorkspaceService:
                 if value not in ("full", "light"):
                     raise WorkspaceError("gate_mode_default must be 'full' or 'light'")
                 clean[key] = value
+            elif key == "require_attributed_answers":
+                value = str(value).strip().lower()
+                if value not in ("auto", "on", "off"):
+                    raise WorkspaceError(
+                        "require_attributed_answers must be 'auto', 'on' or 'off'")
+                clean[key] = value
+            elif key == "stage_role_map":
+                # fail closed on the WRITE side: a malformed map is a 400 and
+                # nothing changes; '' clears back to inherit
+                if isinstance(value, str) and not value.strip():
+                    clean[key] = ""
+                    continue
+                try:
+                    mapping = json.loads(value) if isinstance(value, str) else value
+                    clean[key] = json.dumps(validate_stage_role_map(mapping))
+                except (ValueError, TypeError) as e:
+                    raise WorkspaceError(f"stage_role_map: {e}")
+            elif key == "analytics_provider":
+                # allowed names come from the analytics registry — one list,
+                # so the validator can't drift when the next driver lands
+                value = str(value).strip().lower()
+                if value not in analytics.ANALYTICS_PROVIDERS:
+                    raise WorkspaceError(
+                        "analytics_provider must be one of: "
+                        + ", ".join(f"'{p}'" for p in analytics.ANALYTICS_PROVIDERS))
+                clean[key] = value
+            elif key == "analytics_config":
+                # dict (API body) or JSON string; must be an object. Fail
+                # closed: malformed -> 400, nothing changes. Stored verbatim
+                # (SECRET AT REST) — public() never returns it.
+                if isinstance(value, str) and not value.strip():
+                    clean[key] = "{}"  # explicit clear
+                    continue
+                try:
+                    parsed = json.loads(value) if isinstance(value, str) else value
+                    if not isinstance(parsed, dict):
+                        raise ValueError("must be a JSON object")
+                except (ValueError, TypeError) as e:
+                    raise WorkspaceError(f"analytics_config: {e}")
+                clean[key] = json.dumps(parsed)
+            elif key == "slack_channels":
+                # Epic D3: list (API body) or JSON string of channel ids;
+                # '' / [] clears. Fail closed: malformed -> 400, nothing changes.
+                if isinstance(value, str) and not value.strip():
+                    clean[key] = ""
+                    continue
+                try:
+                    parsed = json.loads(value) if isinstance(value, str) else value
+                    if not isinstance(parsed, list):
+                        raise ValueError("must be a list of channel ids")
+                    channels = []
+                    for ch in parsed:
+                        ch = str(ch or "").strip()
+                        if not ch:
+                            raise ValueError("channel ids must be non-empty strings")
+                        if ch not in channels:
+                            channels.append(ch)
+                    if len(channels) > SLACK_CHANNELS_MAX:
+                        raise ValueError(
+                            f"at most {SLACK_CHANNELS_MAX} channels per workspace")
+                except (ValueError, TypeError) as e:
+                    raise WorkspaceError(f"slack_channels: {e}")
+                clean[key] = json.dumps(channels) if channels else ""
+            elif key == "budget_monthly_usd":
+                # Epic I4 (Epic G4 extends): empty string -> NULL = inherit the
+                # instance BUDGET_MONTHLY_USD; 0 = no budget. Fail closed on
+                # anything unparseable or negative.
+                if isinstance(value, str) and not value.strip():
+                    clean[key] = None
+                    continue
+                try:
+                    budget = float(value)
+                except (ValueError, TypeError):
+                    raise WorkspaceError("budget_monthly_usd must be a number ≥ 0")
+                if budget < 0:
+                    raise WorkspaceError("budget_monthly_usd must be a number ≥ 0")
+                clean[key] = budget
+            elif key == "gate_sla_hours":
+                # empty string -> NULL = inherit the instance default
+                if isinstance(value, str) and not value.strip():
+                    clean[key] = None
+                    continue
+                try:
+                    hours = int(value)
+                except (ValueError, TypeError):
+                    raise WorkspaceError("gate_sla_hours must be an integer ≥ 0")
+                if hours < 0:
+                    raise WorkspaceError("gate_sla_hours must be an integer ≥ 0")
+                clean[key] = hours
             else:
                 value = str(value).strip()
                 # name is the one field that must never be blank; the OTHER
@@ -257,8 +422,27 @@ class WorkspaceService:
                 clean[key] = value
         return clean
 
+    def analytics_for(self, ws: dict | None):
+        """The workspace's analytics driver (Epic B3) — NullAnalytics when
+        nothing is configured, so callers never branch on 'no analytics'."""
+        return analytics.provider_for(self.settings, ws)
+
+    @staticmethod
+    def _analytics_configured(ws: dict) -> bool:
+        """Configured-ness WITHOUT the secret: does the stored config carry any
+        substantive key? The dashboard shows this boolean, never the config."""
+        if not str(ws.get("analytics_provider") or "").strip():
+            return False
+        try:
+            config = json.loads(ws.get("analytics_config") or "{}")
+        except (ValueError, TypeError):
+            return False
+        return any(str(config.get(k) or "").strip()
+                   for k in ("project_id", "service_account", "secret"))
+
     def public(self, ws: dict) -> dict:
-        """API/dashboard shape, repos + members inlined."""
+        """API/dashboard shape, repos + members inlined. NEVER includes
+        analytics_config — it holds the provider secret."""
         return {
             "id": ws["id"], "slug": ws["slug"], "name": ws["name"],
             "product_name": ws["product_name"],
@@ -268,6 +452,18 @@ class WorkspaceService:
             "clickup_enabled": bool(ws["clickup_enabled"]),
             "slack_webhook_url": ws["slack_webhook_url"],
             "gate_mode_default": ws["gate_mode_default"],
+            "require_attributed_answers": ws.get("require_attributed_answers") or "auto",
+            "stage_role_map": ws.get("stage_role_map") or "",
+            "gate_sla_hours": ws.get("gate_sla_hours"),
+            "budget_monthly_usd": ws.get("budget_monthly_usd"),
+            "analytics_provider": ws.get("analytics_provider") or "",
+            "analytics_configured": self._analytics_configured(ws),
+            # channel ids are not secrets (the bot token is, and lives in env)
+            "slack_channels": self.slack_channels_of(ws),
+            # the fully-merged 0–9 ownership ladder, so the UI shows effective
+            # ownership without duplicating the merge logic client-side
+            "stage_roles": {str(i): roles.role_for_stage(self.settings, ws, i)
+                            for i in range(10)},
             "repos": {r["slug"]: {"repo": r["repo"], "base": r["base"],
                                   "setup_cmd": r["setup_cmd"], "test_cmd": r["test_cmd"],
                                   "allow": json.loads(r["allow"] or "[]")}

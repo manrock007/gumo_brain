@@ -8,9 +8,49 @@ import os
 import re
 from pathlib import Path
 
-from .config import RepoTarget, Settings
+from .config import ENGINE_DIR, LEGACY_ENGINE_DIRS, RepoTarget, Settings
+from .runner import resolve_runner
+from .secrets import build_subprocess_env
+from .vcs import VCS, vcs_for
 
 log = logging.getLogger("brain.fixer")
+
+# Epic F3: the run sandbox. Resolved once per (backend) — LocalRunner by default
+# (byte-for-byte today's exec); ContainerRunner when runner_backend=container.
+_RUNNER_CACHE: dict = {}
+
+
+def _runner(settings: Settings):
+    key = getattr(settings, "runner_backend", "local") or "local"
+    cached = _RUNNER_CACHE.get(key)
+    if cached is None:
+        cached = resolve_runner(settings)
+        _RUNNER_CACHE[key] = cached
+    return cached
+
+
+def engine_dir(workspace: str) -> str:
+    """The engine namespace dir for THIS clone: a repo that already has a
+    legacy tree keeps it (legacy wins when present — never split-brain a repo
+    across two trees); otherwise the current ENGINE_DIR. Migrate a repo by
+    `git mv .gumo .ctrlloop` in one PR, after which only `.ctrlloop` exists."""
+    for legacy in LEGACY_ENGINE_DIRS:
+        if (Path(workspace) / legacy).is_dir():
+            return legacy
+    return ENGINE_DIR
+
+
+async def git_show_ns(workspace: str, ref: str, rel: str) -> tuple[int, str]:
+    """`git show {ref}:{<ns>}/{rel}` with the SAME precedence rule as
+    engine_dir — legacy wins when present in the ref — for base-pinned reads
+    that cannot consult the working tree. Returns the last (code, output)
+    when no namespace has the file."""
+    code, out = 1, ""
+    for ns in (*LEGACY_ENGINE_DIRS, ENGINE_DIR):
+        code, out = await git(workspace, "show", f"{ref}:{ns}/{rel}")
+        if code == 0:
+            return code, out
+    return code, out
 
 PR_URL_RE = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+")
 # STRICT capture: only a standalone `PR_URL: <url>` line counts as "this run
@@ -112,14 +152,18 @@ async def _run(cmd: list[str], cwd: str | None = None, timeout: int = 300) -> tu
 
 async def prepare_workspace(settings: Settings, target: RepoTarget, branch: str,
                             keep_branch: bool = False,
-                            workspace_root: str | None = None) -> str:
+                            workspace_root: str | None = None,
+                            vcs: VCS | None = None) -> str:
     """Clone (or refresh) the repo and check out a clean branch off the base.
 
     keep_branch=True (phase 2) reuses the existing branch if it exists so the
     fix lands on the same branch the analysis referenced.
     workspace_root overrides the clone location — read-only chat runs use their
     own clone so they never contend with the job holding the main workspace.
+    vcs is the H2 VCS driver used to mint the clone URL; resolved internally so
+    existing callers are unchanged (they never pass it).
     """
+    vcs = vcs or vcs_for(settings)
     root = workspace_root or settings.workspaces_dir
     name = target.repo.split("/")[-1]
     workspace = str(Path(root) / name)
@@ -127,7 +171,7 @@ async def prepare_workspace(settings: Settings, target: RepoTarget, branch: str,
 
     if not Path(workspace, ".git").exists():
         code, out = await _run(
-            ["git", "clone", "--filter=blob:none", f"https://github.com/{target.repo}.git", workspace],
+            ["git", "clone", "--filter=blob:none", vcs.clone_url(target.repo), workspace],
             timeout=900,
         )
         if code != 0:
@@ -169,7 +213,8 @@ async def git(workspace: str, *args: str, timeout: int = 300) -> tuple[int, str]
 
 async def prepare_feature_workspace(settings: Settings, target: RepoTarget,
                                     branch: str, stage: int,
-                                    workspace_root: str | None = None) -> str:
+                                    workspace_root: str | None = None,
+                                    vcs: VCS | None = None) -> str:
     """Feature stages resume from origin/<branch> — never silently rebuild from base.
 
     Stage 0 creates the branch from origin/<base>. Stage > 0 requires
@@ -178,7 +223,10 @@ async def prepare_feature_workspace(settings: Settings, target: RepoTarget,
     Raises BranchLostError in that case.
     workspace_root overrides the clone location — shepherd fix runs use their
     own clone so they never contend with the job holding the main workspace.
+    vcs is the H2 VCS driver used to mint the clone URL; resolved internally so
+    existing callers are unchanged (they never pass it).
     """
+    vcs = vcs or vcs_for(settings)
     root = workspace_root or settings.workspaces_dir
     name = target.repo.split("/")[-1]
     workspace = str(Path(root) / name)
@@ -186,7 +234,7 @@ async def prepare_feature_workspace(settings: Settings, target: RepoTarget,
 
     if not Path(workspace, ".git").exists():
         code, out = await _run(
-            ["git", "clone", "--filter=blob:none", f"https://github.com/{target.repo}.git", workspace],
+            ["git", "clone", "--filter=blob:none", vcs.clone_url(target.repo), workspace],
             timeout=900,
         )
         if code != 0:
@@ -220,12 +268,26 @@ async def prepare_feature_workspace(settings: Settings, target: RepoTarget,
     return workspace
 
 
+async def mint_git_token(settings: Settings, repo: str) -> str | None:
+    """Back-compat shim (Epic H2): the token-minting logic moved onto the VCS
+    driver (``GitHubVCS.mint_git_token``). Delegates through the resolved VCS so
+    every existing importer (engine.py, test_githubapp) keeps working while the
+    seam owns the implementation. Never raises — app errors fall back to PAT."""
+    return await vcs_for(settings).mint_git_token(repo)
+
+
 def _claude_cmd_env(settings: Settings, prompt: str, allowed_tools: list[str],
                     resume_session: str | None, disallowed_tools: list[str] | None,
                     session_id: str | None, fork_session: bool,
-                    config_dir: str | None, output_format: str = "json"):
+                    config_dir: str | None, output_format: str = "json",
+                    git_token: str | None = None):
     """Shared command/env assembly for the raw and streaming runners — one
-    place owns the flag order and the env hygiene."""
+    place owns the flag order and the env hygiene.
+
+    G2: the env is ALLOW-LISTED (secrets.build_subprocess_env), not an ambient
+    os.environ.copy(), so operator secrets never reach the model's shell. The
+    run's GH_TOKEN is the run-specific `git_token` (G1: a minted per-repo
+    installation token) when provided, else the PAT fallback."""
     # prompt is positional, directly after -p; option flags follow it
     cmd = [
         settings.claude_binary,
@@ -246,16 +308,20 @@ def _claude_cmd_env(settings: Settings, prompt: str, allowed_tools: list[str],
     if settings.claude_model:
         cmd += ["--model", settings.claude_model]
 
-    env = os.environ.copy()
-    env["GH_TOKEN"] = settings.github_token
-    env["CLICKUP_TOKEN"] = settings.clickup_token  # used by the brain-ticket CLI
-    # never inherit an ambient session identity from the service's own env
-    env.pop("CLAUDE_CODE_SESSION_ID", None)
+    # G2: explicit allow-listed env — NOT os.environ.copy(). Run-specific vars
+    # (the git token, the ClickUp token used by brain-ticket, the config dir)
+    # are layered on top; CLAUDE_CODE_SESSION_ID is never inherited (absent from
+    # the allow-list by construction).
+    extra: dict[str, str | None] = {
+        "GH_TOKEN": git_token if git_token else settings.github_token,
+        "CLICKUP_TOKEN": settings.clickup_token,
+    }
     if config_dir:
-        env["CLAUDE_CONFIG_DIR"] = config_dir
+        extra["CLAUDE_CONFIG_DIR"] = config_dir
     elif settings.session_persistence:
         # sessions on the data volume so resume survives restarts
-        env["CLAUDE_CONFIG_DIR"] = settings.claude_config_dir
+        extra["CLAUDE_CONFIG_DIR"] = settings.claude_config_dir
+    env = build_subprocess_env(settings, extra=extra)
     return cmd, env
 
 
@@ -265,7 +331,51 @@ async def run_claude_raw(settings: Settings, workspace: str, prompt: str,
                          disallowed_tools: list[str] | None = None,
                          session_id: str | None = None,
                          fork_session: bool = False,
-                         config_dir: str | None = None) -> RawRunResult:
+                         config_dir: str | None = None,
+                         git_token: str | None = None) -> RawRunResult:
+    """Public entrypoint (Epic H3 seam). Resolves the AgentRuntime driver and
+    dispatches the raw run through it — CLIRuntime (default) delegates back to
+    ``_run_claude_raw_impl`` below (the real CLI body). This name stays the one
+    engine.py/worker.py import and tests patch, so patching it still intercepts
+    every run; the runtime seam is reached only INSIDE this shim (single hop —
+    the CLIRuntime calls the private ``_impl``, never this public name)."""
+    from .runtime import runtime_for
+    return await runtime_for(settings).run(
+        settings, workspace, prompt, allowed_tools, timeout,
+        resume_session=resume_session, disallowed_tools=disallowed_tools,
+        session_id=session_id, fork_session=fork_session, config_dir=config_dir,
+        git_token=git_token)
+
+
+async def run_claude_stream(settings: Settings, workspace: str, prompt: str,
+                            allowed_tools: list[str], timeout: int,
+                            resume_session: str | None = None,
+                            disallowed_tools: list[str] | None = None,
+                            session_id: str | None = None,
+                            fork_session: bool = False,
+                            config_dir: str | None = None,
+                            on_event=None,
+                            interrupt_event=None,
+                            git_token: str | None = None) -> RawRunResult:
+    """Public streaming entrypoint (Epic H3 seam) — dispatches through the
+    resolved AgentRuntime; CLIRuntime delegates to ``_run_claude_stream_impl``.
+    Same shim discipline as run_claude_raw (single hop; patchable name kept)."""
+    from .runtime import runtime_for
+    return await runtime_for(settings).run_stream(
+        settings, workspace, prompt, allowed_tools, timeout,
+        resume_session=resume_session, disallowed_tools=disallowed_tools,
+        session_id=session_id, fork_session=fork_session, config_dir=config_dir,
+        on_event=on_event, interrupt_event=interrupt_event, git_token=git_token)
+
+
+async def _run_claude_raw_impl(settings: Settings, workspace: str, prompt: str,
+                               allowed_tools: list[str], timeout: int,
+                               resume_session: str | None = None,
+                               disallowed_tools: list[str] | None = None,
+                               session_id: str | None = None,
+                               fork_session: bool = False,
+                               config_dir: str | None = None,
+                               git_token: str | None = None) -> RawRunResult:
     """Low-level headless run. Returns the CLI's result text verbatim plus the
     telemetry envelope (session/cost/turns/duration) — callers own the parsing.
 
@@ -280,15 +390,10 @@ async def run_claude_raw(settings: Settings, workspace: str, prompt: str,
       chats use their own so concurrent invocations never race the session
       store's state files)."""
     cmd, env = _claude_cmd_env(settings, prompt, allowed_tools, resume_session,
-                               disallowed_tools, session_id, fork_session, config_dir)
+                               disallowed_tools, session_id, fork_session, config_dir,
+                               git_token=git_token)
 
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        cwd=workspace,
-        env=env,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+    proc = await _runner(settings).spawn(cmd, cwd=workspace, env=env)
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
@@ -348,15 +453,16 @@ def _tool_status(name: str, tool_input: dict) -> str:
     return name
 
 
-async def run_claude_stream(settings: Settings, workspace: str, prompt: str,
-                            allowed_tools: list[str], timeout: int,
-                            resume_session: str | None = None,
-                            disallowed_tools: list[str] | None = None,
-                            session_id: str | None = None,
-                            fork_session: bool = False,
-                            config_dir: str | None = None,
-                            on_event=None,
-                            interrupt_event=None) -> RawRunResult:
+async def _run_claude_stream_impl(settings: Settings, workspace: str, prompt: str,
+                                  allowed_tools: list[str], timeout: int,
+                                  resume_session: str | None = None,
+                                  disallowed_tools: list[str] | None = None,
+                                  session_id: str | None = None,
+                                  fork_session: bool = False,
+                                  config_dir: str | None = None,
+                                  on_event=None,
+                                  interrupt_event=None,
+                                  git_token: str | None = None) -> RawRunResult:
     """run_claude_raw with live progress (docs/CONVERSATIONS.md §5): the CLI
     runs in stream-json mode and each event is surfaced through on_event as it
     happens — ("status", "Read app/x.py") per tool call, ("delta", text) per
@@ -372,16 +478,11 @@ async def run_claude_stream(settings: Settings, workspace: str, prompt: str,
     on_event = on_event or (lambda event, data: None)
     cmd, env = _claude_cmd_env(settings, prompt, allowed_tools, resume_session,
                                disallowed_tools, session_id, fork_session,
-                               config_dir, output_format="stream-json")
+                               config_dir, output_format="stream-json",
+                               git_token=git_token)
 
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        cwd=workspace,
-        env=env,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        limit=2 ** 20,  # stream-json lines can carry whole documents; 64KB default is too small
-    )
+    # stream-json lines can carry whole documents; 64KB default is too small
+    proc = await _runner(settings).spawn(cmd, cwd=workspace, env=env, limit=2 ** 20)
 
     result_env: dict | None = None
     saw_event = False
@@ -515,18 +616,24 @@ async def run_claude(settings: Settings, target: RepoTarget, workspace: str, pro
     """v1 contract used by sentry/task jobs: PR URL sniffing + NEEDS_INPUT/NO_FIX.
     With on_event, the run streams live progress (tool calls / text) exactly like
     stage runs — same return contract either way."""
+    # G1: mint a per-repo short-lived installation token for the run's GH_TOKEN
+    # (falls back to the PAT when the app is off / can't reach the repo). The
+    # app private key never enters the subprocess — only this minted token does.
+    git_token = await mint_git_token(settings, target.repo)
     if on_event is not None:
         raw = await run_claude_stream(
             settings, workspace, prompt,
             allowed_tools=BASE_ALLOWED_TOOLS + target.allow,
             timeout=settings.claude_timeout_seconds,
             on_event=on_event,
+            git_token=git_token,
         )
     else:
         raw = await run_claude_raw(
             settings, workspace, prompt,
             allowed_tools=BASE_ALLOWED_TOOLS + target.allow,
             timeout=settings.claude_timeout_seconds,
+            git_token=git_token,
         )
     if raw.status == "timeout":
         return FixResult("timeout", detail=raw.text, meta=raw.meta)

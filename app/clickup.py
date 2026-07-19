@@ -8,6 +8,7 @@ import logging
 import httpx
 
 from .config import Settings
+from .tracker import Tracker
 
 log = logging.getLogger("brain.clickup")
 
@@ -22,17 +23,28 @@ STATUS_CANDIDATES = {
     "skipped": ["rejected", "complete", "done", "closed"],
     "error": ["to do", "open"],
     "timeout": ["to do", "open"],
+    # outcome loop (Epic B4): a closed watch, and an active one (the watch
+    # never flips ticket status at spawn — only at park/close)
+    "done": ["complete", "done", "closed"],
+    "watching": ["in progress", "active"],
 }
 
 
-class ClickUp:
+class ClickUpTracker(Tracker):
+    """The DEFAULT tracker driver (Epic H1) — one ClickUp task per issue, the
+    conveyor belt for HITL input. Conforms to the ``Tracker`` ABC; the seam is a
+    pure retype, the HTTP logic below is unchanged."""
+
+    name = "clickup"
+
     def __init__(self, settings: Settings):
         self.enabled = settings.clickup_enabled
         self._list_id = settings.clickup_list_id
         self._headers = {"Authorization": settings.clickup_token}
         self._statuses: list[str] = []
         # custom-field defs by lowercased name: {name: {id, type, options{name: option_id}}}
-        # — the gumo-speed conveyor contract (Stage board, PR fields, Decisions)
+        # — the workflow-conveyor mirror contract (Stage board, PR fields,
+        # Decisions; originally the gumo-speed workflow)
         self._fields: dict[str, dict] = {}
 
     async def load_statuses(self):
@@ -270,7 +282,10 @@ class ClickUp:
             log.exception("ClickUp comment failed for task %s", task_id)
 
     async def comments(self, task_id: str) -> list[dict]:
-        """Newest-last list of {id, text, date} comments (date: epoch seconds)."""
+        """Newest-last list of {id, text, date, user_id, username} comments
+        (date: epoch seconds). The commenter identity feeds answer attribution
+        (Epic A1) — read fail-safe, so an odd payload shape degrades to an
+        anonymous comment, never a crash."""
         if not self.enabled or not task_id:
             return []
         try:
@@ -285,7 +300,11 @@ class ClickUp:
                         date = float(c.get("date", 0)) / 1000.0  # API returns ms
                     except (TypeError, ValueError):
                         date = 0.0
-                    out.append({"id": str(c["id"]), "text": c.get("comment_text", ""), "date": date})
+                    u = c.get("user") or {}
+                    out.append({"id": str(c["id"]), "text": c.get("comment_text", ""),
+                                "date": date,
+                                "user_id": str(u.get("id") or ""),
+                                "username": (u.get("username") or "").strip()})
                 return out
         except Exception:
             log.exception("ClickUp comments fetch failed for task %s", task_id)
@@ -309,3 +328,8 @@ class ClickUp:
                 r.raise_for_status()
         except Exception:
             log.exception("ClickUp set_status(%s) failed for task %s", state, task_id)
+
+
+# Back-compat alias — worker.py and engine.py import `ClickUp`; test_shepherd
+# and others construct it directly. Load-bearing, not cosmetic.
+ClickUp = ClickUpTracker

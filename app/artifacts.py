@@ -16,14 +16,12 @@ import logging
 import re
 from pathlib import Path
 
-from .clickup import ClickUp
 from .config import GATE_PREFIX
 from .db import JobStore
-from .fixer import git
+from .fixer import engine_dir, git
+from .tracker import Tracker
 
 log = logging.getLogger("brain.artifacts")
-
-FEATURES_DIR = ".gumo/features"
 
 _ESCAPE_RE = re.compile(r"\\([\\`*_{}\[\]()#+\-.!>~|])")
 _BULLET_RE = re.compile(r"^(\s*)[*+]\s", re.MULTILINE)
@@ -62,16 +60,21 @@ def semantic_hash(text: str) -> str:
     return hashlib.sha256(semantic_normalize(text).encode()).hexdigest()
 
 
-def feature_dir(job_id: str) -> str:
-    return f"{FEATURES_DIR}/{job_id}"
+def features_dir(workspace: str) -> str:
+    """Relative features root inside a clone, namespace-resolved (legacy wins)."""
+    return f"{engine_dir(workspace)}/features"
+
+
+def feature_dir(workspace: str, job_id: str) -> str:
+    return f"{features_dir(workspace)}/{job_id}"
 
 
 def artifact_path(workspace: str, job_id: str, artifact: str) -> Path:
-    return Path(workspace) / feature_dir(job_id) / artifact
+    return Path(workspace) / feature_dir(workspace, job_id) / artifact
 
 
 def list_artifacts(workspace: str, job_id: str) -> list[str]:
-    d = Path(workspace) / feature_dir(job_id)
+    d = Path(workspace) / feature_dir(workspace, job_id)
     if not d.is_dir():
         return []
     return sorted(p.name for p in d.glob("P*-*.md"))
@@ -80,7 +83,7 @@ def list_artifacts(workspace: str, job_id: str) -> list[str]:
 class ArtifactSync:
     """Per-job sync between the feature branch and ClickUp subtasks."""
 
-    def __init__(self, store: JobStore, clickup: ClickUp, mirror_max_chars: int = 50000):
+    def __init__(self, store: JobStore, clickup: Tracker, mirror_max_chars: int = 50000):
         self.store = store
         self.clickup = clickup
         self.mirror_max_chars = mirror_max_chars
@@ -129,7 +132,7 @@ class ArtifactSync:
             path = artifact_path(workspace, job_id, artifact)
             git_text = path.read_text() if path.exists() else ""
             if task.get("missing") or task.get("archived"):
-                await self._recreate_mirror(job, artifact, git_text)
+                await self._recreate_mirror(workspace, job, artifact, git_text)
                 continue
             fetched = task.get("description") or ""
             if not fetched.strip():
@@ -179,7 +182,7 @@ class ArtifactSync:
         for artifact, content in contents.items():
             state = self.store.artifact_get(job_id, artifact)
             if state is None or not state["subtask_id"]:
-                await self._create_mirror(job, artifact, content)
+                await self._create_mirror(workspace, job, artifact, content)
                 continue
             subtask_id = state["subtask_id"]
             truncated = "truncated" in (state["flags"] or "")
@@ -187,12 +190,12 @@ class ArtifactSync:
             if task is None:
                 continue  # API failure — leave mirror + hash as-is, retry next sync
             if task.get("missing") or task.get("archived"):
-                await self._recreate_mirror(job, artifact, content)
+                await self._recreate_mirror(workspace, job, artifact, content)
                 continue
             if truncated:
                 # the mirror is an intentional pointer, not an editing surface;
                 # never treat the banner as a human edit — just refresh the pointer
-                await self._put_and_fix(job_id, subtask_id, artifact, content)
+                await self._put_and_fix(workspace, job_id, subtask_id, artifact, content)
                 continue
             current = task.get("description") or ""
             if (current.strip() and state["synced_hash"]
@@ -206,7 +209,7 @@ class ArtifactSync:
                 self.store.artifact_set(job_id, artifact, synced_hash=semantic_hash(current))
                 conflicted.append(artifact)
                 continue
-            await self._put_and_fix(job_id, subtask_id, artifact, content)
+            await self._put_and_fix(workspace, job_id, subtask_id, artifact, content)
         return conflicted
 
     # ---------- mirror plumbing ----------
@@ -221,9 +224,12 @@ class ArtifactSync:
             True,
         )
 
-    async def _create_mirror(self, job: dict, artifact: str, content: str):
+    async def _create_mirror(self, workspace: str, job: dict, artifact: str, content: str):
+        # workspace resolves the REAL namespace for the truncated-mirror pointer
+        # text — the human's only pointer to the git file; a wrong dir on a
+        # legacy repo would mislead the editing human
         job_id = job["issue_id"]
-        body, truncated = self._mirror_body(content, f"{feature_dir(job_id)}/{artifact}")
+        body, truncated = self._mirror_body(content, f"{feature_dir(workspace, job_id)}/{artifact}")
         created = await self.clickup.create_task(
             name=artifact.removesuffix(".md").replace("-", " "),
             description=body,
@@ -249,21 +255,22 @@ class ArtifactSync:
         if not job.get("mirror_ok"):
             self.store.set_fields(job_id, mirror_ok=1)
 
-    async def _recreate_mirror(self, job: dict, artifact: str, content: str):
+    async def _recreate_mirror(self, workspace: str, job: dict, artifact: str, content: str):
         job_id = job["issue_id"]
         log.warning("job %s: mirror subtask for %s lost — recreating from git", job_id, artifact)
         self.store.artifact_set(job_id, artifact, subtask_id="", synced_hash="", flags="mirror_lost")
-        await self._create_mirror(job, artifact, content)
+        await self._create_mirror(workspace, job, artifact, content)
         await self.clickup.comment(
             job.get("clickup_task_id") or "",
             f"{GATE_PREFIX} The `{artifact}` subtask disappeared; I recreated it from git "
             "(the source of truth). Any edits made to the old subtask were not received.",
         )
 
-    async def _put_and_fix(self, job_id: str, subtask_id: str, artifact: str, content: str):
+    async def _put_and_fix(self, workspace: str, job_id: str, subtask_id: str,
+                           artifact: str, content: str):
         """PUT then hash the READBACK — ClickUp's regenerated markdown is the
         fixpoint that future pulls are compared against."""
-        body, truncated = self._mirror_body(content, f"{feature_dir(job_id)}/{artifact}")
+        body, truncated = self._mirror_body(content, f"{feature_dir(workspace, job_id)}/{artifact}")
         ok = await self.clickup.update_description(subtask_id, body)
         if not ok:
             return  # keep old hash; retry at next sync point
@@ -276,7 +283,7 @@ class ArtifactSync:
             truncated = True
             log.warning("job %s: %s readback truncated by ClickUp — switching to pointer mirror", job_id, artifact)
             pointer = (f"**TRUNCATED MIRROR — full document lives in git at "
-                       f"`{feature_dir(job_id)}/{artifact}`. Edit via gate comments, not here.**")
+                       f"`{feature_dir(workspace, job_id)}/{artifact}`. Edit via gate comments, not here.**")
             await self.clickup.update_description(subtask_id, pointer)
             # hash the POINTER readback, not the stale full-content one, else the
             # next push() reads the banner as a 'human edit' and commits it to git

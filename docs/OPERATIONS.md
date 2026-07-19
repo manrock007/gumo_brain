@@ -22,7 +22,11 @@ The container needs outbound HTTPS to GitHub, Anthropic, and (if enabled)
 Sentry, ClickUp, and Slack webhooks. Inbound: the dashboard/API port and the
 `/webhooks/sentry` endpoint.
 
-## 2. Install (fresh instance)
+## 2. Install (fresh instance) — the from-zero walkthrough
+
+Every code default is neutral: a fresh instance knows nothing about any
+product until you tell it. **No Gumo value — or any other customer value — is
+involved at any point** (the example appendix below is documentation only).
 
 1. Run the image with a persistent volume mounted at `DATA_DIR` and these
    minimum env vars:
@@ -37,10 +41,30 @@ Sentry, ClickUp, and Slack webhooks. Inbound: the dashboard/API port and the
    SESSION_COOKIE_SECURE=true         # behind any TLS-terminating proxy
    ```
 
+   First boot creates one admin user and one empty workspace named
+   "Default" (no repos, no product name — the instance context applies until
+   you set one).
+
 2. Sign in as the admin. The dashboard greets you with the **first-run
-   checklist** (ENGINE.md §14): set your business context, point a workspace
-   at your repositories, bootstrap product memory, invite your team. Every
-   step auto-detects; dismiss the card when you're done.
+   checklist** (ENGINE.md §14) with every step unticked:
+   - **Business context** — Project context panel (or `PUT /api/context`):
+     set your product name and paste your business context (the textarea
+     ships a fill-in template).
+   - **Repositories** — Settings → Workspaces (or
+     `PATCH /api/workspaces/{id}` with
+     `{"repos": [{"slug": "api", "repo": "you/api", "base": "main"}], "canonical_project": "api"}`):
+     add your first repo; the slug immediately appears in the intake pickers
+     (`GET /api/projects`).
+   - **Memory** — Product brain panel: bootstrap each repo's engine memory
+     (a draft PR you review).
+   - **Team** — Settings → Users: add members, assign them to workspaces.
+
+3. Submit your first feature (project + title on the dashboard, or
+   `POST /api/features {"project": "api", "title": "…"}`) — it queues at P0
+   even with no ClickUp configured (ClickUp is best-effort visibility,
+   never required). Dismiss the checklist card when you're done.
+
+   This whole path is pinned by `tests/test_install_from_zero.py`.
 
 3. Optional integrations, per workspace once configured globally:
    - **Sentry intake**: `SENTRY_CLIENT_SECRET`, `SENTRY_AUTH_TOKEN`,
@@ -93,6 +117,14 @@ pre-upgrade backup is the rollback path.
 - **Disk**: clones under `workspaces/` are the growth driver; they are safe
   to delete when no run is active. Transcripts self-prune after
   `TRANSCRIPT_TTL_DAYS` (30), CLI sessions after `SESSION_TTL_DAYS` (14).
+- **Routines** (Epic I): the dashboard's **Routines panel** shows every
+  routine's scope, schedule, enabled state and run history, with a run-now
+  button (audited in `admin_events` as `routine_run_now` — the run history
+  itself carries no actor). The builtin sweep/reaper/janitor rows derive their cadence from
+  the env (schedule shown as "from settings") unless you set an explicit
+  schedule; the reaper cannot be disabled. Stale inbox notices expire after
+  `INBOX_NOTICE_TTL_DAYS`; routine run history is pruned after
+  `ROUTINE_RUN_TTL_DAYS` (newest 20 per routine always kept).
 - **Locked account**: 5 consecutive bad passwords lock sign-in for 5
   minutes (`AUTH_LOCKOUT_ATTEMPTS` / `AUTH_LOCKOUT_SECONDS`). An admin
   password reset clears the lockout immediately.
@@ -104,3 +136,461 @@ pre-upgrade backup is the rollback path.
 - **Run guardrails**: `MAX_RUNS_PER_DAY` (8), `ISSUE_COOLDOWN_HOURS` (72),
   `CLAUDE_TIMEOUT_SECONDS` (2400) — the daily-cap and cooldown protections
   described in ENGINE.md §7.
+
+## 6. Configuration reference (selected env vars)
+
+Every code default is **neutral** — nothing customer- or vendor-specific is
+baked in. Key knobs (see `app/config.py` for the full set; env var = the
+upper-cased field name):
+
+| Env var | Default | Meaning |
+| --- | --- | --- |
+| `REPO_MAP` | `{}` | project slug → `{repo, base, setup_cmd?, test_cmd?, allow?}`; normally managed per workspace via the API, env seeds first boot |
+| `PRODUCT_NAME` | `your product` | prompt identity ("the `<name>` Engine") |
+| `BUSINESS_CONTEXT` | *(empty)* | free text injected into every run prompt; template in the dashboard's context panel |
+| `MEMORY_CANONICAL_PROJECT` | *(empty)* | slug hosting product-scope memory; empty = repo-scope only |
+| `BRANCH_PREFIX` | `ctrlloop` | prefix for engine-created branches (`<prefix>/feat-…`, `<prefix>/sentry-…`, `<prefix>/memory-…`, `<prefix>/outcome-…`). Must be ONE git-valid branch segment — starts alphanumeric, chars `A-Za-z0-9._-`, no `/`, no `.lock` suffix (validated at boot; e.g. `team/bot` is rejected). Jobs record their branch at first use, so changing it never strands in-flight work; pre-rename rows keep their historical `brain/…` branches. |
+| `SENTRY_ORG`, `SENTRY_AUTH_TOKEN` | *(empty)* | BOTH required to enable the Sentry lane |
+| `SENTRY_API_BASE` | `https://sentry.io/api/0` | EU-region orgs set `https://de.sentry.io/api/0` |
+| `CLICKUP_TOKEN`, `CLICKUP_LIST_ID` | *(empty)* | BOTH required to enable ClickUp (list may also be per-workspace) |
+| `CLICKUP_STAGE_FIELD_MAP` | `{}` | stage → `Stage` dropdown option (`"build"` resolves per-repo) |
+| `CLICKUP_REPO_STAGE_MAP` | `{}` | repo → its build-stage column |
+| `CLICKUP_PR_FIELD_MAP` | `{}` | repo → its PR url field |
+| `CLICKUP_DOC_FIELD_MAP` | `{}` | artifact filename → doc url field |
+| `CLICKUP_FOLDER_FIELD` | *(empty)* | url field pointing at the branch's engine tree |
+| `CLICKUP_FRICTION_FIELD` | *(empty)* | append-only friction/improvements log field |
+| `CLICKUP_FLAG_FIELD`, `CLICKUP_METRIC_FIELD` | *(empty)* | P9 `FLAG_NAME:` / `SUCCESS_METRIC:` launch fields |
+| `PUBLIC_BASE_URL` | *(empty)* | dashboard base for deep links; empty = links omitted |
+| `CTRLLOOP_GIT_NAME`, `CTRLLOOP_GIT_EMAIL` | `ctrlloop` / `engine@ctrlloop.local` | git author for engine commits (entrypoint.sh) |
+
+Empty maps/fields make the whole conveyor mirror inert — the engine never
+touches a workspace's custom fields unless told which ones. Three field names
+stay **literal by design** and are addressed by name with a quiet no-op when
+the workspace lacks them: `Stage` (inert anyway until
+`CLICKUP_STAGE_FIELD_MAP` is populated), `Dashboard` (inert until
+`PUBLIC_BASE_URL` is set), and `Decisions` (substantive gate answers append
+there). They are engine-generic mirror fields, not customer branding.
+`CLICKUP_DRI_FIELD_MAP` (default `{"founder": "Assigned Founder DRI",
+"dev": "Assigned Dev DRI"}`) follows the same posture: engine-generic role
+field names, read-side lookups against your workspace's own schema, a quiet
+no-op when the fields don't exist, `{}` to disable the reads entirely.
+
+## 7. Team coordination (Epic A: dual DRIs, role gates, attribution, SLA)
+
+| Env var | Default | Meaning |
+| --- | --- | --- |
+| `REQUIRE_ATTRIBUTED_ANSWERS` | `auto` | ClickUp gate verbs must come from a mapped commenter: `on` / `off` / `auto` (= strict once ANY user has a ClickUp link). Instance fallback; each workspace can override. |
+| `STAGE_ROLE_MAP` | *(empty)* | JSON overrides of the stage→role ladder (keys `"0"`..`"9"`, values `founder`/`dev`); empty = built-in (P0/P1/P9 founder, P2–P8 dev). Workspace `stage_role_map` overrides it. |
+| `GATE_SLA_HOURS` | `24` | gate SLA before escalation; `0` disables. Workspace `gate_sla_hours` overrides (empty string in a PATCH clears back to inherit). |
+| `SLA_CHECK_INTERVAL_SECONDS` | `900` | escalation sweep cadence. |
+| `CLICKUP_DRI_FIELD_MAP` | `{"founder": "Assigned Founder DRI", "dev": "Assigned Dev DRI"}` | role → the ClickUp people field feature adoption reads that DRI from; `{}` disables. |
+
+How it fits together:
+
+- **Linking people**: Settings → Users → "Link ClickUp id" (or
+  `PATCH /api/users/{u} {"clickup_user_id": "<numeric id>"}`). One ClickUp
+  identity per user (409 + a DB unique index). Once anyone is linked, the
+  default `auto` strictness starts refusing gate verbs from unmapped
+  ClickUp commenters (one explanatory reply per comment).
+- **DRIs**: set per feature at submit (dashboard fields / API
+  `founder_dri`+`dev_dri`; the old `owner` field is a deprecated alias for
+  `dev_dri`) or via the ClickUp people fields at `[feature]` adoption.
+  A job with NO explicit DRIs stays in solo mode — no role enforcement, no
+  SLA escalation. **Re-submitting a feature replaces its DRIs from the fresh
+  submission** — but note the Epic D1 interplay: with
+  `PEOPLE_ROUTING_DEFAULTS=true` (the default) and people profiles covering
+  the repo, an EMPTY slot re-fills from the profiles at intake, so a
+  resubmit that omits both DRIs re-enables enforcement with the profile
+  defaults. There is no per-job "no DRI" once profiles cover a repo —
+  `PEOPLE_ROUTING_DEFAULTS=false` is the opt-out (profiles then feed
+  prompts/display only). See §10.
+- **Fail-closed corner**: `REQUIRE_ATTRIBUTED_ANSWERS=off` with DRIs set
+  still refuses unmapped ClickUp commenters on role-owned gates (an
+  unresolved commenter can never be the owner) — if a DRI'd feature's gate
+  channel looks dead from ClickUp, link the ClickUp ids or answer on the
+  dashboard. Admin override (audited) exists only on the dashboard.
+- **Upgrades**: pre-existing jobs carry only the legacy `owner` column —
+  they keep today's behavior verbatim (assignment yes, enforcement and
+  escalation no). The first SLA sweep after a deploy escalates only gates
+  that are ALREADY over the SLA *and* carry explicit DRIs — a freshly
+  upgraded instance (no DRI columns populated yet) sends nothing.
+
+## 8. The outcome loop (Epic B: metric at intake, watcher, ledger)
+
+| Env var | Default | Meaning |
+| --- | --- | --- |
+| `METRIC_WINDOW_DAYS_DEFAULT` | `14` | measurement window (days) for features submitted without one; the API/intake accept 1–365. |
+| `WATCH_ENABLED` | `true` | master switch: spawn watch jobs on merge + run the watch loop. |
+| `WATCH_INTERVAL_SECONDS` | `3600` | watch loop cadence; metric reads are internally throttled to ~one per day per job. |
+| `OUTCOME_FLAT_BAND_PCT` | `10` | ± band around the baseline inside which a verdict is `flat`. |
+| `OUTCOME_MEMORY_PRS` | `true` | on `/proceed` at the Iterate gate, write the verdict into product memory via a mechanical draft PR (no model run). |
+| `ANALYTICS_PROVIDER` | *(empty)* | instance-level analytics fallback: empty = none (verdicts stay `unmeasured`) or `mixpanel`. Per-workspace settings win. |
+| `ANALYTICS_CONFIG` | `{}` | JSON object for the instance provider: `{project_id, service_account, secret, api_base}`. EU Mixpanel projects set `"api_base": "https://eu.mixpanel.com/api"` — never a code default. |
+
+Per-workspace analytics lives in Settings → Workspaces
+(`PATCH /api/workspaces/{id}` with `analytics_provider` +
+`analytics_config`). The config — including the Mixpanel service-account
+secret — is stored in the DB row and **redacted from every API response**;
+the dashboard only ever sees `analytics_configured: true/false`. A malformed
+config or unknown provider degrades to the null driver (outcomes render
+`unmeasured`), and read failures (e.g. a revoked credential's 401) appear as
+detail text on the watch job.
+
+Operational notes:
+
+- Watch jobs (`watch-<feature id>`) never invoke Claude — the loop is pure
+  HTTP + SQLite. A parked Iterate gate does sit in `awaiting_input`, so it
+  counts toward the `runs_today` daily-cap denominator like any other parked
+  gate (accepted; the cap only guards Claude-run statuses transitively).
+- Re-submitting a shipped feature resets the previous lap's watch row,
+  readings, and ledger row inside the atomic re-intake — the new lap is
+  measured from scratch.
+- `/redo <days>` on the Iterate gate re-arms a fresh window (1–365; anything
+  else is refused with the reason) while keeping the ORIGINAL pre-ship
+  baseline.
+
+## 9. Graduated autonomy (Epic C: trust ladder, pins, clawback)
+
+| Env var | Default | Meaning |
+| --- | --- | --- |
+| `AUTONOMY_ENABLED` | `true` | master switch: nightly scoring + the Autonomy surface + workspace pins. `false` = legacy behavior (only per-feature `gate_mode=light` auto-advances; pins ignored). Env-only and read once — **flipping it requires a restart**. |
+| `AUTONOMY_WINDOW_DAYS` | `30` | rolling `stage_runs` window the scorer reads; runs that age out decay the cell back to level 0. |
+| `AUTONOMY_MIN_RUNS` | `5` | cells with fewer counted runs stay level 0; level 3 also needs a clean streak of at least this many runs plus one human-answered gate in the window. |
+| `AUTONOMY_AUTO_LEVEL` | `0` | computed level required to auto-advance a gate. **`0` (default) = computed levels never auto-advance** — scoring, the matrix and pins still work. Set `1`–`3` to opt in (`3` = only full trust); any other value disables the rule (never clamped). |
+| `AUTONOMY_RECOMPUTE_HOURS` | `24` | nightly scorer cadence (`POST /api/autonomy/recompute`, admin, runs it on demand). |
+
+Notes:
+
+- **Fresh instances gate everything until a track record exists**; upgraded
+  instances too — computed-level auto-advance is off until you set
+  `AUTONOMY_AUTO_LEVEL`, so deploying this feature changes no gating
+  behavior by itself. Pins in Settings → Autonomy override the computed
+  level in both directions and are explicit admin actions.
+- The safety guards (mid-run human edit, mirror down, first run after a
+  `/redo`, P5 without a PR, non-boilerplate questions) always apply — under
+  every pin and at every level — and P9 always parks (terminal gate).
+- Clawback (per cell or per stage across the workspace, dashboard →
+  Autonomy) is available to workspace members, drops levels to 0, and makes
+  the cell re-earn from runs after the clawback only. Every pin change,
+  clawback, level change and auto-advance lands in the `autonomy_events`
+  audit table.
+- These settings are env-only (not dashboard-editable context overrides);
+  changes apply at the next restart.
+
+## 10. Organizational context (Epic D: people, decisions, retrieval, Slack)
+
+| Env var | Default | Meaning |
+| --- | --- | --- |
+| `PEOPLE_ROUTING_DEFAULTS` | `true` | people profiles fill EMPTY DRI slots at feature intake (exactly-one enabled workspace-member match per role; ambiguity fills nothing). Neutral: inert until profiles exist. `false` = profiles feed prompts/display only — the opt-out documented in §7. |
+| `MEMORY_SEARCH_TOP_K` | `5` | FTS snippets injected into stage prompts. `0` disables the block; any value outside `1..20` also disables it (never clamped toward more context). |
+| `SLACK_INGEST_ENABLED` | `false` | **the D3 flag** — Slack read ingestion of decision candidates. Even when `true` it needs `SLACK_BOT_TOKEN` and a per-workspace channel allowlist. |
+| `SLACK_BOT_TOKEN` | *(empty)* | Slack bot token. Secret: env-only, never stored in a workspace row, never returned by any API, never interpolated into logs/details. |
+| `SLACK_API_BASE` | `https://slack.com/api` | test seam; leave alone in production. |
+| `SLACK_INGEST_INTERVAL_SECONDS` | `600` | ingest loop cadence. |
+| `SLACK_INGEST_MAX_PAGES` | `10` | per-channel pagination bound per pass (pages of 100). A bound-hit pass processes what it fetched but holds the watermark (fail closed — never advanced past unfetched messages); raise it temporarily to let a backlogged channel catch up to exhaustion. |
+| `SLACK_DECISION_EMOJI` | `pushpin` | reaction NAME (no colons) marking a decision message; the `!decision` message prefix is always recognized when the flag is on. |
+
+Per-workspace: `slack_channels` (Settings → Workspaces, or
+`PATCH /api/workspaces/{id}` with a list of channel ids; `""` clears). A
+channel may be allowlisted by exactly ONE workspace — candidates route
+deterministically. When a channel is FIRST allowlisted its read watermark is
+initialized to *now*: ingestion is forward-only, so enabling the flag never
+floods the inbox with historical candidates.
+
+Slack app scopes (read-only by design): `channels:history` covers PUBLIC
+channels only — add `groups:history` for private channels the bot is in, and
+`reactions:read` for the emoji convention. `chat.getPermalink` needs no
+write scope; the engine never posts to Slack from this feature. Known
+limits (documented, by Slack API construction): a reaction added to a
+message older than the ~7-day re-scan overlap is not seen, and thread
+replies are not captured unless broadcast to the channel.
+
+What ingestion produces: decision-registry rows with `status='candidate'`,
+parked in every member's inbox for **confirm** (with optional scope/title/
+text edits; org scope is admin-only) or **dismiss**. Candidates are
+quarantined until confirmed: never indexed for retrieval, never rendered
+into any prompt, excluded from the default `GET /api/decisions` view.
+Dismissals are remembered — the row is kept, so a re-scan can never
+re-propose it.
+
+## 11. Proactive routines (Epic I)
+
+All neutral, env-overridable; the schedule keys are **seed defaults only** —
+after first boot the routine ROW is authoritative (edit in the Routines
+panel or `PUT /api/routines/{id}`).
+
+| Env var | Default | Meaning |
+| --- | --- | --- |
+| `ROUTINES_ENABLED` | `true` | master flag for the PER-WORKSPACE routines (standup, memory upkeep, risk scan, proposal scan, planning) ONLY — the builtin sweep/reaper/janitor rows keep firing when off. Env-only; restart to flip. |
+| `ROUTINE_TICK_SECONDS` | `60` | scheduler tick cadence. |
+| `ROUTINE_TZ` | `UTC` | timezone (zoneinfo name) daily/weekly schedules evaluate in. |
+| `STANDUP_SCHEDULE` | `daily@09:00;days=mon,tue,wed,thu,fri` | seed schedule for the exception-only standup digest. |
+| `MEMORY_UPKEEP_SCHEDULE` | `daily@07:00` | seed schedule for memory upkeep. |
+| `RISK_SCAN_SCHEDULE` | `every:3600` | seed schedule for the risk scan. |
+| `PROPOSAL_SCAN_SCHEDULE` | `every:86400` | seed schedule for the proposal scan. |
+| `PLANNING_SCHEDULE` | `weekly@mon 09:00` | seed schedule for the weekly planning pack. |
+| `MEMORY_STALENESS_THRESHOLD` | `0` | commits-stale threshold that queues a memory refresh. **0 = memory upkeep inert** (opt-in spend). Per-routine `config.staleness_threshold` overrides. |
+| `MEMORY_UPKEEP_COOLDOWN_DAYS` | `7` | at most one auto refresh per repo per window (human bootstraps count). |
+| `RISK_SENTRY_SPIKE_EVENTS` | `0` | 24h event count that raises a Sentry-spike alert. **0 = off.** Absolute threshold (no baseline store in v1). |
+| `RISK_REDO_THRESHOLD` | `3` | redos on one stage of one job (rolling `AUTONOMY_WINDOW_DAYS`) that raise a trust-decay alert. |
+| `BUDGET_MONTHLY_USD` | `0` | instance fallback for the per-workspace `budget_monthly_usd` column (NULL = inherit). **0 = no budget** — spend alerts and the digest budget section stay inert. The substrate Epic G4 extends. |
+| `PROPOSAL_WINDOW_DAYS` | `30` | evidence window for the proposal lane + the dismissal recency guard. |
+| `PROPOSAL_FRICTION_MIN` | `3` | friction entries per (project, stage) before a process-improvement brief. |
+| `PROPOSAL_SENTRY_CLUSTER_MIN` | `3` | stored sentry jobs per (project, culprit head) before a hardening brief. |
+| `INBOX_NOTICE_TTL_DAYS` | `30` | open notices (risk alerts, notes, digests, packs) expire — visibly — after this. |
+| `ROUTINE_RUN_TTL_DAYS` | `90` | routine run-history retention (janitor; newest 20 per routine always kept). |
+
+Per-workspace: `budget_monthly_usd` (Settings → Workspaces or
+`PATCH /api/workspaces/{id}`; `""` = inherit the instance value, `0` = no
+budget). Slack copies of digests/packs use the workspace's existing
+`slack_webhook_url` — no new secret.
+
+## 12. Identity & SSO (Epic E1)
+
+Local password auth is ALWAYS present and can never be turned off in a way that
+locks the instance out — a local-provider account with a usable password
+(`is_break_glass`) can always sign in. OIDC is additive.
+
+**OIDC setup** (Okta / Entra / Google / any OIDC provider):
+
+| Env var | Default | Meaning |
+| --- | --- | --- |
+| `OIDC_ENABLED` | `false` | master switch. OIDC also needs issuer + client id + secret + redirect (`oidc_configured` fails closed on partial config). |
+| `OIDC_ISSUER` | `""` | e.g. `https://your-org.okta.com` — discovery at `{issuer}/.well-known/openid-configuration`. |
+| `OIDC_CLIENT_ID` / `OIDC_CLIENT_SECRET` | `""` | app credentials. The secret is never returned by any API or logged. |
+| `OIDC_REDIRECT_URL` | `""` | the registered callback, e.g. `https://host/auth/oidc/callback`. |
+| `OIDC_SCOPES` | `openid email profile` | requested scopes. |
+| `OIDC_ROLE_CLAIM` | `""` | the id_token claim carrying group/role membership (e.g. `groups`). |
+| `OIDC_ROLE_MAP` | `{}` | JSON `{claim_value: role}` (`instance_admin`\|`member`\|`viewer`). |
+| `OIDC_ADMIN_GROUP` | `""` | membership in this group → `instance_admin`. |
+| `OIDC_DEFAULT_ROLE` | `member` | role when nothing maps. |
+| `OIDC_ROLE_SYNC` | `true` | re-map role on repeat login (never demotes the last instance admin, never touches a local-provider admin). |
+| `CTRLLOOP_LOCAL_LOGIN` | `true` | `false` only HIDES the password form; break-glass local login still works. |
+
+Login page shows SSO buttons from `GET /api/auth/providers` (public, no
+secrets). JIT provisioning auto-links ONLY on the IdP-stable `sub`
+(`external_id`) — an SSO login whose email/username collides with an existing
+LOCAL account is refused (never adopts/overwrites the local password). SAML and
+SCIM are scaffolds behind the same interface (`SAML_ENABLED` / `SCIM_ENABLED` /
+`SCIM_TOKEN`), inert by default.
+
+## 13. Scoped API tokens (Epic E2)
+
+Per-user tokens for automation, replacing HTTP Basic passwords. `POST
+/api/tokens` returns the `ctl_…` plaintext ONCE; only its sha256 is stored.
+`GET /api/tokens` lists yours (no secret); `DELETE /api/tokens/{id}` revokes;
+instance admins revoke others' via `/api/users/{u}/tokens`. Use it with
+`Authorization: Bearer ctl_…`. Once an account has an active token, HTTP Basic
+password auth is refused (403) for that account — EXCEPT break-glass instance
+admins, so ops can always get in. `API_TOKEN_DEFAULT_TTL_DAYS` (default `0` =
+no expiry) sets the default lifetime.
+
+## 14. RBAC v2 (Epic E3)
+
+Two axes: instance role (`instance_admin` | `member` on `users.role`) and
+workspace role (`admin` | `member` | `viewer` on `workspace_members.role`) plus
+a per-member repo allow-list (`repos`, `[]` = all). Instance admins are admins
+everywhere. Viewers are read-only (GET works, mutations 403). Config mutations
+require the admin role OF THAT SCOPE. Set a member's workspace role/repos via
+`PUT /api/workspaces/{id}/members` (`role`, `repos`). Legacy `admin` rows are
+migrated to `instance_admin` on boot (and normalized on read); the last
+instance admin can never be demoted.
+
+## 15. Audit log (Epic E4)
+
+Append-only `audit_log` covers gate decisions (both channels, with actor),
+admin overrides, logins (password + OIDC), config mutations, user/token
+lifecycle, and autonomy events (it supersedes `admin_events`, which is
+mirrored + boot-copied in). `GET /api/audit` is the dashboard viewer
+(membership-scoped). `GET /api/audit/export?after=<id>&limit=<n>` streams
+cursor-paged JSONL for a SIEM — one JSON object per line, next cursor in the
+`X-Next-Cursor` header (re-fetch with `?after=`). Instance-admin only
+(workspace admins get a membership-scoped export).
+
+| Env var | Default | Meaning |
+| --- | --- | --- |
+| `AUDIT_EXPORT_PAGE_SIZE` | `500` | max rows per export page. |
+| `AUDIT_RETENTION_DAYS` | `0` | `0` = keep forever (the SIEM is the archive); `>0` lets the daily janitor prune older rows. |
+
+## 16. GitHub App (Epic G1)
+
+Additive to the PAT: when configured, the engine mints a short-lived,
+single-repo installation token per run and hands ONLY that token to the
+subprocess (never the PAT, never the private key). A repo the app can't reach,
+or any app error, falls back to the PAT (`github_token`).
+
+| Env var | Default | Meaning |
+| --- | --- | --- |
+| `GITHUB_APP_ID` | `""` | the app id. |
+| `GITHUB_APP_PRIVATE_KEY` | `""` | the RSA private key (PEM or `@/path/to/key.pem` for a mounted file). SECRET — never logged, never in a subprocess env. |
+| `GITHUB_TOKEN` | `""` | the PAT — still the documented fallback; covers repos the app can't. |
+
+## 17. Secrets & subprocess env (Epic G2)
+
+| Env var | Default | Meaning |
+| --- | --- | --- |
+| `SECRETS_PROVIDER` | `env` | `env` (default), `file` (`SECRETS_DIR/<name>` files, Docker/K8s), or `vault` (scaffold → env). Unknown → env. |
+| `SECRETS_DIR` | `""` | base dir for the file provider. |
+| `SUBPROCESS_ENV_ALLOWLIST` | `""` | extra env var NAMES (comma list) to pass through to Claude/git runs, on top of the built-in plumbing + model-auth (incl. Bedrock/Vertex) + gh/git allow-list. A hard-deny secret set can never be re-added here. |
+
+Claude/git subprocesses get an explicitly allow-listed environment — operator
+secrets (Sentry token, dashboard password, OIDC secret, the app private key)
+never reach the model's shell. Startup logs the detected model-auth backend.
+
+## 18. Budgets (Epic G4)
+
+| Env var | Default | Meaning |
+| --- | --- | --- |
+| `BUDGET_MONTHLY_USD` | `0` | instance fallback for the per-workspace budget. `0` = inert. |
+| `BUDGET_WARN_PCT` | `80` | warn at ≥ this % of budget. |
+| `BUDGET_BLOCK_ENABLED` | `true` | block non-forced Claude runs at ≥100%. `false` = warn-only, never blocks. |
+
+Enforced at every Claude-run dispatch (sentry/task AND every feature stage). A
+non-forced run at ≥100% parks (feature pipelines park as `error` preserving
+stage/artifacts/gate answer), emits an inbox item, and audits `budget.block`;
+re-kick with override runs it and audits `budget.override`. `GET /api/budgets`
+powers the spend panel; set a workspace budget via `PATCH /api/workspaces/{id}`.
+
+## 19. Model billing (Max → API) (Epic G5)
+
+The engine runs the same under personal Claude Max OAuth
+(`CLAUDE_CODE_OAUTH_TOKEN`) or API billing (`ANTHROPIC_API_KEY`). **Anthropic
+policy prohibits routing OTHER users' requests through personal Max
+credentials.** Before onboarding a second user, flip to API billing: set
+`ANTHROPIC_API_KEY`, unset `CLAUDE_CODE_OAUTH_TOKEN`, restart. Startup logs the
+detected backend and warns loudly when a Max token is used on an instance with
+>1 enabled user. Stage runs, sessions, and the fast lane all resolve the same
+auth (fast lane prefers `CHAT_API_KEY` → `ANTHROPIC_API_KEY`).
+
+## 20. Execution substrate (Epic F)
+
+The substrate is Postgres/multi-worker/sandbox-capable, but **SQLite is the
+zero-config default and nothing here is required**. An existing single-process
+SQLite instance keeps working byte-for-byte with no new config.
+
+### 20.1 Database driver (F1) — SQLite default, Postgres opt-in
+
+- `DATABASE_URL` **empty** (default) → SQLite at `DATA_DIR/brain.db`, exactly as
+  before. JobStore runs the schema + additive migrations in-process.
+- `DATABASE_URL=postgresql://user:pass@host/db` → the Postgres driver. Alembic
+  owns the schema; install the extra deps first:
+  `pip install -r requirements.txt -r requirements-postgres.txt`.
+- Postgres-only knobs (ignored on SQLite): `DB_POOL_SIZE` (5),
+  `DB_POOL_MAX_OVERFLOW` (5), `DB_STATEMENT_TIMEOUT_MS` (0 = none).
+- **Adopting Postgres from an existing SQLite instance** (no data loss):
+  1. create an empty Postgres database;
+  2. `alembic upgrade head` (materializes the exact baseline schema — the
+     baseline is *generated from* the identical SQLite schema by
+     `scripts/gen_pg_baseline.py`);
+  3. `python scripts/sqlite_to_pg.py --sqlite DATA_DIR/brain.db --pg "$DATABASE_URL"`;
+  4. set `DATABASE_URL` and restart.
+- **Every future additive column** added to `app/db.py` MIGRATIONS **must get a
+  matching Alembic revision.** The static guard
+  `tests/test_dbdriver.py::test_every_migrations_column_in_alembic_baseline`
+  fails CI if a baseline column is missing; the full type-parity guard runs when
+  `TEST_DATABASE_URL` is set.
+- **Limitation:** memory retrieval (FTS5) is SQLite-only. On Postgres
+  `fts_enabled=False` and `mem_search()` returns `[]` — retrieval is a read
+  enhancement, no control flow depends on it (a native tsvector index is future
+  work).
+
+### 20.2 Multi-worker queue (F2) — Postgres only
+
+- SQLite keeps the single-process in-memory priority queue; `WORKERS` stays 1.
+  **`WORKERS>1` requires Postgres.**
+- On Postgres the worker claims jobs from the DB with `FOR UPDATE SKIP LOCKED`
+  (poll interval `JOB_POLL_INTERVAL_SECONDS`, default 2s); per-repo
+  serialization uses Postgres advisory locks, lifting the single-process
+  constraint. `WORKER_ID` (default `hostname:pid`) scopes boot crash recovery to
+  a worker's own interrupted runs — cross-worker zombies are left to the reaper.
+- **Topology constraint:** the shared CLI config dir (`~/.claude` when
+  `SESSION_PERSISTENCE` is off) is serialized cross-process by a Postgres
+  advisory lock on ONE host. For **multi-host** workers, give each worker its own
+  `CLAUDE_CONFIG_DIR` (per-host config dir) or run with
+  `SESSION_PERSISTENCE=false` — do not share one config dir across hosts.
+
+### 20.3 Sandboxed runs (F3) — FLAG, off by default
+
+- `RUNNER_BACKEND=local` (default) runs Claude as today's direct subprocess.
+- `RUNNER_BACKEND=container` runs each Claude invocation in a disposable
+  container (`RUNNER_CONTAINER_IMAGE`) with the clone bind-mounted, ONLY the G2
+  allow-listed env (via a 0600 `--env-file`, unlinked after), `--rm`, and an
+  operator-provided `RUNNER_CONTAINER_NETWORK` egress allowlist. An empty network
+  config **fails closed** (the runner refuses to start rather than granting full
+  egress). The image must carry `claude` + `git` + `gh`.
+- **Bind-mount caveat (docker-in-docker):** `-v {cwd}:{cwd}` is resolved by the
+  docker daemon against the HOST filesystem. If the app itself is containerized,
+  mount the workspaces dir at an identical host path (or run the daemon with that
+  path visible), or the container sees an empty tree. Flag-off by default, so
+  this never affects the default deployment.
+
+### 20.4 Observability (F4)
+
+- `GET /metrics` — Prometheus text exposition (queue depth, jobs by
+  status/kind, runs today, stage-run cost, gate latency, autonomy levels, budget
+  spend, watch jobs, build info). Auth: `METRICS_TOKEN` **empty** (default) →
+  requires instance-admin auth; set a token → `Authorization: Bearer <token>`
+  for Prometheus. Never unauthenticated-open (workspace names/costs are
+  sensitive). Cached with a small TTL so a scrape can't hammer the DB.
+- `GET /health/ready` — 200 `{ready, checks:{db, worker, scheduler}}` or 503 when
+  a hard dependency (DB) is down. Never inlines credentials or upstream error
+  bodies. `GET /health` stays the unauthenticated liveness probe.
+- `LOG_FORMAT=text` (default, byte-for-byte today's format) or `json` for
+  structured logs carrying `request_id` (from/into the `X-Request-ID` header)
+  and `job_id` (set around each job's processing).
+
+## 21. Abstraction seams (Epic H)
+
+Swappable drivers behind published interfaces (see ENGINE.md "Abstraction
+seams"). Every key defaults to the current driver — an unconfigured instance is
+unchanged. Each factory fails **closed to the working default driver** for an
+empty or unknown value (there is no null tracker/VCS/runtime steady state), so a
+typo can never silently disable ClickUp/GitHub/the CLI.
+
+| Env var | Default | Meaning |
+| --- | --- | --- |
+| `TRACKER_PROVIDER` | `clickup` | issue tracker: `clickup` (default, today's behavior) or `jira` (scaffold → inert, degrades to dashboard-only). Empty/unknown → `clickup`. |
+| `VCS_PROVIDER` | `github` | version-control / PR host: `github` (default) or `gitlab` (scaffold → inert PR ops, PAT-only, clone still works). Empty/unknown → `github`. |
+| `AGENT_RUNTIME` | `cli` | agent implementation: `cli` (default, the `claude -p` subprocess) or `agent-sdk` (scaffold → raises on run). Empty/unknown → `cli`. |
+
+`ANALYTICS_PROVIDER` (§8) is the fourth seam (H4), already delivered by B3;
+unlike the three above it DOES have a null steady state (empty = no analytics,
+verdicts stay `unmeasured`), which is why it alone defaults to empty.
+
+The Jira/GitLab mapping notes and the Agent-SDK migration sketch live in
+`docs/TRACKER-JIRA.md`, `docs/VCS-GITLAB.md`, and `docs/CONVERSATIONS.md` §7.
+
+## Appendix — Example configuration: the original Gumo instance
+
+The values that used to ship as code defaults, now purely this one customer's
+config. Use them as a worked example:
+
+```
+SENTRY_ORG=gumo
+SENTRY_API_BASE=https://de.sentry.io/api/0     # EU-region org
+PUBLIC_BASE_URL=https://gumo.co.in/brain
+PRODUCT_NAME=Gumo
+MEMORY_CANONICAL_PROJECT=gumo
+CLICKUP_LIST_ID=901615853762                   # "Sentry Autofix" list
+CLICKUP_STAGE_FIELD_MAP={"0": "Brief", "1": "PRD", "2": "PRD", "3": "Contract", "4": "Grounding", "5": "build", "6": "build", "7": "Integration", "8": "Tech Review", "9": "Launch", "shipped": "Dogfood", "merged": "Complete"}
+CLICKUP_REPO_STAGE_MAP={"manrock007/gumoserver": "Backend", "manrock007/gumowebclient": "Frontend - Web", "manrock007/gumoclient": "Frontend - App"}
+CLICKUP_PR_FIELD_MAP={"manrock007/gumoserver": "Backend PR", "manrock007/gumowebclient": "Web PR", "manrock007/gumoclient": "App PR"}
+CLICKUP_DOC_FIELD_MAP={"P1-prd.md": "PRD Doc", "P3-design.md": "Contract Doc"}
+CLICKUP_FOLDER_FIELD=PRD Folder
+CLICKUP_FRICTION_FIELD=Gumo Workflow Improvements
+CLICKUP_FLAG_FIELD=Flag name
+CLICKUP_METRIC_FIELD=Success metric
+REPO_MAP={"gumo": {"repo": "manrock007/gumoserver", "base": "master"}, "web": {"repo": "manrock007/gumowebclient", "base": "dev", "setup_cmd": "npm ci", "test_cmd": "npm test", "allow": ["Bash(npm:*)", "Bash(npx:*)", "Bash(node:*)"]}, "react-native": {"repo": "manrock007/gumoclient", "base": "master", "setup_cmd": "cd codebase/Gumo && npm ci", "test_cmd": "cd codebase/Gumo && npx jest --ci", "allow": ["Bash(npm:*)", "Bash(npx:*)", "Bash(node:*)", "Bash(cd:*)"]}, "gumo-video-analyser": {"repo": "manrock007/gumo_video_analyser", "base": "main"}}
+```
+
+Business-context example (dashboard context panel / `BUSINESS_CONTEXT`):
+
+```
+Gumo is one product built across three main repositories:
+- `gumo` (manrock007/gumoserver) — the Django backend: API, data models,
+  business logic. This is the canonical repo hosting product-scope memory.
+- `web` (manrock007/gumowebclient) — the web client.
+- `react-native` (manrock007/gumoclient) — the React Native mobile app.
+The clients consume the backend's API; cross-repo features ship server-first,
+then clients. Deeper, versioned product knowledge lives in product memory.
+```

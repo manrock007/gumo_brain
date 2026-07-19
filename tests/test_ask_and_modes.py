@@ -146,6 +146,138 @@ class TestAutoAdvance:
         assert worker.engine._auto_advance_ok(job, 7, self.BOILER, None, []) is False
 
 
+class TestAutoAdvanceGuardsUnderAutonomy:
+    """Epic C2: the invariant guards survive EVERY autonomy path — an
+    always_auto pin or a level >= AUTONOMY_AUTO_LEVEL cell auto-advances a
+    clean, guard-passing STAGE_DONE, and nothing else."""
+
+    BOILER = TestAutoAdvance.BOILER
+    REAL_Q = TestAutoAdvance.REAL_Q
+
+    def _job(self, worker, job_id, stage=7, mode="full", **fields):
+        store = worker.store
+        ws = store.workspace_get_by_slug("aw") or store.workspace_create("aw", "AW")
+        worker.intake_feature(job_id, title="F", project="web", request="r",
+                              gate_mode=mode)
+        store.set_fields(job_id, stage=stage, workspace_id=ws["id"], **fields)
+        return store.get(job_id), ws["id"]
+
+    def test_always_auto_pin_advances_full_mode(self, worker):
+        job, ws = self._job(worker, "feat-au1", stage=7)
+        worker.store.autonomy_pin_set(ws, 7, "always_auto", "dashboard:boss")
+        assert worker.engine._auto_advance_ok(job, 7, self.BOILER, None, []) is True
+
+    def test_always_auto_pin_reaches_stages_outside_light_set(self, worker):
+        job, ws = self._job(worker, "feat-au2", stage=3)
+        worker.store.autonomy_pin_set(ws, 3, "always_auto", "dashboard:boss")
+        assert worker.engine._auto_advance_ok(job, 3, self.BOILER, None, []) is True
+
+    def test_always_auto_pin_never_covers_stage_9(self, worker):
+        job, ws = self._job(worker, "feat-au3", stage=9)
+        worker.store.autonomy_pin_set(ws, 9, "always_auto", "dashboard:boss")
+        assert worker.engine._auto_advance_ok(job, 9, self.BOILER, None, []) is False
+
+    def test_always_gate_pin_parks_light_mode_boilerplate(self, worker):
+        job, ws = self._job(worker, "feat-au4", stage=7, mode="light")
+        worker.store.autonomy_pin_set(ws, 7, "always_gate", "dashboard:boss")
+        assert worker.engine._auto_advance_ok(job, 7, self.BOILER, None, []) is False
+
+    def test_guards_hold_under_always_auto_pin(self, worker):
+        job, ws = self._job(worker, "feat-au5", stage=7)
+        worker.store.autonomy_pin_set(ws, 7, "always_auto", "dashboard:boss")
+        eng = worker.engine
+        # conflicted mid-run human edit
+        assert eng._auto_advance_ok(job, 7, self.BOILER, None, ["P4-plan.md"]) is False
+        # mirror down
+        worker.store.set_fields("feat-au5", mirror_ok=0)
+        assert eng._auto_advance_ok(worker.store.get("feat-au5"), 7,
+                                    self.BOILER, None, []) is False
+        worker.store.set_fields("feat-au5", mirror_ok=1)
+        # real (non-boilerplate) questions
+        assert eng._auto_advance_ok(worker.store.get("feat-au5"), 7,
+                                    self.REAL_Q, None, []) is False
+        # first clean run after an explicit /redo of this stage
+        worker.store.guidance_add("feat-au5", 7, "redo", "tighter", "dashboard")
+        assert eng._auto_advance_ok(worker.store.get("feat-au5"), 7,
+                                    self.BOILER, None, []) is False
+
+    def test_p5_without_pr_parks_under_pin(self, worker):
+        job, ws = self._job(worker, "feat-au6", stage=5)
+        worker.store.autonomy_pin_set(ws, 5, "always_auto", "dashboard:boss")
+        eng = worker.engine
+        assert eng._auto_advance_ok(job, 5, self.BOILER, None, []) is False
+        assert eng._auto_advance_ok(job, 5, self.BOILER,
+                                    "https://github.com/x/y/pull/1", []) is True
+
+    def test_level_3_advances_only_with_the_opt_in(self, worker):
+        import time
+        job, ws = self._job(worker, "feat-au7", stage=7)
+        worker.store.autonomy_score_upsert(ws, "web", 7, 3, 0.95, "{}", 9, time.time())
+        eng = worker.engine
+        # default AUTONOMY_AUTO_LEVEL=0: computed levels never auto-advance
+        assert eng._auto_advance_ok(job, 7, self.BOILER, None, []) is False
+        worker.settings.autonomy_auto_level = 3
+        assert eng._auto_advance_ok(job, 7, self.BOILER, None, []) is True
+        # guards still veto at level 3
+        assert eng._auto_advance_ok(job, 7, self.BOILER, None, ["P1-prd.md"]) is False
+        assert eng._auto_advance_ok(job, 7, self.REAL_Q, None, []) is False
+
+    def test_level_below_the_bar_parks(self, worker):
+        import time
+        job, ws = self._job(worker, "feat-au8", stage=7)
+        worker.settings.autonomy_auto_level = 3
+        worker.store.autonomy_score_upsert(ws, "web", 7, 2, 0.8, "{}", 9, time.time())
+        assert worker.engine._auto_advance_ok(job, 7, self.BOILER, None, []) is False
+
+    def test_after_run_records_reason_and_audit_event(self, worker, monkeypatch, tmp_path):
+        """C3: the auto-advance carries its resolution reason into the
+        guidance entry AND lands an INSERT-only autonomy_events row."""
+        eng = worker.engine
+        job, ws = self._job(worker, "feat-au9", stage=3)
+        worker.store.autonomy_pin_set(ws, 3, "always_auto", "dashboard:boss")
+        run_id = worker.store.stage_run_open("feat-au9", 3, 1, None)
+
+        class Raw:
+            status = "ok"
+            text = ("STAGE_DONE:\nresults\n## Questions\n"
+                    "1. Approve and continue to the next stage?")
+            meta = {}
+
+        async def truthy(*a, **k):
+            return True
+
+        async def empty(*a, **k):
+            return ""
+
+        async def empty_list(*a, **k):
+            return []
+
+        async def anoop(*a, **k):
+            return None
+
+        monkeypatch.setattr(eng, "_checkpoint", truthy)
+        monkeypatch.setattr(eng.sync, "push", empty_list)
+        monkeypatch.setattr(eng.sync, "commit_file", anoop)
+        monkeypatch.setattr(eng, "_evidence", empty)
+        monkeypatch.setattr(eng, "_comment", anoop)
+        result = asyncio.run(
+            eng._after_run(job, 3, run_id, None, "b", str(tmp_path), Raw(), "base"))
+        assert result == "requeue"
+        assert worker.store.get("feat-au9")["stage"] == 4
+        g = worker.store.guidance_for("feat-au9")[-1]
+        assert g["action"] == "auto" and "pin: always_auto" in g["text"]
+        ev = worker.store.autonomy_events_recent([ws])
+        assert ev[0]["kind"] == "auto_advance"
+        assert "pin: always_auto" in ev[0]["detail"]
+        assert ev[0]["job_id"] == "feat-au9" and ev[0]["actor"] == "engine"
+
+    def test_light_mode_constant_is_the_autonomy_one(self, worker):
+        from app import autonomy as autonomy_mod
+        from app.engine import Engine
+        assert Engine.LIGHT_MODE_AUTO_STAGES is autonomy_mod.LIGHT_MODE_AUTO_STAGES
+        assert worker.engine.LIGHT_MODE_AUTO_STAGES == {2, 4, 5, 6, 7, 8}
+
+
 class TestRequeuePropagation:
     def test_auto_advance_requeue_reaches_the_worker(self, worker, monkeypatch, tmp_path):
         """Regression (Seer round 3): _run_stage_inner must propagate _after_run's

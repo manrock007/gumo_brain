@@ -1,11 +1,37 @@
+import hashlib
 import json
 import re
+import secrets
 import sqlite3
 import time
 from contextlib import contextmanager
 
+from .dbdriver import DBDriver, SqliteDriver, PostgresDriver
+
+# Epic F1: driver-normalized exception aliases. Call sites catch
+# ``db.IntegrityError`` / ``db.OperationalError`` instead of ``sqlite3.*`` so
+# the same handler works under either backend. Defaults are the SQLite types
+# (the zero-config path + every test); a Postgres JobStore rebinds them to the
+# psycopg types in __init__.
+IntegrityError: type = sqlite3.IntegrityError
+OperationalError: type = sqlite3.OperationalError
+
 # owner/name + number out of a GitHub PR url (kept escape-simple on purpose)
 PR_URL_PARTS_RE = re.compile(r"github\.com/([\w.-]+/[\w.-]+)/pull/(\d+)")
+
+
+def normalize_role(role: str) -> str:
+    """Epic E3: legacy 'admin' reads as 'instance_admin'. A read-side shim so
+    the ~14 call sites reading users.role directly all see the new vocabulary
+    even for a row the one-shot migration somehow missed."""
+    return "instance_admin" if role == "admin" else role
+
+
+def _norm_user(row) -> dict:
+    d = dict(row)
+    if "role" in d:
+        d["role"] = normalize_role(d["role"])
+    return d
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -28,7 +54,10 @@ CREATE TABLE IF NOT EXISTS jobs (
     question TEXT DEFAULT '',        -- pending questions extracted from the analysis
     evidence TEXT DEFAULT '',        -- harness-captured gate evidence (diffstat etc.)
     guidance TEXT,                   -- latest human guidance (v1 task flow)
-    owner TEXT DEFAULT '',           -- feature owner (ClickUp user id or name)
+    owner TEXT DEFAULT '',           -- feature owner (ClickUp user id or name); legacy
+                                     -- computed alias of the DRI columns (Epic A2)
+    founder_dri TEXT DEFAULT '',     -- founder DRI: ClickUp person id (numeric) or username
+    dev_dri TEXT DEFAULT '',         -- dev DRI: same encoding
     related_jobs TEXT DEFAULT '',    -- comma-separated sibling pipelines (cross-repo)
     mirror_ok INTEGER NOT NULL DEFAULT 1,  -- ClickUp artifact mirror healthy?
     cu_list_id TEXT DEFAULT '',      -- home list of the ClickUp ticket (for subtasks)
@@ -123,11 +152,14 @@ CREATE TABLE IF NOT EXISTS workspaces (
     name TEXT NOT NULL,              -- display name, e.g. 'App'
     product_name TEXT NOT NULL DEFAULT '',
     workspace_context TEXT NOT NULL DEFAULT '',  -- injected into runs (§10 hierarchy)
-    canonical_project TEXT NOT NULL DEFAULT '',  -- project slug hosting .gumo/product
+    canonical_project TEXT NOT NULL DEFAULT '',  -- project slug hosting product-scope memory
     clickup_list_id TEXT NOT NULL DEFAULT '',    -- empty + disabled -> dashboard-only
     clickup_enabled INTEGER NOT NULL DEFAULT 0,
     slack_webhook_url TEXT NOT NULL DEFAULT '',  -- gate nudges when ClickUp is off (or always)
     gate_mode_default TEXT NOT NULL DEFAULT 'full',
+    require_attributed_answers TEXT NOT NULL DEFAULT 'auto',  -- Epic A1: auto | on | off
+    stage_role_map TEXT NOT NULL DEFAULT '',     -- Epic A3: JSON overrides; '' = inherit
+    gate_sla_hours INTEGER,                      -- Epic A5: NULL = inherit instance default
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
@@ -155,6 +187,7 @@ CREATE TABLE IF NOT EXISTS users (
     username TEXT NOT NULL UNIQUE,
     pw_hash TEXT NOT NULL,           -- argon2
     role TEXT NOT NULL DEFAULT 'member',  -- admin | member
+    clickup_user_id TEXT NOT NULL DEFAULT '',  -- Epic A1: ClickUp person id ↔ CtrlLoop identity
     disabled INTEGER NOT NULL DEFAULT 0,
     must_change_pw INTEGER NOT NULL DEFAULT 0,
     failed_attempts INTEGER NOT NULL DEFAULT 0,
@@ -177,6 +210,230 @@ CREATE TABLE IF NOT EXISTS app_config (
     updated_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS gate_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL,
+    stage INTEGER,
+    kind TEXT NOT NULL,        -- refused_unattributed | refused_wrong_role | admin_override
+                               -- | sla_nudge | sla_second_dri | sla_standup_flag
+    ref TEXT NOT NULL,         -- idempotence key: comment id, uuid, or 'run<stage_runs.id>-step<k>'
+    detail TEXT DEFAULT '',
+    actor TEXT DEFAULT '',     -- acting/refused identity, e.g. 'clickup:jane#123', 'dashboard:manish'
+    at REAL NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_gate_events_dedupe ON gate_events(job_id, kind, ref);
+
+-- Append-only audit of admin/config mutations that grant or move authority
+-- (user↔ClickUp identity links, workspace security config). INSERT-only —
+-- the minimal substrate the BUILD-PLAN invariant ("every new mutation is
+-- auditable") requires until Epic E4's full audit_log folds/exports it.
+CREATE TABLE IF NOT EXISTS admin_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL,              -- 'clickup_link' | 'workspace_config' | 'workspace_create'
+    target TEXT NOT NULL DEFAULT '', -- mutated entity: username / workspace id
+    detail TEXT DEFAULT '',          -- what changed (secrets redacted at the call site)
+    actor TEXT DEFAULT '',           -- acting principal, e.g. 'dashboard:<username>'
+    at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS metric_readings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL,            -- the watch job (INSERT-only, one row per read)
+    metric TEXT NOT NULL DEFAULT '',
+    metric_event TEXT NOT NULL DEFAULT '',
+    observed REAL,                   -- window-to-date aggregate at read time
+    window_day INTEGER,              -- 1..N day index inside the watch window
+    window_start REAL,               -- the watch_started_at this reading belongs to
+                                     -- (a /redo re-arms a NEW window; verdicts and
+                                     -- gate tables must never mix two windows)
+    detail TEXT NOT NULL DEFAULT '', -- provider note (series summary)
+    at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS outcomes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL UNIQUE,     -- the watch job (watch-<feature id>)
+    feature_id TEXT NOT NULL DEFAULT '',
+    workspace_id INTEGER,
+    metric TEXT NOT NULL DEFAULT '',
+    metric_event TEXT NOT NULL DEFAULT '',
+    target TEXT NOT NULL DEFAULT '',
+    observed REAL,
+    baseline REAL,                   -- pre-merge same-length window aggregate (when queryable)
+    window_days INTEGER,
+    verdict TEXT NOT NULL DEFAULT '',      -- moved | flat | regressed | unmeasured
+    verdict_inputs TEXT NOT NULL DEFAULT '{}',  -- JSON: formula inputs (transparent, auditable)
+    learning TEXT NOT NULL DEFAULT '',     -- filled by the human's /proceed answer
+    decided_by TEXT NOT NULL DEFAULT '',   -- via string, e.g. 'dashboard:manish' / 'clickup:jane'
+    decided_at REAL,
+    created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS autonomy_scores (
+    workspace_id INTEGER NOT NULL,
+    project TEXT NOT NULL,             -- repo slug (globally unique across workspaces)
+    stage INTEGER NOT NULL,            -- 0..8 (P9 never auto-advances — no cell)
+    level INTEGER NOT NULL DEFAULT 0,  -- 0 = always gate .. 3 = full auto-advance
+    score REAL NOT NULL DEFAULT 0,     -- composite 0..1 the level was derived from
+    inputs TEXT NOT NULL DEFAULT '{}', -- JSON: exact numbers the formula saw (transparency)
+    sample_runs INTEGER NOT NULL DEFAULT 0,
+    clawback_at REAL,                  -- set by clawback; runs before this never count again
+    computed_at REAL NOT NULL,
+    PRIMARY KEY (workspace_id, project, stage)
+);
+
+CREATE TABLE IF NOT EXISTS autonomy_pins (
+    workspace_id INTEGER NOT NULL,
+    stage INTEGER NOT NULL,
+    pin TEXT NOT NULL,                 -- 'always_gate' | 'always_auto'
+    set_by TEXT NOT NULL DEFAULT '',   -- 'dashboard:<username>'
+    set_at REAL NOT NULL,
+    PRIMARY KEY (workspace_id, stage)
+);
+
+CREATE TABLE IF NOT EXISTS autonomy_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id INTEGER,
+    project TEXT DEFAULT '',
+    stage INTEGER,
+    job_id TEXT DEFAULT '',
+    kind TEXT NOT NULL,                -- 'auto_advance' | 'pin_set' | 'pin_clear' | 'clawback' | 'level_change'
+    detail TEXT DEFAULT '',            -- e.g. 'P6 auto-advanced — level 3, 14 clean runs'
+    actor TEXT DEFAULT '',             -- 'engine' | 'dashboard:<username>'
+    at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_autonomy_events_ws_at ON autonomy_events(workspace_id, at);
+
+-- Epic D2: cross-ticket decision registry. Auto-registered from substantive
+-- gate answers (ref='g<guidance id>' — idempotent under replay), manual adds
+-- from the dashboard, Slack candidates (D3 — status='candidate', quarantined:
+-- never indexed, never in prompts, never in the default registry view until
+-- a human confirms). origin_author preserves the ORIGINAL author when a
+-- confirmation stamps decided_by with the ratifying human (auditability).
+CREATE TABLE IF NOT EXISTS decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL DEFAULT 'gate',    -- gate | manual | slack
+    status TEXT NOT NULL DEFAULT 'active',  -- active | superseded | candidate | dismissed
+    scope TEXT NOT NULL DEFAULT 'job',      -- job | repo | product | org
+    job_id TEXT NOT NULL DEFAULT '',
+    workspace_id INTEGER,
+    project TEXT NOT NULL DEFAULT '',
+    stage INTEGER,
+    title TEXT NOT NULL DEFAULT '',
+    text TEXT NOT NULL,                     -- decision + rationale (capped 4000 at write)
+    decided_by TEXT NOT NULL DEFAULT '',    -- via string: 'dashboard:<u>' | 'clickup:<u>' | 'slack:<u>'
+    origin_author TEXT NOT NULL DEFAULT '', -- original author when decided_by is later overwritten
+    links TEXT NOT NULL DEFAULT '[]',       -- JSON list of URLs
+    ref TEXT NOT NULL DEFAULT '',           -- idempotence key ('' allowed for manual adds)
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    updated_by TEXT NOT NULL DEFAULT ''
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_decisions_ref ON decisions(source, ref) WHERE ref != '';
+
+-- Epic D3: per-channel Slack read watermarks. Deliberately NOT app_config
+-- (that is the context-override KV). last_ts is Slack's ts string
+-- (lexicographic-safe); rows are created — initialized to NOW — when a
+-- channel is first allowlisted, so ingestion is forward-only by construction
+-- (no historical candidate flood).
+CREATE TABLE IF NOT EXISTS slack_cursors (
+    channel TEXT PRIMARY KEY,
+    last_ts TEXT NOT NULL DEFAULT '0',
+    updated_at REAL NOT NULL
+);
+
+-- Epic D1: people profile layer OVER users (1:1; never a parallel identity).
+-- Feeds intake-time DRI defaults + the prompt ownership block; gate
+-- enforcement still keys exclusively on the jobs.founder_dri/dev_dri columns.
+CREATE TABLE IF NOT EXISTS people (
+    user_id INTEGER PRIMARY KEY,          -- users(id)
+    person_role TEXT NOT NULL DEFAULT '', -- '' | founder | product | dev | design
+    areas TEXT NOT NULL DEFAULT '[]',     -- JSON list of {"kind": workspace|repo|area, "value": str}
+    authority TEXT NOT NULL DEFAULT '[]', -- JSON list of decision-authority tags
+    notes TEXT NOT NULL DEFAULT '',
+    updated_at REAL NOT NULL
+);
+
+-- Epic I0: durable inbox notices — every proactive-routine output lands here
+-- (risk alerts, proposal briefs, standup digests, planning packs, routine
+-- notes), never a silent side effect. UNIQUE(kind, dedupe_key) is BOTH the
+-- re-scan idempotence guard and the DISMISSAL MEMORY: rows are never deleted,
+-- so a dismissed key blocks re-insert forever; only a candidate whose
+-- contributing content changed (folded into the key) can surface again.
+CREATE TABLE IF NOT EXISTS inbox_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id INTEGER,            -- NULL = instance-wide (admin-only visibility)
+    kind TEXT NOT NULL,              -- 'risk_alert' | 'proposal' | 'standup_digest'
+                                     -- | 'planning_pack' | 'routine_note'
+    source TEXT NOT NULL DEFAULT '', -- emitting routine kind, e.g. 'risk_scan'
+    dedupe_key TEXT NOT NULL,        -- idempotence + dismissal memory (see above)
+    source_sig TEXT NOT NULL DEFAULT '',  -- coarse source signature for the
+                                     -- proposal recency guard (project:stage etc.)
+    title TEXT NOT NULL,
+    body TEXT NOT NULL DEFAULT '',   -- markdown; fed to prompts ONLY via adoption,
+                                     -- where it takes the untrusted-fragment
+                                     -- posture of a ClickUp description
+    refs TEXT NOT NULL DEFAULT '{}', -- JSON: {job_id, project, pr_url, ...}
+    status TEXT NOT NULL DEFAULT 'open',  -- open | dismissed | adopted | expired
+    status_by TEXT NOT NULL DEFAULT '',   -- 'dashboard:<user>' / 'engine'
+    status_at REAL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_inbox_items_dedupe ON inbox_items(kind, dedupe_key);
+
+-- Epic I5: friction becomes engine data, not just a ClickUp mirror. Rows come
+-- from run FRICTION: protocol lines AND human redos — written regardless of
+-- clickup_field_sync_enabled (the row is the record; the mirror stays
+-- best-effort visibility, the exact Epic B posture).
+CREATE TABLE IF NOT EXISTS frictions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL,
+    workspace_id INTEGER,
+    project TEXT NOT NULL DEFAULT '',
+    stage INTEGER,
+    source TEXT NOT NULL,            -- 'run' | 'redo'
+    text TEXT NOT NULL,
+    at REAL NOT NULL
+);
+
+-- Epic I1: the routine engine. One row per (kind, scope); builtin instance
+-- rows (workspace_id NULL) generalize the hardcoded loops. schedule='' on a
+-- builtin row means "derive from live settings at each tick" so env contracts
+-- (SWEEP_INTERVAL_HOURS, …) keep working; an operator-edited non-empty
+-- schedule wins. last_run_at doubles as the CAS claim column.
+-- NOTE (Epic F1): the COALESCE expression index needs Postgres expression-
+-- index syntax review when the Alembic baseline is generated.
+CREATE TABLE IF NOT EXISTS routines (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id INTEGER,             -- NULL = instance-scoped (builtin loops)
+    kind TEXT NOT NULL,               -- registry key
+    name TEXT NOT NULL DEFAULT '',
+    schedule TEXT NOT NULL,           -- 'every:<seconds>' | 'daily@HH:MM[;days=…]'
+                                      -- | 'weekly@<day> HH:MM' | '' (builtin: derive)
+    config TEXT NOT NULL DEFAULT '{}',-- JSON per-kind knobs (override settings)
+    enabled INTEGER NOT NULL DEFAULT 1,
+    last_run_at REAL,                 -- CAS claim column
+    last_status TEXT NOT NULL DEFAULT '',   -- ok | error | quiet | skipped
+    last_result TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_routines_scope
+    ON routines(kind, COALESCE(workspace_id, -1));
+
+CREATE TABLE IF NOT EXISTS routine_runs (    -- INSERT-only run history
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    routine_id INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    workspace_id INTEGER,
+    started_at REAL NOT NULL,
+    ended_at REAL,
+    status TEXT NOT NULL DEFAULT '',  -- ok | error | quiet | skipped
+    detail TEXT NOT NULL DEFAULT '',
+    items_emitted INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS gate_chat (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     job_id TEXT NOT NULL,
@@ -192,6 +449,50 @@ CREATE TABLE IF NOT EXISTS gate_chat (
     lane TEXT NOT NULL DEFAULT '',   -- '' = tool run | 'fast' = bundle-primed API call
     at REAL NOT NULL
 );
+
+-- Epic E2: scoped API tokens (ctl_ prefix). Only the sha256 of the token is
+-- stored — never the token. prefix_hint is a NON-SECRET display fragment.
+CREATE TABLE IF NOT EXISTS api_tokens (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    name TEXT NOT NULL DEFAULT '',
+    token_hash TEXT NOT NULL UNIQUE,      -- sha256 of the ctl_ token
+    prefix_hint TEXT NOT NULL DEFAULT '', -- 'ctl_…abcd' (last 4) — display only, not a secret leak
+    scopes TEXT NOT NULL DEFAULT '',      -- JSON list; '' = inherit the user's role (full)
+    created_at REAL NOT NULL,
+    last_used_at REAL,
+    expires_at REAL,                      -- NULL = no expiry
+    revoked_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_api_tokens_user ON api_tokens(user_id);
+
+-- Epic E1: single-use OIDC login transactions (state/nonce), pruned by TTL.
+-- DB-backed (no new signing secret; consistent with auth_sessions).
+CREATE TABLE IF NOT EXISTS auth_oidc_txn (
+    state TEXT PRIMARY KEY,
+    nonce TEXT NOT NULL,
+    redirect_after TEXT NOT NULL DEFAULT '/',
+    provider TEXT NOT NULL DEFAULT 'oidc',
+    created_at REAL NOT NULL
+);
+
+-- Epic E4: the canonical append-only audit log. SUPERSEDES admin_events
+-- (admin_event_add repoints here; a one-time boot-copy migrates legacy rows).
+-- Append-only: no update/delete helpers. `id` is the monotonic SIEM cursor.
+CREATE TABLE IF NOT EXISTS audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    at REAL NOT NULL,
+    actor TEXT NOT NULL DEFAULT '',        -- 'dashboard:<u>' | 'clickup:<u>#<id>' | 'token:<u>' | 'oidc:<u>' | 'engine'
+    actor_kind TEXT NOT NULL DEFAULT '',   -- user | token | engine | system
+    action TEXT NOT NULL,                  -- dotted verb (app/audit.py constants)
+    scope TEXT NOT NULL DEFAULT 'instance',-- instance | workspace | job
+    workspace_id INTEGER,
+    job_id TEXT NOT NULL DEFAULT '',
+    target TEXT NOT NULL DEFAULT '',       -- mutated entity id/name
+    channel TEXT NOT NULL DEFAULT '',      -- dashboard | clickup | api | system (gate channels)
+    detail TEXT NOT NULL DEFAULT ''        -- JSON; secrets redacted in audit_add
+);
+CREATE INDEX IF NOT EXISTS idx_audit_ws ON audit_log(workspace_id, id);
 """
 
 MIGRATIONS = {  # table -> columns added after that table first shipped (in-place upgrade)
@@ -220,11 +521,65 @@ MIGRATIONS = {  # table -> columns added after that table first shipped (in-plac
         "steer_note": "TEXT DEFAULT ''",  # human's live steer, moved into resume_answer on interrupt
         "auto_retries": "INTEGER NOT NULL DEFAULT 0",  # transient-error retries spent (max 1; human redo resets)
         "workspace_id": "INTEGER",  # owning workspace (Phase 2); NULL rows adopted by migration
+        "branch": "TEXT NOT NULL DEFAULT ''",  # git branch this job's work lives on (stamped at first use)
+        "founder_dri": "TEXT DEFAULT ''",  # Epic A2: ClickUp person id (numeric) or username
+        "dev_dri": "TEXT DEFAULT ''",      # Epic A2: same encoding; legacy `owner` = computed alias
+        "success_metric": "TEXT DEFAULT ''",   # Epic B1: metric name/goal captured at intake
+        "metric_target": "TEXT DEFAULT ''",    # Epic B1: target value as text (numeric when parseable)
+        "metric_window_days": "INTEGER",       # Epic B1: NULL = settings default at watch spawn
+        "metric_event": "TEXT DEFAULT ''",     # Epic B2: analytics event, harvested from P9 METRIC_EVENT:
+        "watch_started_at": "REAL",            # Epic B4: watch jobs only
+        "watch_deadline": "REAL",              # Epic B4: persisted so restarts never re-derive the window
+        # Epic I5: sentry-cluster substrate — the issue culprit, single-lined
+        # and capped at write (worker._process_sentry). Pre-upgrade sentry rows
+        # keep culprit='' — clusters only accumulate from upgrade forward.
+        "culprit": "TEXT DEFAULT ''",
+        # Epic G4: a ONE-SHOT budget override. Distinct from `forced` (which
+        # intake stamps on every human-submitted job to skip cooldown/grading):
+        # this is set only by an explicit admin re-kick and lets a single
+        # over-budget stage proceed, then is consumed (cleared) by the engine so
+        # the next over-budget stage re-parks. Default 0 = enforce the budget.
+        "budget_override": "INTEGER NOT NULL DEFAULT 0",
+        # Epic F2: multi-worker DB-claim queue (Postgres only). claimed_by is
+        # the worker that owns an in-flight run (default '' = unclaimed); boot
+        # crash recovery is scoped to a worker's own claims. Neutral defaults —
+        # SQLite never touches the claim path and existing rows are unaffected.
+        "claimed_by": "TEXT NOT NULL DEFAULT ''",
+        "claimed_at": "REAL",
+    },
+    "users": {
+        "clickup_user_id": "TEXT NOT NULL DEFAULT ''",  # Epic A1: ClickUp id ↔ CtrlLoop identity
+        # Epic E1: identity provider that owns this account. 'local' = password
+        # (the break-glass path — always present). SSO accounts carry the
+        # provider name and an UNUSABLE_PW sentinel pw_hash (no local password).
+        "auth_provider": "TEXT NOT NULL DEFAULT 'local'",
+        "external_id": "TEXT NOT NULL DEFAULT ''",  # provider-stable subject id (IdP `sub`)
+        "email": "TEXT NOT NULL DEFAULT ''",
+    },
+    "workspaces": {
+        "require_attributed_answers": "TEXT NOT NULL DEFAULT 'auto'",  # Epic A1: auto | on | off
+        "stage_role_map": "TEXT NOT NULL DEFAULT ''",                  # Epic A3: JSON; '' = inherit
+        "gate_sla_hours": "INTEGER",                                   # Epic A5: NULL = inherit
+        "analytics_provider": "TEXT NOT NULL DEFAULT ''",  # Epic B3: '' = none | 'mixpanel'
+        # SECRET AT REST — never returned by the API (workspaces.public redacts it)
+        "analytics_config": "TEXT NOT NULL DEFAULT '{}'",
+        # Epic D3: JSON list of Slack channel ids to ingest (FLAG'd feature);
+        # '' = ingestion off for this workspace. Channel ids are not secrets.
+        "slack_channels": "TEXT NOT NULL DEFAULT ''",
+        # Epic I4 (and the substrate Epic G4 extends into the warn/block
+        # ladder): per-workspace monthly budget in USD. NULL = inherit the
+        # instance BUDGET_MONTHLY_USD; 0 = no budget (spend alerts inert).
+        "budget_monthly_usd": "REAL",
     },
     "stage_runs": {
         "session_id": "TEXT DEFAULT ''",
         "resumed": "INTEGER NOT NULL DEFAULT 0",
         "transcript": "TEXT DEFAULT ''",
+    },
+    "workspace_members": {
+        # Epic E3 RBAC v2: workspace-scoped role + per-member repo restriction.
+        "role": "TEXT NOT NULL DEFAULT 'member'",   # admin | member | viewer
+        "repos": "TEXT NOT NULL DEFAULT '[]'",       # JSON slug list; [] = all repos in ws
     },
     "gate_chat": {
         "cost_usd": "REAL",
@@ -247,10 +602,47 @@ MIGRATIONS = {  # table -> columns added after that table first shipped (in-plac
 # markdown documents, not blobs; anything longer is truncated with a banner.
 ARTIFACT_CONTENT_MAX = 60000
 
+# Epic D4: FTS index body cap and the caps the registry enforces at write.
+FTS_BODY_MAX = 20000
+DECISION_TEXT_MAX = 4000
+DECISION_SCOPES = ("job", "repo", "product", "org")
+DECISION_STATUSES = ("active", "superseded", "candidate", "dismissed")
+
+# FTS terms are sanitized HARD before they reach a MATCH expression: FTS5
+# syntax injection is a crash vector, not a security one, but a crash in
+# prompt assembly would park the job.
+_FTS_TERM_RE = re.compile(r"[^0-9A-Za-z_]+")
+
 
 class JobStore:
-    def __init__(self, path: str):
-        self._path = path
+    def __init__(self, dsn: str, *, driver: DBDriver | None = None,
+                 pool_size: int = 5, pool_max_overflow: int = 5,
+                 statement_timeout_ms: int = 0):
+        """Back-compat: a plain filesystem path (what conftest and every test
+        pass) selects SqliteDriver; a ``postgresql://`` DSN selects
+        PostgresDriver; an explicit ``driver=`` wins over both. On Postgres the
+        DDL/bootstrap block below is skipped — Alembic owns the schema."""
+        self._path = dsn  # retained for back-compat / diagnostics
+        if driver is not None:
+            self._driver = driver
+        elif isinstance(dsn, str) and dsn.startswith(("postgres://", "postgresql://")):
+            self._driver = PostgresDriver(
+                dsn, pool_size=pool_size, max_overflow=pool_max_overflow,
+                statement_timeout_ms=statement_timeout_ms)
+        else:
+            self._driver = SqliteDriver(dsn)
+        # module-level driver-normalized exception aliases (see top of module)
+        global IntegrityError, OperationalError
+        IntegrityError = self._driver.IntegrityError
+        OperationalError = self._driver.OperationalError
+        # fts_enabled is set for BOTH backends: under owns_schema=True the whole
+        # DDL block (the only place SQLite assigns it) is skipped, so Postgres
+        # must default it False here or mem_search / _fts_upsert AttributeError.
+        # Postgres FTS (tsvector) is out of scope for F1 — retrieval degrades to
+        # absent exactly like a SQLite build without FTS5 (documented).
+        self.fts_enabled = False
+        if self._driver.owns_schema:
+            return  # Alembic owns schema + the one-shot data steps on Postgres
         with self._conn() as c:
             c.executescript(SCHEMA)
             for table, columns in MIGRATIONS.items():
@@ -258,16 +650,100 @@ class JobStore:
                 for col, ddl in columns.items():
                     if col not in cols:
                         c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
+                        if table == "jobs" and col == "branch":
+                            # one-time backfill on the upgrade boot (idempotent
+                            # by construction — it only runs when the column is
+                            # first added): every pre-upgrade job keeps the
+                            # EXACT branch it already pushed under the
+                            # historical 'brain/' prefix. Feature job ids
+                            # already carry 'feat-', so 'brain/feat-feat-<id>'
+                            # is deliberate — it matches what the engine built.
+                            c.execute("""UPDATE jobs SET branch = CASE kind
+                                WHEN 'feature' THEN 'brain/feat-' || issue_id
+                                WHEN 'memory'  THEN 'brain/memory-' || project
+                                WHEN 'sentry'  THEN 'brain/sentry-' || issue_id
+                                ELSE 'brain/' || issue_id END
+                                WHERE branch = ''""")
+            # after the migrations loop so upgraded DBs already carry the column:
+            # one ClickUp identity maps to at most one CtrlLoop user (Epic A1).
+            # Partial (non-empty only) — pre-existing rows are all '', so the
+            # index creation is always safe.
+            c.execute("""CREATE UNIQUE INDEX IF NOT EXISTS idx_users_clickup_id
+                         ON users(clickup_user_id) WHERE clickup_user_id != ''""")
+            # Epic E1: one external identity ↔ one user (partial — empty
+            # external_id rows, i.e. every local account, are exempt).
+            c.execute("""CREATE UNIQUE INDEX IF NOT EXISTS idx_users_external_id
+                         ON users(auth_provider, external_id) WHERE external_id != ''""")
+            # Epic E3 RBAC v2: instance-role vocabulary becomes
+            # instance_admin | member. One-shot rewrite of legacy 'admin' rows
+            # (idempotent — a second boot matches nothing). A read-side shim
+            # (normalize_role) additionally covers any row that slips through.
+            c.execute("UPDATE users SET role='instance_admin' WHERE role='admin'")
+            # Epic D4: the memory-retrieval index lives beside the data it
+            # mirrors. SQLite built without FTS5 (exotic) degrades to ABSENT
+            # retrieval — fail-open ONLY for a read enhancement: no control
+            # flow ever depends on the index; the prompt block just never
+            # renders. Candidates (D3) are never indexed by construction.
+            try:
+                c.execute("""CREATE VIRTUAL TABLE IF NOT EXISTS mem_fts USING fts5(
+                    kind UNINDEXED, key UNINDEXED, project UNINDEXED,
+                    workspace_id UNINDEXED, scope UNINDEXED, job_id UNINDEXED,
+                    path UNINDEXED, title, body, tokenize='porter unicode61')""")
+                self.fts_enabled = True
+            except self._driver.OperationalError:
+                self.fts_enabled = False
+            # Epic E4: one-time copy of legacy admin_events into the unified
+            # audit_log, gated on a DURABLE app_config marker (never on table
+            # emptiness — audit_retention pruning would otherwise re-copy). The
+            # shim (admin_event_add) mirrors NEW rows; this backfills OLD ones.
+            marker = c.execute(
+                "SELECT value FROM app_config WHERE key = 'audit_legacy_copied'"
+            ).fetchone()
+            if marker is None:
+                from .audit import LEGACY_KIND_MAP
+                legacy = c.execute(
+                    "SELECT kind, target, detail, actor, at FROM admin_events ORDER BY id"
+                ).fetchall()
+                for r in legacy:
+                    action = LEGACY_KIND_MAP.get(r["kind"], f"legacy.{r['kind']}")
+                    ak = "user" if (r["actor"] or "").startswith(
+                        ("dashboard:", "clickup:", "token:")) else "system"
+                    note = (r["detail"] or "")[:400]
+                    c.execute(
+                        "INSERT INTO audit_log (at, actor, actor_kind, action, scope, "
+                        "workspace_id, job_id, target, channel, detail) "
+                        "VALUES (?, ?, ?, ?, 'instance', NULL, '', ?, '', ?)",
+                        (r["at"], r["actor"] or "engine", ak, action, r["target"] or "",
+                         json.dumps({"kind": r["kind"], "note": note})))
+                c.execute(
+                    "INSERT INTO app_config (key, value, updated_at) VALUES "
+                    "('audit_legacy_copied', '1', ?)", (time.time(),))
 
-    @contextmanager
     def _conn(self):
-        conn = sqlite3.connect(self._path)
-        conn.row_factory = sqlite3.Row
-        try:
-            yield conn
-            conn.commit()
-        finally:
-            conn.close()
+        """Delegate to the active driver's connection context (Epic F1). The
+        SqliteDriver path is byte-for-byte the historical sqlite3.connect +
+        Row factory with commit-on-exit / close-in-finally."""
+        return self._driver.connect()
+
+    def _insert_returning(self, c, sql: str, params, pk: str = "id"):
+        """Execute an INSERT and return its new primary-key value.
+
+        On SQLite this is ``cur.lastrowid``; on Postgres the driver's cursor
+        has no lastrowid, so we append ``RETURNING <pk>`` and read it back. Only
+        the ~7 real lastrowid sites call this — a blanket RETURNING rewrite
+        would break every insert into a table whose PK is not named ``id``.
+
+        Returns None when 0 rows were inserted (an ON CONFLICT DO NOTHING that
+        deduped): callers that dedupe already branch on ``cur.rowcount == 0``
+        first, and on SQLite lastrowid is only trusted when rowcount != 0."""
+        if self._driver.backend == "postgres":
+            cur = c.execute(sql + f" RETURNING {pk}", params)
+            if not cur.rowcount:
+                return cur, None
+            row = cur.fetchone()
+            return cur, (row[pk] if row is not None else None)
+        cur = c.execute(sql, params)
+        return cur, (cur.lastrowid if cur.rowcount else None)
 
     # ---------- jobs ----------
 
@@ -382,6 +858,155 @@ class JobStore:
         """Jobs that must be re-enqueued on startup — SQLite is the queue of record."""
         return self.by_status(["received", "queued"])
 
+    def ping(self) -> bool:
+        """Epic F4: DB reachability probe for /health/ready. Returns True iff a
+        trivial SELECT 1 succeeds; never raises."""
+        try:
+            with self._conn() as c:
+                c.execute("SELECT 1").fetchone()
+            return True
+        except Exception:
+            return False
+
+    def metrics_snapshot(self) -> dict:
+        """Epic F4: read-only aggregations for /metrics, computed at scrape time
+        (metrics.py caches with a small TTL so a scrape can't DoS the DB). Every
+        aggregate degrades to empty on a missing table so a partial schema never
+        breaks the scrape."""
+        snap: dict = {
+            "jobs_by_status_kind": [], "queue_db_depth": 0, "runs_today": 0,
+            "stage_run_cost_usd_total": 0.0, "gate_latency": {},
+            "autonomy_levels": [], "watch_jobs": 0,
+        }
+        with self._conn() as c:
+            def _q(sql, params=()):
+                try:
+                    return c.execute(sql, params).fetchall()
+                except self._driver.OperationalError:
+                    return []
+            for r in _q("SELECT status, kind, COUNT(*) AS n FROM jobs "
+                        "GROUP BY status, kind"):
+                snap["jobs_by_status_kind"].append(
+                    {"status": r["status"], "kind": r["kind"], "n": r["n"]})
+            row = _q("SELECT COUNT(*) AS n FROM jobs WHERE status IN ('received','queued')")
+            snap["queue_db_depth"] = row[0]["n"] if row else 0
+            row = _q("SELECT COUNT(*) AS n FROM jobs WHERE kind='watch' "
+                     "AND status='watching'")
+            snap["watch_jobs"] = row[0]["n"] if row else 0
+            row = _q("SELECT COALESCE(SUM(cost_usd),0) AS s FROM stage_runs")
+            snap["stage_run_cost_usd_total"] = float(row[0]["s"]) if row else 0.0
+            # gate latency summary from answered gates (seconds)
+            row = _q("SELECT COUNT(*) AS n, "
+                     "COALESCE(SUM(gate_answered_at - gate_posted_at),0) AS s "
+                     "FROM stage_runs WHERE gate_posted_at IS NOT NULL "
+                     "AND gate_answered_at IS NOT NULL "
+                     "AND gate_answered_at >= gate_posted_at")
+            if row:
+                snap["gate_latency"] = {"count": row[0]["n"], "sum": float(row[0]["s"])}
+            for r in _q("SELECT workspace_id, project, stage, level "
+                        "FROM autonomy_scores"):
+                snap["autonomy_levels"].append(
+                    {"workspace_id": r["workspace_id"], "project": r["project"],
+                     "stage": r["stage"], "level": r["level"]})
+        snap["runs_today"] = self.runs_today()
+        return snap
+
+    def claim_next_job(self, worker_id: str) -> dict | None:
+        """Epic F2 (Postgres only): atomically claim the highest-priority
+        received/queued job for this worker. ONE statement removes the row from
+        the candidate set — it advances status to 'running', stamps claimed_by
+        and run_started_at — so a second worker can never re-claim it (the
+        double-dispatch window the design's blocker called out). SKIP LOCKED
+        skips rows another worker is mid-claim on.
+
+        Priority mirrors worker._priority_for: live sentry (0) > human (1) >
+        sweep (2), then oldest updated_at first. Watch jobs (status='watching')
+        are never candidates by construction.
+
+        On SQLite this returns None — SQLite keeps the single-consumer in-memory
+        queue and never calls this path."""
+        if self._driver.backend != "postgres":
+            return None
+        now = time.time()
+        prio = ("CASE WHEN kind='sentry' AND source='sweep' THEN 2 "
+                "WHEN kind='sentry' THEN 0 ELSE 1 END")
+        with self._conn() as c:
+            # NOTE: candidates are matched on status alone, NOT on claimed_by=''.
+            # A received/queued row is by definition not running, so any
+            # claimed_by on it is a stale corpse-marker (a crashed worker whose
+            # release_claim never fired and whose reaper/redo path left the field
+            # set). Requiring claimed_by='' here would make such a row PERMANENTLY
+            # unclaimable — defeating the F2 crash-recovery guarantee — since only
+            # a same-worker boot recovery or release_claim ever clears the field.
+            # The atomic UPDATE→'running' under FOR UPDATE SKIP LOCKED reassigns
+            # claimed_by, so mutual exclusion never depended on this predicate.
+            row = c.execute(
+                f"""UPDATE jobs SET status='running', claimed_by=?, claimed_at=?,
+                        run_started_at=?, updated_at=?
+                    WHERE issue_id = (
+                        SELECT issue_id FROM jobs
+                        WHERE status IN ('received','queued')
+                        ORDER BY {prio}, updated_at
+                        FOR UPDATE SKIP LOCKED
+                        LIMIT 1)
+                    RETURNING *""",
+                (worker_id, now, now, now),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def recover_worker_claims(self, worker_id: str) -> list[dict]:
+        """Epic F2: boot crash recovery SCOPED to one worker's own in-flight
+        runs. A restart of the same worker reclaims only the corpses it left
+        ('running' rows it had claimed) — cross-worker zombies are left to the
+        reaper (run_started_at + grace), so a live sibling's run is never
+        corrupted. Returns the rows reset to 'queued' (claim cleared)."""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM jobs WHERE status='running' AND claimed_by=?",
+                (worker_id,)).fetchall()
+            recovered = [dict(r) for r in rows]
+            for r in recovered:
+                c.execute(
+                    "UPDATE jobs SET status='queued', claimed_by='', claimed_at=NULL, "
+                    "updated_at=? WHERE issue_id=?",
+                    (time.time(), r["issue_id"]))
+        return recovered
+
+    def release_claim(self, issue_id: str, worker_id: str | None = None):
+        """Clear a job's claim (best-effort; used when a claimed job finishes or
+        is handed back so a later reaper/recovery doesn't treat it as owned).
+
+        Epic F2: when worker_id is given, the clear is guarded by
+        ``AND claimed_by = worker_id`` (like recover_worker_claims). This matters
+        when a re-queue-DURING-run path (Epic C2 auto-advance / P6 auto-skip /
+        transient-retry) flips the row to a claimable 'queued' state while this
+        worker is still finishing its post-run I/O: a sibling can legitimately
+        claim the row in that window, and an UNGUARDED release would then wipe
+        the SIBLING's ownership (claimed_by=''), defeating its fast per-worker
+        boot recovery. The guard makes release a no-op once someone else owns it.
+        worker_id=None keeps the unconditional clear the reaper needs to drop a
+        DEAD worker's claim (that claim is by definition not ours)."""
+        with self._conn() as c:
+            if worker_id is None:
+                c.execute(
+                    "UPDATE jobs SET claimed_by='', claimed_at=NULL WHERE issue_id=?",
+                    (issue_id,))
+            else:
+                c.execute(
+                    "UPDATE jobs SET claimed_by='', claimed_at=NULL "
+                    "WHERE issue_id=? AND claimed_by=?",
+                    (issue_id, worker_id))
+
+    def queued_count(self) -> int:
+        """Claimable backlog depth (received/queued). The /health gauge reads
+        this on multi-worker, where the in-process queue is bypassed and its
+        qsize() would report 0 — the DB row count is the real backlog."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT COUNT(*) AS n FROM jobs WHERE status IN ('received','queued')"
+            ).fetchone()
+            return row["n"] if row else 0
+
     def stale_running(self, older_than_seconds: float) -> list[dict]:
         cutoff = time.time() - older_than_seconds
         with self._conn() as c:
@@ -474,11 +1099,33 @@ class JobStore:
     def workspace_member_set(self, workspace_id: int, user_id: int, member: bool):
         with self._conn() as c:
             if member:
-                c.execute("INSERT OR IGNORE INTO workspace_members (workspace_id, user_id) VALUES (?, ?)",
+                c.execute("INSERT INTO workspace_members (workspace_id, user_id) VALUES (?, ?) "
+                          "ON CONFLICT(workspace_id, user_id) DO NOTHING",
                           (workspace_id, user_id))
             else:
                 c.execute("DELETE FROM workspace_members WHERE workspace_id = ? AND user_id = ?",
                           (workspace_id, user_id))
+
+    def workspace_member_row(self, workspace_id: int, user_id: int) -> dict | None:
+        """The membership row (Epic E3: role + repos), or None when not a member."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM workspace_members WHERE workspace_id = ? AND user_id = ?",
+                (int(workspace_id), int(user_id))).fetchone()
+            return dict(row) if row else None
+
+    def workspace_member_set_role(self, workspace_id: int, user_id: int,
+                                  role: str = "member", repos: list | None = None):
+        """Upsert a member with an explicit workspace role + repo allow-list."""
+        role = role if role in ("admin", "member", "viewer") else "member"
+        repos_json = json.dumps(repos or [])
+        with self._conn() as c:
+            c.execute(
+                """INSERT INTO workspace_members (workspace_id, user_id, role, repos)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(workspace_id, user_id) DO UPDATE SET
+                     role = excluded.role, repos = excluded.repos""",
+                (int(workspace_id), int(user_id), role, repos_json))
 
     def workspace_ids_for_user(self, user_id: int) -> set[int]:
         with self._conn() as c:
@@ -502,12 +1149,12 @@ class JobStore:
         cols = ", ".join(fields)
         marks = ", ".join("?" for _ in fields)
         with self._conn() as c:
-            cur = c.execute(
+            _, ws_id = self._insert_returning(
+                c,
                 f"INSERT INTO workspaces (slug, name{', ' + cols if cols else ''}, created_at, updated_at) "
                 f"VALUES (?, ?{', ' + marks if marks else ''}, ?, ?)",
                 (slug, name, *fields.values(), now, now),
             )
-            ws_id = cur.lastrowid
             for r in repos:
                 c.execute(
                     "INSERT INTO workspace_repos (workspace_id, slug, repo, base, setup_cmd, test_cmd, allow) "
@@ -517,7 +1164,8 @@ class JobStore:
                 )
             c.execute("UPDATE jobs SET workspace_id = ? WHERE workspace_id IS NULL", (ws_id,))
             for uid in user_ids:
-                c.execute("INSERT OR IGNORE INTO workspace_members (workspace_id, user_id) VALUES (?, ?)",
+                c.execute("INSERT INTO workspace_members (workspace_id, user_id) VALUES (?, ?) "
+                          "ON CONFLICT(workspace_id, user_id) DO NOTHING",
                           (ws_id, uid))
         return self.workspace_get(ws_id)
 
@@ -527,18 +1175,123 @@ class JobStore:
         with self._conn() as c:
             row = c.execute("SELECT * FROM users WHERE username = ?",
                             ((username or "").strip(),)).fetchone()
-            return dict(row) if row else None
+            return _norm_user(row) if row else None
 
     def user_count(self) -> int:
         with self._conn() as c:
             return c.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
 
+    def enabled_user_count(self) -> int:
+        """Enabled (non-disabled) users — drives the Epic G5 Max→API policy
+        warning (personal Max creds must not route a 2nd user's requests)."""
+        with self._conn() as c:
+            return c.execute(
+                "SELECT COUNT(*) AS n FROM users WHERE disabled = 0").fetchone()["n"]
+
     def user_list(self) -> list[dict]:
         """All users WITHOUT pw_hash — safe for the admin UI."""
         with self._conn() as c:
             rows = c.execute(
-                "SELECT id, username, role, disabled, must_change_pw, created_at, updated_at "
-                "FROM users ORDER BY username").fetchall()
+                "SELECT id, username, role, clickup_user_id, disabled, must_change_pw, "
+                "created_at, updated_at FROM users ORDER BY username").fetchall()
+            return [_norm_user(r) for r in rows]
+
+    def user_for_clickup_id(self, cu_id: str) -> dict | None:
+        """The ENABLED user a ClickUp identity maps to. Fails closed on
+        ambiguity: 0 or >1 matches both return None (the unique partial index
+        prevents duplicates, but a hand-edited DB must not silently pick one)."""
+        cu_id = str(cu_id or "").strip()
+        if not cu_id:
+            return None
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM users WHERE clickup_user_id = ? AND disabled = 0 LIMIT 2",
+                (cu_id,)).fetchall()
+            return _norm_user(rows[0]) if len(rows) == 1 else None
+
+    def user_by_external_id(self, provider: str, external_id: str) -> dict | None:
+        """The user an IdP identity maps to (Epic E1). Keyed on
+        (auth_provider, external_id) — the ONLY auto-link key for SSO."""
+        external_id = (external_id or "").strip()
+        if not external_id:
+            return None
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM users WHERE auth_provider = ? AND external_id = ? LIMIT 1",
+                (provider, external_id)).fetchone()
+            return _norm_user(row) if row else None
+
+    def instance_admin_count(self, enabled_only: bool = True) -> int:
+        """Instance admins (Epic E1/E3 — accept both legacy 'admin' and
+        'instance_admin' during the E3 transition). Guards 'never demote the
+        last admin'."""
+        q = "SELECT COUNT(*) AS n FROM users WHERE role IN ('admin','instance_admin')"
+        if enabled_only:
+            q += " AND disabled = 0"
+        with self._conn() as c:
+            return c.execute(q).fetchone()["n"]
+
+    def any_clickup_mapping(self) -> bool:
+        """Does ANY enabled user carry a ClickUp mapping? Drives the 'auto'
+        strictness of require_attributed_answers (Epic A1)."""
+        with self._conn() as c:
+            return c.execute(
+                "SELECT 1 FROM users WHERE clickup_user_id != '' AND disabled = 0 LIMIT 1"
+            ).fetchone() is not None
+
+    def user_for_dri(self, value: str) -> dict | None:
+        """Resolve a DRI value (ClickUp person id or CtrlLoop username) to a
+        user row. Numeric values are ClickUp ids first; a miss falls back to a
+        username lookup so a digits-only username stays reachable."""
+        value = str(value or "").strip()
+        if not value:
+            return None
+        if value.isdigit():
+            user = self.user_for_clickup_id(value)
+            if user is not None:
+                return user
+        return self.user_get(value)
+
+    # ---------- people profiles (Epic D1 — a layer over users, never identity) ----------
+
+    def person_get(self, user_id: int) -> dict | None:
+        with self._conn() as c:
+            row = c.execute("SELECT * FROM people WHERE user_id = ?",
+                            (int(user_id),)).fetchone()
+            return dict(row) if row else None
+
+    def person_set(self, user_id: int, **fields):
+        """UPSERT the profile row in a single statement. Callers validate via
+        people.validate_profile FIRST — a bad profile must change nothing."""
+        allowed = {k: v for k, v in fields.items()
+                   if k in ("person_role", "areas", "authority", "notes")}
+        if not allowed:
+            return
+        now = time.time()
+        cols = ", ".join(allowed)
+        marks = ", ".join("?" for _ in allowed)
+        sets = ", ".join(f"{k} = excluded.{k}" for k in allowed)
+        with self._conn() as c:
+            c.execute(
+                f"INSERT INTO people (user_id, {cols}, updated_at) "
+                f"VALUES (?, {marks}, ?) "
+                f"ON CONFLICT(user_id) DO UPDATE SET {sets}, "
+                f"updated_at = excluded.updated_at",
+                (int(user_id), *allowed.values(), now),
+            )
+
+    def people_all(self) -> list[dict]:
+        """Every user with their profile (empty defaults when no row) —
+        excludes pw_hash, mirrors user_list's safe shape."""
+        with self._conn() as c:
+            rows = c.execute(
+                """SELECT u.id, u.username, u.role, u.clickup_user_id, u.disabled,
+                          COALESCE(p.person_role, '') AS person_role,
+                          COALESCE(p.areas, '[]') AS areas,
+                          COALESCE(p.authority, '[]') AS authority,
+                          COALESCE(p.notes, '') AS notes
+                   FROM users u LEFT JOIN people p ON p.user_id = u.id
+                   ORDER BY u.username""").fetchall()
             return [dict(r) for r in rows]
 
     def user_create(self, username: str, pw_hash: str, role: str = "member",
@@ -598,7 +1351,7 @@ class JobStore:
                 return None
             c.execute("UPDATE auth_sessions SET last_seen = ? WHERE token_hash = ?",
                       (now, token_hash))
-            return dict(row)
+            return _norm_user(row)
 
     def auth_session_delete(self, token_hash: str):
         with self._conn() as c:
@@ -612,6 +1365,121 @@ class JobStore:
     def auth_sessions_prune(self):
         with self._conn() as c:
             c.execute("DELETE FROM auth_sessions WHERE expires_at <= ?", (time.time(),))
+
+    # ---------- scoped API tokens (Epic E2) ----------
+
+    def api_token_create(self, user_id: int, name: str = "", scopes: str = "",
+                         ttl_days: int = 0) -> tuple[str, dict]:
+        """Generate a `ctl_` token, store ONLY its sha256, return the plaintext
+        ONCE plus the row. prefix_hint is a non-secret display fragment
+        ('ctl_…<last4>') — never the leading chars (those are secret entropy)."""
+        token = "ctl_" + secrets.token_urlsafe(32)
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        prefix_hint = f"ctl_…{token[-4:]}"
+        now = time.time()
+        expires_at = (now + ttl_days * 86400) if ttl_days and ttl_days > 0 else None
+        with self._conn() as c:
+            _, _new_id = self._insert_returning(
+                c,
+                "INSERT INTO api_tokens (user_id, name, token_hash, prefix_hint, scopes, "
+                "created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (int(user_id), name or "", token_hash, prefix_hint, scopes or "", now, expires_at),
+            )
+            row = c.execute("SELECT id, user_id, name, prefix_hint, scopes, created_at, "
+                            "last_used_at, expires_at, revoked_at FROM api_tokens WHERE id = ?",
+                            (_new_id,)).fetchone()
+        return token, dict(row)
+
+    def api_token_verify(self, token: str) -> dict | None:
+        """Resolve a `ctl_` token to its ENABLED user row (+ token scopes/id).
+        Rejects revoked/expired tokens. Touches last_used_at (throttled)."""
+        token = (token or "").strip()
+        if not token.startswith("ctl_"):
+            return None
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        now = time.time()
+        with self._conn() as c:
+            row = c.execute(
+                """SELECT t.id AS token_id, t.scopes AS token_scopes, t.last_used_at,
+                          t.expires_at, t.revoked_at, u.*
+                   FROM api_tokens t JOIN users u ON u.id = t.user_id
+                   WHERE t.token_hash = ? AND u.disabled = 0""",
+                (token_hash,)).fetchone()
+            if row is None:
+                return None
+            row = dict(row)
+            if row.get("revoked_at") is not None:
+                return None
+            if row.get("expires_at") is not None and row["expires_at"] <= now:
+                return None
+            # throttle last_used writes to ~1/min (like auth_session last_seen)
+            last = row.get("last_used_at") or 0
+            if now - last > 60:
+                c.execute("UPDATE api_tokens SET last_used_at = ? WHERE id = ?",
+                          (now, row["token_id"]))
+        return row
+
+    def api_token_list(self, user_id: int) -> list[dict]:
+        """A user's tokens WITHOUT any hash — safe for the API."""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT id, user_id, name, prefix_hint, scopes, created_at, last_used_at, "
+                "expires_at, revoked_at FROM api_tokens WHERE user_id = ? ORDER BY id DESC",
+                (int(user_id),)).fetchall()
+            return [dict(r) for r in rows]
+
+    def api_token_revoke(self, token_id: int, user_id: int | None = None) -> bool:
+        """Revoke a token. When user_id is given, only that owner's token is
+        revoked (self-service); None = admin revoke of any token. Idempotent."""
+        now = time.time()
+        with self._conn() as c:
+            if user_id is None:
+                cur = c.execute(
+                    "UPDATE api_tokens SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL",
+                    (now, int(token_id)))
+            else:
+                cur = c.execute(
+                    "UPDATE api_tokens SET revoked_at = ? WHERE id = ? AND user_id = ? "
+                    "AND revoked_at IS NULL",
+                    (now, int(token_id), int(user_id)))
+            return cur.rowcount > 0
+
+    def user_has_active_token(self, user_id: int) -> bool:
+        """Any non-revoked, non-expired token — drives the Basic deprecation."""
+        now = time.time()
+        with self._conn() as c:
+            return c.execute(
+                "SELECT 1 FROM api_tokens WHERE user_id = ? AND revoked_at IS NULL "
+                "AND (expires_at IS NULL OR expires_at > ?) LIMIT 1",
+                (int(user_id), now)).fetchone() is not None
+
+    # ---------- OIDC login transactions (Epic E1) ----------
+
+    def oidc_txn_create(self, state: str, nonce: str, redirect_after: str = "/",
+                        provider: str = "oidc"):
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO auth_oidc_txn (state, nonce, redirect_after, provider, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (state, nonce, redirect_after or "/", provider, time.time()))
+
+    def oidc_txn_take(self, state: str, max_age_seconds: int = 600) -> dict | None:
+        """Single-use: fetch and DELETE the txn row. Returns None when missing or
+        older than max_age (fail closed — an expired/replayed state is refused)."""
+        with self._conn() as c:
+            row = c.execute("SELECT * FROM auth_oidc_txn WHERE state = ?", (state,)).fetchone()
+            if row is None:
+                return None
+            c.execute("DELETE FROM auth_oidc_txn WHERE state = ?", (state,))
+            row = dict(row)
+        if time.time() - (row.get("created_at") or 0) > max_age_seconds:
+            return None
+        return row
+
+    def oidc_txn_prune(self, max_age_seconds: int = 600):
+        with self._conn() as c:
+            c.execute("DELETE FROM auth_oidc_txn WHERE created_at <= ?",
+                      (time.time() - max_age_seconds,))
 
     # ---------- app config (project-context overrides, key-value) ----------
 
@@ -656,12 +1524,27 @@ class JobStore:
     # ---------- guidance log (INSERT-only) ----------
 
     def guidance_add(self, job_id: str, stage: int | None, action: str, text: str,
-                     via: str, artifact_sha: str = ""):
+                     via: str, artifact_sha: str = "") -> int:
+        """INSERT-only; returns the new row id (Epic D2: the decision
+        registry's auto-registration ref 'g<id>')."""
         with self._conn() as c:
-            c.execute(
+            _, gid = self._insert_returning(
+                c,
                 "INSERT INTO guidance_log (job_id, stage, action, text, via, artifact_sha, at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (job_id, stage, action, text, via, artifact_sha, time.time()),
             )
+            # Epic D4: human decisions are retrievable context. gate_events /
+            # admin_events are deliberately NEVER indexed (refusals and
+            # escalations must never reach model context as human decisions).
+            if action in ("proceed", "redo", "answer", "chat", "steer") and (text or "").strip():
+                row = c.execute("SELECT project, workspace_id FROM jobs WHERE issue_id = ?",
+                                (job_id,)).fetchone()
+                self._fts_upsert(
+                    c, "guidance", f"g{gid}",
+                    project=(row["project"] if row else "") or "",
+                    workspace_id=row["workspace_id"] if row else None,
+                    job_id=job_id, title=f"P{stage} {action}", body=text)
+            return gid
 
     def guidance_for(self, job_id: str) -> list[dict]:
         with self._conn() as c:
@@ -669,6 +1552,905 @@ class JobStore:
                 "SELECT * FROM guidance_log WHERE job_id = ? ORDER BY id", (job_id,)
             ).fetchall()
             return [dict(r) for r in rows]
+
+    # ---------- FTS memory retrieval (Epic D4, docs/ENGINE.md §16) ----------
+    # Indexed: active decisions, human guidance, live artifacts, memory files.
+    # Deliberately NOT indexed: gate_events/admin_events (refusals must never
+    # read as human decisions), candidate/dismissed/superseded decisions, and
+    # artifacts flagged 'superseded' (the engine banners them "will be
+    # regenerated"). Absence of FTS5 degrades retrieval to absent — additive
+    # prompt context only, no control flow depends on it.
+
+    def _fts_upsert(self, c, kind: str, key: str, *, project: str = "",
+                    workspace_id=None, scope: str = "", job_id: str = "",
+                    path: str = "", title: str = "", body: str = ""):
+        """DELETE+INSERT on an open connection (fts5 has no ON CONFLICT).
+        No-op when FTS is unavailable or the body is blank."""
+        if not self.fts_enabled:
+            return
+        body = (body or "").strip()
+        if not body:
+            return
+        c.execute("DELETE FROM mem_fts WHERE kind = ? AND key = ?", (kind, key))
+        c.execute(
+            "INSERT INTO mem_fts (kind, key, project, workspace_id, scope, "
+            "job_id, path, title, body) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (kind, key, project or "",
+             "" if workspace_id is None else str(int(workspace_id)),
+             scope or "", job_id or "", path or "", (title or "")[:300],
+             body[:FTS_BODY_MAX]),
+        )
+
+    def _fts_delete(self, c, kind: str, key: str):
+        if not self.fts_enabled:
+            return
+        c.execute("DELETE FROM mem_fts WHERE kind = ? AND key = ?", (kind, key))
+
+    def fts_upsert(self, kind: str, key: str, **kwargs):
+        """Standalone upsert (memory.refresh_cache uses this)."""
+        if not self.fts_enabled:
+            return
+        with self._conn() as c:
+            self._fts_upsert(c, kind, key, **kwargs)
+
+    def fts_delete(self, kind: str, key: str):
+        if not self.fts_enabled:
+            return
+        with self._conn() as c:
+            self._fts_delete(c, kind, key)
+
+    def fts_has(self, kind: str, project: str) -> bool:
+        """Any rows of a kind for a project? (cache-warm check for reindexing)."""
+        if not self.fts_enabled:
+            return False
+        with self._conn() as c:
+            return c.execute(
+                "SELECT 1 FROM mem_fts WHERE kind = ? AND project = ? LIMIT 1",
+                (kind, project)).fetchone() is not None
+
+    def fts_search(self, terms: list[str], *, project: str = "",
+                   workspace_id=None, exclude_job_id: str = "",
+                   kinds: tuple = (), limit: int = 5) -> list[dict]:
+        """Ranked snippet search for prompt assembly. Scoping is an explicit
+        per-kind whitelist (never one shared OR-chain — a project='' admission
+        must not leak workspace-scoped decisions into every run):
+        - guidance/artifact: exact project match (project-less rows excluded),
+          never the asking job's own rows;
+        - memory: exact project match;
+        - decision: workspace match OR scope='org' (candidates are simply not
+          in the index), never the asking job's own rows.
+        A malformed query must never fail a stage run → [] on any FTS error."""
+        if not self.fts_enabled:
+            return []
+        clean: list[str] = []
+        for t in terms or []:
+            for part in _FTS_TERM_RE.sub(" ", str(t or "")).split():
+                if part and part not in clean:
+                    clean.append(part)
+        if not clean:
+            return []  # MATCH '' raises — an empty term list is 'no results'
+        match = " OR ".join(f'"{t}"' for t in clean)
+        ws = "" if workspace_id is None else str(int(workspace_id))
+        excl = exclude_job_id or ""
+        # exclude rows of the asking job ONLY when an exclusion is requested —
+        # '' must not accidentally exclude job-less rows (manual decisions)
+        not_own = "(? = '' OR job_id != ?)"
+        where = ("("
+                 f"(kind IN ('guidance','artifact') AND project != '' "
+                 f" AND project = ? AND {not_own})"
+                 " OR (kind = 'memory' AND project = ?)"
+                 " OR (kind = 'decision' AND (scope = 'org' OR (? != '' AND workspace_id = ?))"
+                 f"     AND {not_own})"
+                 ")")
+        params: list = [match, project or "", excl, excl,
+                        project or "", ws, ws, excl, excl]
+        kind_clause = ""
+        if kinds:
+            marks = ",".join("?" for _ in kinds)
+            kind_clause = f" AND kind IN ({marks})"
+            params.extend(kinds)
+        params.append(int(limit))
+        try:
+            with self._conn() as c:
+                rows = c.execute(
+                    f"""SELECT kind, key, project, path, title,
+                               snippet(mem_fts, 8, '', '', ' … ', 24) AS snippet
+                        FROM mem_fts
+                        WHERE mem_fts MATCH ? AND {where}{kind_clause}
+                        ORDER BY bm25(mem_fts) LIMIT ?""",
+                    params).fetchall()
+                return [dict(r) for r in rows]
+        except self._driver.OperationalError:
+            return []
+
+    # ---------- decision registry (Epic D2, docs/ENGINE.md §16) ----------
+
+    def decision_add(self, source: str, text: str, *, ref: str = "",
+                     status: str = "active", scope: str = "job",
+                     job_id: str = "", workspace_id=None, project: str = "",
+                     stage: int | None = None, title: str = "",
+                     decided_by: str = "", links="[]",
+                     origin_author: str = "") -> int | None:
+        """INSERT OR IGNORE keyed on the partial UNIQUE (source, ref) index —
+        idempotent under any replay; a previously DISMISSED candidate's ref
+        row still exists, so it can never be re-created. Returns the new row
+        id, or None when deduped — detected via cur.rowcount, NEVER lastrowid
+        (an ignored insert leaves lastrowid at the previous insert's id).
+        Empty text is refused loudly (same posture as gate_event_add).
+        Active rows enter the FTS index in the same transaction; candidates
+        never do."""
+        text = (text or "").strip()
+        if not text:
+            raise ValueError("decision_add requires non-empty text")
+        text = text[:DECISION_TEXT_MAX]
+        if isinstance(links, (list, tuple)):
+            links = json.dumps([str(l) for l in links])
+        now = time.time()
+        with self._conn() as c:
+            # ON CONFLICT on the partial UNIQUE (source, ref) index — the WHERE
+            # matches the index predicate so a ref='' row (not in the index)
+            # never conflicts, exactly like the old INSERT OR IGNORE. Portable
+            # to Postgres, where OR IGNORE is invalid.
+            cur, did = self._insert_returning(
+                c,
+                """INSERT INTO decisions
+                     (source, status, scope, job_id, workspace_id, project, stage,
+                      title, text, decided_by, origin_author, links, ref,
+                      created_at, updated_at, updated_by)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(source, ref) WHERE ref != '' DO NOTHING""",
+                (source, status, scope, job_id, workspace_id, project, stage,
+                 (title or "")[:200], text, decided_by, origin_author,
+                 links or "[]", (ref or "").strip(), now, now, decided_by),
+            )
+            if cur.rowcount == 0:
+                return None  # deduped by (source, ref)
+            if status == "active":
+                self._fts_upsert(c, "decision", f"d{did}", project=project,
+                                 workspace_id=workspace_id, scope=scope,
+                                 job_id=job_id, path=f"decisions/#{did}",
+                                 title=title or f"{scope} decision",
+                                 body=f"{title}\n{text}".strip())
+            return did
+
+    def decision_get(self, decision_id: int) -> dict | None:
+        with self._conn() as c:
+            row = c.execute("SELECT * FROM decisions WHERE id = ?",
+                            (int(decision_id),)).fetchone()
+            return dict(row) if row else None
+
+    DECISION_EDIT_FIELDS = ("scope", "title", "text", "links", "decided_by",
+                            "project", "stage")
+
+    def decision_set_status(self, decision_id: int, from_statuses: list[str],
+                            to_status: str, updated_by: str, **fields) -> bool:
+        """CAS on status — the single-writer guard for confirm/dismiss/
+        supersede races (one UPDATE, WHERE status IN (...)). Returns True iff
+        this caller won. Syncs the FTS row: delete on leaving 'active',
+        insert on entering it. Extra fields (confirm-with-edits) are
+        whitelisted; callers validate values first."""
+        fields = {k: v for k, v in fields.items() if k in self.DECISION_EDIT_FIELDS}
+        if "text" in fields:
+            fields["text"] = str(fields["text"] or "")[:DECISION_TEXT_MAX]
+        if "title" in fields:
+            fields["title"] = str(fields["title"] or "")[:200]
+        if "links" in fields and isinstance(fields["links"], (list, tuple)):
+            fields["links"] = json.dumps([str(l) for l in fields["links"]])
+        marks = ",".join("?" for _ in from_statuses)
+        cols = "".join(f", {k} = ?" for k in fields)
+        with self._conn() as c:
+            cur = c.execute(
+                f"UPDATE decisions SET status = ?, updated_at = ?, updated_by = ?"
+                f"{cols} WHERE id = ? AND status IN ({marks})",
+                (to_status, time.time(), updated_by, *fields.values(),
+                 int(decision_id), *from_statuses),
+            )
+            if cur.rowcount != 1:
+                return False
+            row = c.execute("SELECT * FROM decisions WHERE id = ?",
+                            (int(decision_id),)).fetchone()
+            if to_status == "active" and row:
+                self._fts_upsert(c, "decision", f"d{decision_id}",
+                                 project=row["project"],
+                                 workspace_id=row["workspace_id"],
+                                 scope=row["scope"], job_id=row["job_id"],
+                                 path=f"decisions/#{decision_id}",
+                                 title=row["title"] or f"{row['scope']} decision",
+                                 body=f"{row['title']}\n{row['text']}".strip())
+            else:
+                self._fts_delete(c, "decision", f"d{decision_id}")
+            return True
+
+    @staticmethod
+    def _like_escape(q: str) -> str:
+        return (q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_"))
+
+    def decisions_query(self, *, q: str = "", scope: str = "", status: str = "",
+                        project: str = "", source: str = "",
+                        workspace_ids: list[int] | None = None,
+                        limit: int = 100, offset: int = 0) -> list[dict]:
+        """Registry view. workspace_ids=None = admin (all rows); a list =
+        member visibility — EXACTLY the prompt-admission predicate: rows of
+        the member's workspaces plus scope='org' rows (which reach every
+        member's prompts, so every member may see and read them); [] = org
+        rows only. Default status view excludes candidates AND dismissed
+        (inbox material / remembered rejections, not registry truth).
+        q is a LIKE filter with %/_ escaped (user-supplied search text) —
+        deliberately not FTS: the index excludes non-active rows, and a
+        status-filtered registry search must not depend on it."""
+        where, params = [], []
+        if scope:
+            where.append("scope = ?"); params.append(scope)
+        if status:
+            where.append("status = ?"); params.append(status)
+        else:
+            where.append("status IN ('active', 'superseded')")
+        if project:
+            where.append("project = ?"); params.append(project)
+        if source:
+            where.append("source = ?"); params.append(source)
+        if workspace_ids is not None:
+            if workspace_ids:
+                marks = ",".join("?" for _ in workspace_ids)
+                where.append(f"(scope = 'org' OR workspace_id IN ({marks}))")
+                params.extend(int(w) for w in workspace_ids)
+            else:
+                where.append("scope = 'org'")
+        if q.strip():
+            esc = f"%{self._like_escape(q.strip())}%"
+            where.append("(title LIKE ? ESCAPE '\\' OR text LIKE ? ESCAPE '\\')")
+            params.extend([esc, esc])
+        clause = " AND ".join(where) if where else "1=1"
+        with self._conn() as c:
+            rows = c.execute(
+                f"SELECT * FROM decisions WHERE {clause} "
+                f"ORDER BY id DESC LIMIT ? OFFSET ?",
+                (*params, int(limit), int(offset))).fetchall()
+            return [dict(r) for r in rows]
+
+    def decisions_for_job(self, job_id: str) -> list[dict]:
+        """This feature's own ACTIVE decisions — the P9 registry feed.
+        Superseded rows (incl. a re-intaken lap's, cleared by
+        _clear_pipeline_state) never resurface here."""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM decisions WHERE job_id = ? AND status = 'active' "
+                "ORDER BY id", (job_id,)).fetchall()
+            return [dict(r) for r in rows]
+
+    def decisions_recent_scoped(self, workspace_id: int, scopes: tuple,
+                                limit: int = 10) -> list[dict]:
+        """Recent active decisions for a prompt: org-scope rows are admitted
+        regardless of workspace_id; every other scope requires an exact
+        workspace match (callers skip this entirely when the job has no
+        stamped workspace — fail closed)."""
+        marks = ",".join("?" for _ in scopes)
+        with self._conn() as c:
+            rows = c.execute(
+                f"""SELECT * FROM decisions
+                    WHERE status = 'active' AND scope IN ({marks})
+                      AND (scope = 'org' OR workspace_id = ?)
+                    ORDER BY id DESC LIMIT ?""",
+                (*scopes, int(workspace_id), int(limit))).fetchall()
+            return [dict(r) for r in rows]
+
+    def decision_candidates(self, workspace_ids: list[int] | None,
+                            limit: int = 50) -> list[dict]:
+        """Parked Slack candidates for the inbox — oldest first, membership-
+        scoped (None = admin/all; [] = none: candidates are always workspace-
+        routed, so there is no org admission here)."""
+        with self._conn() as c:
+            if workspace_ids is None:
+                rows = c.execute(
+                    "SELECT * FROM decisions WHERE status = 'candidate' "
+                    "ORDER BY id LIMIT ?", (int(limit),)).fetchall()
+            elif not workspace_ids:
+                rows = []
+            else:
+                marks = ",".join("?" for _ in workspace_ids)
+                rows = c.execute(
+                    f"SELECT * FROM decisions WHERE status = 'candidate' "
+                    f"AND workspace_id IN ({marks}) ORDER BY id LIMIT ?",
+                    (*[int(w) for w in workspace_ids], int(limit))).fetchall()
+            return [dict(r) for r in rows]
+
+    # ---------- audit_log (Epic E4 — canonical, append-only, SIEM cursor) ----------
+
+    # Allow-listed detail fields (redaction by allow-list, not denylist — a call
+    # site can never leak a secret by forgetting to redact a new key).
+    _AUDIT_DETAIL_ALLOW = frozenset({
+        "action", "method", "field", "fields", "from", "to", "role", "reason",
+        "verdict", "stage", "channel", "name", "ttl_days", "scopes", "count",
+        "level", "pin", "project", "provider", "state", "amount", "pct",
+        "budget", "spent", "clickup_user_id", "username", "kind", "note",
+        "forced", "override",
+    })
+
+    @classmethod
+    def _audit_redact(cls, detail: dict | None) -> str:
+        if not detail:
+            return "{}"
+        clean = {k: v for k, v in detail.items() if k in cls._AUDIT_DETAIL_ALLOW}
+        return json.dumps(clean, default=str)[:4000]
+
+    def audit_add(self, action: str, *, actor: str = "engine", actor_kind: str = "system",
+                  scope: str = "instance", workspace_id=None, job_id: str = "",
+                  target: str = "", channel: str = "", detail: dict | None = None):
+        """Append one audit row. Detail is redacted by allow-list here so no
+        call site can leak a secret. Append-only — no update/delete."""
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO audit_log (at, actor, actor_kind, action, scope, "
+                "workspace_id, job_id, target, channel, detail) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (time.time(), actor, actor_kind, action, scope, workspace_id,
+                 job_id or "", target or "", channel or "", self._audit_redact(detail)))
+
+    def audit_page(self, after_id: int = 0, limit: int = 500,
+                   workspace_ids: list[int] | None = None) -> list[dict]:
+        """Cursor-paged rows with id > after_id (ascending — monotonic SIEM
+        export). workspace_ids scopes to a workspace-admin's memberships;
+        instance-scoped rows (workspace_id IS NULL) are always visible to an
+        unscoped (instance-admin) reader; a scoped reader sees only their ws
+        rows (never the instance-wide firehose)."""
+        limit = max(1, min(int(limit), 5000))
+        q = "SELECT * FROM audit_log WHERE id > ?"
+        params: list = [int(after_id)]
+        if workspace_ids is not None:
+            if not workspace_ids:
+                return []
+            marks = ",".join("?" for _ in workspace_ids)
+            q += f" AND workspace_id IN ({marks})"
+            params += list(workspace_ids)
+        q += " ORDER BY id ASC LIMIT ?"
+        params.append(limit)
+        with self._conn() as c:
+            return [dict(r) for r in c.execute(q, params).fetchall()]
+
+    def audit_recent(self, limit: int = 100,
+                     workspace_ids: list[int] | None = None) -> list[dict]:
+        """Newest-first for the dashboard viewer (same scoping as audit_page)."""
+        q = "SELECT * FROM audit_log"
+        params: list = []
+        if workspace_ids is not None:
+            if not workspace_ids:
+                return []
+            marks = ",".join("?" for _ in workspace_ids)
+            q += f" WHERE workspace_id IN ({marks})"
+            params += list(workspace_ids)
+        q += " ORDER BY id DESC LIMIT ?"
+        params.append(max(1, min(int(limit), 1000)))
+        with self._conn() as c:
+            return [dict(r) for r in c.execute(q, params).fetchall()]
+
+    def audit_prune(self, older_than_days: int):
+        if older_than_days and older_than_days > 0:
+            cutoff = time.time() - older_than_days * 86400
+            with self._conn() as c:
+                c.execute("DELETE FROM audit_log WHERE at < ?", (cutoff,))
+
+    # ---------- Slack ingest cursors (Epic D3) ----------
+
+    def slack_cursor_get(self, channel: str) -> str | None:
+        """The channel's watermark, or None when the channel was never
+        initialized (the loop initializes to NOW and skips — forward-only)."""
+        with self._conn() as c:
+            row = c.execute("SELECT last_ts FROM slack_cursors WHERE channel = ?",
+                            (channel,)).fetchone()
+            return row["last_ts"] if row else None
+
+    def slack_cursor_set(self, channel: str, ts: str):
+        with self._conn() as c:
+            c.execute(
+                """INSERT INTO slack_cursors (channel, last_ts, updated_at)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(channel) DO UPDATE SET
+                     last_ts = excluded.last_ts, updated_at = excluded.updated_at""",
+                (channel, str(ts), time.time()))
+
+    def slack_cursor_init(self, channel: str, ts: str):
+        """First-allowlist initialization: INSERT OR IGNORE — an existing
+        watermark (channel re-added) is never moved."""
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO slack_cursors (channel, last_ts, updated_at) "
+                "VALUES (?, ?, ?) ON CONFLICT(channel) DO NOTHING",
+                (channel, str(ts), time.time()))
+
+    # ---------- gate events (Epic A: audit substrate + idempotence store) ----------
+    # NOT guidance_log: guidance renders into stage prompts, and refusals /
+    # escalations must never leak into model context as "human decisions".
+
+    def gate_event_add(self, job_id: str, kind: str, ref: str, stage: int | None = None,
+                       detail: str = "", actor: str = "") -> bool:
+        """Record a gate event, idempotently keyed on (job_id, kind, ref).
+        Returns True only when the row is NEW — callers key one-time actions
+        (refusal replies, escalation sends) off that. An empty ref would make
+        any two same-kind events silently dedupe — refused loudly."""
+        ref = str(ref or "").strip()
+        if not ref:
+            raise ValueError("gate_event_add requires a non-empty ref")
+        with self._conn() as c:
+            cur = c.execute(
+                """INSERT INTO gate_events (job_id, stage, kind, ref, detail, actor, at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(job_id, kind, ref) DO NOTHING""",
+                (job_id, stage, kind, ref, detail, actor, time.time()),
+            )
+            return cur.rowcount == 1
+
+    def admin_event_add(self, kind: str, target: str = "", detail: str = "",
+                        actor: str = ""):
+        """Append-only admin/config mutation audit (see the admin_events DDL).
+        Callers redact secret values BEFORE they reach detail.
+
+        Epic E4: admin_events is SUPERSEDED by audit_log. This shim keeps the
+        legacy INSERT (one release, rollback safety) AND mirrors the event into
+        the unified audit_log so the export/viewer is complete without every
+        legacy call site being rewritten at once."""
+        now = time.time()
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO admin_events (kind, target, detail, actor, at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (kind, target, detail, actor, now),
+            )
+        # mirror to audit_log (actor_kind derived from the actor prefix)
+        from .audit import LEGACY_KIND_MAP
+        action = LEGACY_KIND_MAP.get(kind, f"legacy.{kind}")
+        actor_kind = "user" if (actor or "").startswith(("dashboard:", "clickup:", "token:")) else "system"
+        self.audit_add(action, actor=actor or "engine", actor_kind=actor_kind,
+                       target=target, detail={"kind": kind, "note": detail[:400] if detail else ""})
+
+    def admin_events_recent(self, limit: int = 100) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM admin_events ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def gate_events_for(self, job_id: str) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM gate_events WHERE job_id = ? ORDER BY id", (job_id,)
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    # ---------- inbox items (Epic I0: durable routine outputs) ----------
+
+    def inbox_item_add(self, kind: str, dedupe_key: str, title: str,
+                       body: str = "", refs: dict | str | None = None,
+                       workspace_id: int | None = None, source: str = "",
+                       source_sig: str = "") -> bool:
+        """INSERT OR IGNORE keyed on UNIQUE(kind, dedupe_key) — returns True
+        only when the row is NEW (callers key Slack sends off it, exactly like
+        gate_event_add). The same index is the DISMISSAL MEMORY: a dismissed
+        key blocks re-insert forever. Empty dedupe_key is refused loudly."""
+        dedupe_key = str(dedupe_key or "").strip()
+        if not dedupe_key:
+            raise ValueError("inbox_item_add requires a non-empty dedupe_key")
+        if isinstance(refs, dict):
+            refs = json.dumps(refs)
+        now = time.time()
+        with self._conn() as c:
+            cur = c.execute(
+                """INSERT INTO inbox_items
+                     (workspace_id, kind, source, dedupe_key, source_sig, title,
+                      body, refs, status, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)
+                   ON CONFLICT(kind, dedupe_key) DO NOTHING""",
+                (workspace_id, kind, source, dedupe_key, source_sig,
+                 (title or "")[:300], body or "", refs or "{}", now, now),
+            )
+            return cur.rowcount == 1
+
+    def inbox_item_by_key(self, kind: str, dedupe_key: str) -> dict | None:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM inbox_items WHERE kind = ? AND dedupe_key = ?",
+                (kind, dedupe_key)).fetchone()
+            return dict(row) if row else None
+
+    def inbox_item_get(self, item_id: int) -> dict | None:
+        with self._conn() as c:
+            row = c.execute("SELECT * FROM inbox_items WHERE id = ?",
+                            (int(item_id),)).fetchone()
+            return dict(row) if row else None
+
+    def inbox_items_open(self, workspace_ids: list[int] | None,
+                         kinds: tuple = (), limit: int = 200) -> list[dict]:
+        """Open notices, membership-scoped: None = all rows incl. instance-wide
+        NULL-workspace ones (admins); a list = only those workspaces (members
+        never see NULL-workspace rows); [] = none."""
+        where, params = ["status = 'open'"], []
+        if workspace_ids is not None:
+            if not workspace_ids:
+                return []
+            marks = ",".join("?" for _ in workspace_ids)
+            where.append(f"workspace_id IN ({marks})")
+            params.extend(int(w) for w in workspace_ids)
+        if kinds:
+            marks = ",".join("?" for _ in kinds)
+            where.append(f"kind IN ({marks})")
+            params.extend(kinds)
+        with self._conn() as c:
+            rows = c.execute(
+                f"SELECT * FROM inbox_items WHERE {' AND '.join(where)} "
+                f"ORDER BY id DESC LIMIT ?", (*params, int(limit))).fetchall()
+            return [dict(r) for r in rows]
+
+    def inbox_item_resolve(self, item_id: int, to_status: str, by: str,
+                           extra_refs: dict | None = None) -> bool:
+        """CAS on the ONLY state transition these rows have: open → dismissed/
+        adopted/expired. Returns True iff this caller won (the loser of a
+        dismiss/adopt race gets a 409 upstream). The row itself (status_by/
+        status_at, never deleted) is the audit record. extra_refs merges into
+        the stored refs JSON."""
+        now = time.time()
+        with self._conn() as c:
+            row = c.execute("SELECT refs FROM inbox_items WHERE id = ?",
+                            (int(item_id),)).fetchone()
+            refs = "{}" if row is None else (row["refs"] or "{}")
+            if extra_refs:
+                try:
+                    merged = json.loads(refs)
+                    if not isinstance(merged, dict):
+                        merged = {}
+                except (ValueError, TypeError):
+                    merged = {}
+                merged.update(extra_refs)
+                refs = json.dumps(merged)
+            cur = c.execute(
+                """UPDATE inbox_items SET status = ?, status_by = ?, status_at = ?,
+                     updated_at = ?, refs = ?
+                   WHERE id = ? AND status = 'open'""",
+                (to_status, by, now, now, refs, int(item_id)))
+            return cur.rowcount == 1
+
+    def inbox_item_merge_refs(self, item_id: int, extra_refs: dict):
+        """Merge refs on an already-resolved row (e.g. recording an intake
+        error on an adopted proposal — visible, auditable, never a silent
+        un-adopt)."""
+        with self._conn() as c:
+            row = c.execute("SELECT refs FROM inbox_items WHERE id = ?",
+                            (int(item_id),)).fetchone()
+            if row is None:
+                return
+            try:
+                merged = json.loads(row["refs"] or "{}")
+                if not isinstance(merged, dict):
+                    merged = {}
+            except (ValueError, TypeError):
+                merged = {}
+            merged.update(extra_refs)
+            c.execute("UPDATE inbox_items SET refs = ?, updated_at = ? WHERE id = ?",
+                      (json.dumps(merged), time.time(), int(item_id)))
+
+    def inbox_items_expire(self, kinds: tuple, older_than_days: float) -> int:
+        """Flip stale OPEN rows of the given kinds to 'expired' (visible aging,
+        never silent deletion). Dismissed/adopted rows are never touched — the
+        dismissal memory must persist."""
+        if not kinds:
+            return 0
+        cutoff = time.time() - float(older_than_days) * 86400
+        marks = ",".join("?" for _ in kinds)
+        with self._conn() as c:
+            cur = c.execute(
+                f"""UPDATE inbox_items SET status = 'expired', status_by = 'engine',
+                      status_at = ?, updated_at = ?
+                    WHERE status = 'open' AND kind IN ({marks}) AND created_at < ?""",
+                (time.time(), time.time(), *kinds, cutoff))
+            return cur.rowcount
+
+    def inbox_expire_predecessors(self, kind: str, workspace_id: int | None,
+                                  before_id: int) -> int:
+        """A fresh digest/pack expires its still-open predecessors directly
+        (status_by='engine') so counts.notices never grows monotonically."""
+        with self._conn() as c:
+            cur = c.execute(
+                """UPDATE inbox_items SET status = 'expired', status_by = 'engine',
+                     status_at = ?, updated_at = ?
+                   WHERE status = 'open' AND kind = ? AND id < ?
+                     AND (workspace_id = ? OR (workspace_id IS NULL AND ? IS NULL))""",
+                (time.time(), time.time(), kind, int(before_id),
+                 workspace_id, workspace_id))
+            return cur.rowcount
+
+    def inbox_item_recent_sig(self, kind: str, source_sig: str,
+                              since: float) -> bool:
+        """Any item (ANY status — dismissal memory included) of this kind with
+        the same coarse source signature newer than `since`? The proposal
+        recency guard: a dismissed friction brief holds until the pain
+        measurably grows AND the window has passed."""
+        if not source_sig:
+            return False
+        with self._conn() as c:
+            return c.execute(
+                "SELECT 1 FROM inbox_items WHERE kind = ? AND source_sig = ? "
+                "AND created_at >= ? LIMIT 1",
+                (kind, source_sig, since)).fetchone() is not None
+
+    # ---------- frictions (Epic I5: engine data, not just a mirror) ----------
+
+    def friction_add(self, job_id: str, workspace_id: int | None, project: str,
+                     stage: int | None, source: str, text: str):
+        text = (text or "").strip()
+        if not text:
+            return
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO frictions (job_id, workspace_id, project, stage, "
+                "source, text, at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (job_id, workspace_id, project or "", stage, source,
+                 text[:500], time.time()))
+
+    def frictions_since(self, since: float,
+                        workspace_id: int | None = None) -> list[dict]:
+        with self._conn() as c:
+            if workspace_id is None:
+                rows = c.execute(
+                    "SELECT * FROM frictions WHERE at >= ? ORDER BY id",
+                    (since,)).fetchall()
+            else:
+                rows = c.execute(
+                    "SELECT * FROM frictions WHERE at >= ? AND workspace_id = ? "
+                    "ORDER BY id", (since, int(workspace_id))).fetchall()
+            return [dict(r) for r in rows]
+
+    # ---------- routines (Epic I1: the routine engine) ----------
+
+    def routine_upsert_seed(self, kind: str, workspace_id: int | None,
+                            schedule: str, name: str = "",
+                            enabled: bool = True) -> bool:
+        """Seed a routine row — INSERT OR IGNORE on the (kind, workspace)
+        unique index, so seeding NEVER overwrites operator edits. Returns True
+        when the row is new. Distinct from the boot-time last_run_at bump
+        (routine_boot_bump), which runs at EVERY boot."""
+        now = time.time()
+        with self._conn() as c:
+            # conflict target = the expression UNIQUE index
+            # idx_routines_scope on (kind, COALESCE(workspace_id, -1)); the same
+            # expression is valid as a Postgres partial/expression conflict target.
+            cur = c.execute(
+                """INSERT INTO routines
+                     (workspace_id, kind, name, schedule, enabled, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(kind, COALESCE(workspace_id, -1)) DO NOTHING""",
+                (workspace_id, kind, name or kind, schedule, int(enabled), now, now))
+            return cur.rowcount == 1
+
+    def routines_all(self) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM routines ORDER BY workspace_id IS NOT NULL, "
+                "workspace_id, kind").fetchall()
+            return [dict(r) for r in rows]
+
+    def routine_get(self, routine_id: int) -> dict | None:
+        with self._conn() as c:
+            row = c.execute("SELECT * FROM routines WHERE id = ?",
+                            (int(routine_id),)).fetchone()
+            return dict(row) if row else None
+
+    def routine_set(self, routine_id: int, **fields):
+        if not fields:
+            return
+        cols = ", ".join(f"{k} = ?" for k in fields)
+        with self._conn() as c:
+            c.execute(f"UPDATE routines SET {cols}, updated_at = ? WHERE id = ?",
+                      (*fields.values(), time.time(), int(routine_id)))
+
+    def routine_claim(self, routine_id: int, prev_last_run: float | None,
+                      now: float, ignore_disabled: bool = False) -> bool:
+        """Single-flight claim CAS: exactly one caller wins each due firing —
+        correct today and load-bearing under Epic F2 multi-worker.
+        ignore_disabled=True is the reaper's non-disableable escape."""
+        enabled_clause = "" if ignore_disabled else " AND enabled = 1"
+        with self._conn() as c:
+            cur = c.execute(
+                f"""UPDATE routines SET last_run_at = ?, updated_at = ?
+                    WHERE id = ? AND (last_run_at IS ? OR last_run_at = ?)
+                    {enabled_clause}""",
+                (now, now, int(routine_id), prev_last_run, prev_last_run))
+            return cur.rowcount == 1
+
+    def routine_boot_bump(self, kinds: tuple, now: float | None = None):
+        """Boot-time settle bump for builtin (instance-scoped) rows: stamp
+        last_run_at=now so sweep/janitor fire one full interval after boot
+        instead of ~immediately off a stale pre-restart stamp. Runs at EVERY
+        boot — deliberately NOT part of the INSERT OR IGNORE seeding."""
+        if not kinds:
+            return
+        marks = ",".join("?" for _ in kinds)
+        with self._conn() as c:
+            c.execute(
+                f"UPDATE routines SET last_run_at = ?, updated_at = ? "
+                f"WHERE workspace_id IS NULL AND kind IN ({marks})",
+                (now or time.time(), time.time(), *kinds))
+
+    def routine_run_open(self, routine_id: int, kind: str,
+                         workspace_id: int | None) -> int:
+        with self._conn() as c:
+            _, run_id = self._insert_returning(
+                c,
+                "INSERT INTO routine_runs (routine_id, kind, workspace_id, started_at) "
+                "VALUES (?, ?, ?, ?)",
+                (int(routine_id), kind, workspace_id, time.time()))
+            return run_id
+
+    def routine_run_close(self, run_id: int, status: str, detail: str = "",
+                          items_emitted: int = 0):
+        with self._conn() as c:
+            c.execute(
+                "UPDATE routine_runs SET ended_at = ?, status = ?, detail = ?, "
+                "items_emitted = ? WHERE id = ? AND ended_at IS NULL",
+                (time.time(), status, (detail or "")[:1000],
+                 int(items_emitted), int(run_id)))
+
+    def routine_runs_recent(self, routine_id: int, limit: int = 20) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM routine_runs WHERE routine_id = ? "
+                "ORDER BY id DESC LIMIT ?", (int(routine_id), int(limit))).fetchall()
+            return [dict(r) for r in rows]
+
+    def routine_last_success(self, routine_id: int) -> float | None:
+        """When the routine last completed usefully (ok OR quiet) — the digest
+        `since` anchor (Epic I2, floored at now-24h by the caller)."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT MAX(started_at) AS t FROM routine_runs "
+                "WHERE routine_id = ? AND status IN ('ok', 'quiet')",
+                (int(routine_id),)).fetchone()
+            return row["t"] if row and row["t"] else None
+
+    def routine_runs_prune(self, ttl_days: float, keep_latest: int = 20) -> int:
+        """Janitor retention: drop run-history rows older than the TTL, always
+        keeping the newest `keep_latest` per routine."""
+        cutoff = time.time() - float(ttl_days) * 86400
+        with self._conn() as c:
+            cur = c.execute(
+                """DELETE FROM routine_runs WHERE started_at < ? AND id NOT IN (
+                     SELECT id FROM routine_runs r2
+                     WHERE r2.routine_id = routine_runs.routine_id
+                     ORDER BY r2.id DESC LIMIT ?)""",
+                (cutoff, int(keep_latest)))
+            return cur.rowcount
+
+    # ---------- proposal-lane reads (Epic I5) ----------
+
+    def sentry_jobs_since(self, since: float) -> list[dict]:
+        """Stored sentry job rows in the window (project/title/culprit) —
+        the cluster scanner's pure-DB input."""
+        with self._conn() as c:
+            rows = c.execute(
+                """SELECT issue_id, project, title, culprit, workspace_id,
+                          created_at FROM jobs
+                   WHERE kind = 'sentry' AND created_at >= ?
+                   ORDER BY created_at""", (since,)).fetchall()
+            return [dict(r) for r in rows]
+
+    def outcomes_decided(self) -> list[dict]:
+        """Decided flat/regressed ledger rows — the iterate-candidate source
+        (the Iterate gate was already answered; this is the *beyond* lane)."""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM outcomes WHERE decided_at IS NOT NULL "
+                "AND verdict IN ('flat', 'regressed') ORDER BY id").fetchall()
+            return [dict(r) for r in rows]
+
+    def jobs_with_related(self) -> list[dict]:
+        """Jobs referencing sibling pipelines — the live-successor check."""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT issue_id, related_jobs, status, kind FROM jobs "
+                "WHERE related_jobs != ''").fetchall()
+            return [dict(r) for r in rows]
+
+    def jobs_count_by_project(self, since: float) -> dict[str, int]:
+        """project -> jobs created in the window (the memory proposal's
+        high-traffic test)."""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT project, COUNT(*) AS n FROM jobs "
+                "WHERE created_at >= ? AND project != '' GROUP BY project",
+                (since,)).fetchall()
+            return {r["project"]: r["n"] for r in rows}
+
+    # ---------- planning-pack reads (Epic I6) ----------
+
+    def stage_runs_window(self, workspace_id: int, since: float,
+                          until: float) -> list[dict]:
+        """A workspace's stage runs started in [since, until) — the weekly
+        receipts input (same join semantics as autonomy_run_rows)."""
+        with self._conn() as c:
+            rows = c.execute(
+                """SELECT r.* FROM stage_runs r JOIN jobs j ON j.issue_id = r.job_id
+                   WHERE j.workspace_id = ? AND r.started_at >= ?
+                     AND r.started_at < ? ORDER BY r.id""",
+                (int(workspace_id), since, until)).fetchall()
+            return [dict(r) for r in rows]
+
+    def redo_rows_window(self, workspace_id: int, since: float,
+                         until: float) -> list[dict]:
+        """Human redos in [since, until) — TARGET-stage attributed, exactly
+        like autonomy_redo_rows."""
+        with self._conn() as c:
+            rows = c.execute(
+                """SELECT g.stage AS stage, g.at AS at
+                   FROM guidance_log g JOIN jobs j ON j.issue_id = g.job_id
+                   WHERE g.action = 'redo' AND j.workspace_id = ?
+                     AND g.at >= ? AND g.at < ? ORDER BY g.id""",
+                (int(workspace_id), since, until)).fetchall()
+            return [dict(r) for r in rows]
+
+    def outcomes_decided_window(self, workspace_id: int, since: float,
+                                until: float) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute(
+                """SELECT * FROM outcomes WHERE workspace_id = ?
+                   AND decided_at IS NOT NULL AND decided_at >= ?
+                   AND decided_at < ? ORDER BY id""",
+                (int(workspace_id), since, until)).fetchall()
+            return [dict(r) for r in rows]
+
+    # ---------- spend (Epic I0/I4; the substrate Epic G4 extends) ----------
+
+    def costs_since(self, since: float) -> dict:
+        """workspace_id -> total USD since `since`, aggregating stage_runs AND
+        gate_chat costs through the owning job's workspace. Jobs without a
+        workspace land under None."""
+        with self._conn() as c:
+            rows = c.execute(
+                """SELECT j.workspace_id AS ws, SUM(x.c) AS total FROM (
+                     SELECT job_id, COALESCE(cost_usd, 0) AS c FROM stage_runs
+                       WHERE started_at >= ?
+                     UNION ALL
+                     SELECT job_id, COALESCE(cost_usd, 0) FROM gate_chat
+                       WHERE at >= ?
+                   ) x JOIN jobs j ON j.issue_id = x.job_id
+                   GROUP BY j.workspace_id""", (since, since)).fetchall()
+            return {r["ws"]: float(r["total"] or 0) for r in rows}
+
+    def gate_events_by_kind(self, kinds: tuple, since: float,
+                            workspace_id: int | None = None) -> list[dict]:
+        """Gate events of the given kinds since a timestamp, joined to jobs
+        for workspace scoping (Epic I2: the digest's SLA-flag section)."""
+        if not kinds:
+            return []
+        marks = ",".join("?" for _ in kinds)
+        ws_clause = "" if workspace_id is None else " AND j.workspace_id = ?"
+        params: list = [*kinds, since]
+        if workspace_id is not None:
+            params.append(int(workspace_id))
+        with self._conn() as c:
+            rows = c.execute(
+                f"""SELECT e.*, j.workspace_id AS workspace_id,
+                           j.title AS job_title, j.project AS project
+                    FROM gate_events e JOIN jobs j ON j.issue_id = e.job_id
+                    WHERE e.kind IN ({marks}) AND e.at >= ?{ws_clause}
+                    ORDER BY e.id""", params).fetchall()
+            return [dict(r) for r in rows]
+
+    def prs_in_state_with_workspace(self, states: tuple) -> list[dict]:
+        """Tracked PRs in the given states with their owning job's workspace
+        (Epic I2: the digest's stalled-PR section)."""
+        marks = ",".join("?" for _ in states)
+        with self._conn() as c:
+            rows = c.execute(
+                f"""SELECT p.*, j.workspace_id AS workspace_id,
+                           j.title AS job_title, j.project AS project
+                    FROM prs p JOIN jobs j ON j.issue_id = p.job_id
+                    WHERE p.state IN ({marks}) ORDER BY p.id""",
+                tuple(states)).fetchall()
+            return [dict(r) for r in rows]
+
+    def awaiting_gates(self) -> list[dict]:
+        """Everything answerable right now: parked gates (all kinds) plus
+        feature jobs in error/timeout (redo is a valid answer there)."""
+        rows = self.by_status(["awaiting_input", "error", "timeout"])
+        return [r for r in rows
+                if r["status"] == "awaiting_input" or (r.get("kind") or "") == "feature"]
 
     # ---------- artifact sync state (row per artifact) ----------
 
@@ -698,6 +2480,23 @@ class JobStore:
                 (job_id, artifact, merged["subtask_id"], merged["synced_hash"],
                  merged["flags"], merged["content"]),
             )
+            # Epic D4: the index refreshes on every artifact write — and drops
+            # rows the engine itself banners SUPERSEDED ("will be regenerated;
+            # edits ignored") the moment the flag lands. Both artifact write
+            # paths (commit_file + the human-edit pull) funnel through here.
+            if self.fts_enabled and ("content" in fields or "flags" in fields):
+                if "superseded" in (merged["flags"] or ""):
+                    self._fts_delete(c, "artifact", f"{job_id}/{artifact}")
+                elif (merged["content"] or "").strip():
+                    row = c.execute(
+                        "SELECT project, workspace_id FROM jobs WHERE issue_id = ?",
+                        (job_id,)).fetchone()
+                    self._fts_upsert(
+                        c, "artifact", f"{job_id}/{artifact}",
+                        project=(row["project"] if row else "") or "",
+                        workspace_id=row["workspace_id"] if row else None,
+                        job_id=job_id, path=f"features/{job_id}/{artifact}",
+                        title=artifact, body=merged["content"])
 
     def artifact_content_set(self, job_id: str, artifact: str, content: str):
         """Cache the artifact body for the fast-lane chat bundle (truncated)."""
@@ -734,19 +2533,53 @@ class JobStore:
         with self._conn() as c:
             self._clear_pipeline_state(c, job_id)
 
-    @staticmethod
-    def _clear_pipeline_state(c, job_id: str):
+    def _clear_pipeline_state(self, c, job_id: str):
+        """Runs on the CALLER's open connection so the whole reset commits
+        atomically. The same fail-closed rationale that clears guidance_log
+        extends to Epic D: the dead lap's registry rows are superseded (never
+        re-injected into the new lap's P9 as registry truth) and its FTS
+        guidance/artifact/decision rows are purged in the SAME transaction —
+        a dead pipeline's text must not haunt retrieval."""
         c.execute("DELETE FROM artifact_state WHERE job_id = ?", (job_id,))
         c.execute("DELETE FROM stage_state WHERE job_id = ?", (job_id,))
         c.execute("DELETE FROM guidance_log WHERE job_id = ?", (job_id,))
+        c.execute(
+            "UPDATE decisions SET status = 'superseded', updated_at = ?, "
+            "updated_by = 'engine:reintake' WHERE job_id = ? AND status = 'active'",
+            (time.time(), job_id))
+        if self.fts_enabled:
+            c.execute("DELETE FROM mem_fts WHERE kind IN "
+                      "('guidance', 'artifact', 'decision') AND job_id = ?",
+                      (job_id,))
 
     def feature_intake(self, job_id: str, title: str, project: str, **fields):
         """Atomic feature (re-)intake: child-state clears + row upsert + pipeline
         reset in ONE transaction — a crash can never leave status='received' with a
-        stale stage and no stage_state (which would strand the job on restart)."""
+        stale stage and no stage_state (which would strand the job on restart).
+
+        The previous lap's outcome-watch state resets in the SAME transaction
+        (Epic B): a stale `watch-<job>` row would block the fresh lap's spawn
+        forever (idempotent-by-existence), and its readings/ledger row would mix
+        two laps' measurements. The new lap is measured from scratch. The watch
+        job's OWN pipeline state clears too: the Iterate-gate answer writes
+        guidance (and FTS rows) under the `watch-<job>` id, and leaving them
+        would let the dead lap's text haunt retrieval (the _clear_pipeline_state
+        invariant) while its registry decision was superseded."""
         now = time.time()
+        watch_id = f"watch-{job_id}"
         with self._conn() as c:
             self._clear_pipeline_state(c, job_id)
+            # same kind='watch' guard as the DELETE below: a hand-made
+            # non-watch job that happens to be named watch-<id> keeps its
+            # state; an absent row still clears (orphans left by laps that
+            # predate the watch-state clear)
+            row = c.execute("SELECT kind FROM jobs WHERE issue_id = ?",
+                            (watch_id,)).fetchone()
+            if row is None or row["kind"] == "watch":
+                self._clear_pipeline_state(c, watch_id)
+            c.execute("DELETE FROM jobs WHERE issue_id = ? AND kind = 'watch'", (watch_id,))
+            c.execute("DELETE FROM metric_readings WHERE job_id = ?", (watch_id,))
+            c.execute("DELETE FROM outcomes WHERE job_id = ?", (watch_id,))
             c.execute(
                 """INSERT INTO jobs (issue_id, kind, project, title, status, source, forced, attempts, created_at, updated_at)
                    VALUES (?, 'feature', ?, ?, 'received', 'manual', 1, 1, ?, ?)
@@ -760,11 +2593,121 @@ class JobStore:
                      updated_at = excluded.updated_at""",
                 (job_id, project, title, now, now),
             )
-            cols = ", ".join(f"{k} = ?" for k in fields)
+            if fields:
+                cols = ", ".join(f"{k} = ?" for k in fields)
+                c.execute(
+                    f"UPDATE jobs SET {cols}, updated_at = ? WHERE issue_id = ?",
+                    (*fields.values(), now, job_id),
+                )
+
+    # ---------- outcome watch (Epic B4/B5) ----------
+
+    def watch_insert(self, job_id: str, **fields):
+        """Spawn a watch job in ONE transaction: the row is born kind='watch'
+        AND status='watching' — never insert()+set_status, whose intermediate
+        'received' state would be re-enqueued at boot and dispatched into a
+        Claude run. Raises db.IntegrityError (the driver-normalized type) if
+        the row already exists
+        (callers check store.get first; a race fails loudly, not twice)."""
+        now = time.time()
+        cols = ", ".join(fields)
+        marks = ", ".join("?" for _ in fields)
+        with self._conn() as c:
             c.execute(
-                f"UPDATE jobs SET {cols}, updated_at = ? WHERE issue_id = ?",
-                (*fields.values(), now, job_id),
+                f"INSERT INTO jobs (issue_id, kind, status, source, forced, attempts"
+                f"{', ' + cols if cols else ''}, created_at, updated_at) "
+                f"VALUES (?, 'watch', 'watching', 'manual', 1, 1"
+                f"{', ' + marks if marks else ''}, ?, ?)",
+                (job_id, *fields.values(), now, now),
             )
+
+    def reading_add(self, job_id: str, metric: str, metric_event: str,
+                    observed: float | None, window_day: int | None,
+                    detail: str = "", window_start: float | None = None):
+        """One successful metric read (INSERT-only). window_start stamps which
+        watch window (watch_started_at) the reading belongs to — a /redo arms a
+        new window and must never mix readings with the old one."""
+        with self._conn() as c:
+            c.execute(
+                """INSERT INTO metric_readings
+                     (job_id, metric, metric_event, observed, window_day, window_start, detail, at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (job_id, metric, metric_event, observed, window_day, window_start,
+                 detail, time.time()),
+            )
+
+    def readings_for(self, job_id: str, window_start: float | None = None) -> list[dict]:
+        with self._conn() as c:
+            if window_start is None:
+                rows = c.execute(
+                    "SELECT * FROM metric_readings WHERE job_id = ? ORDER BY id",
+                    (job_id,)).fetchall()
+            else:
+                rows = c.execute(
+                    "SELECT * FROM metric_readings WHERE job_id = ? AND window_start = ? ORDER BY id",
+                    (job_id, window_start)).fetchall()
+            return [dict(r) for r in rows]
+
+    def reading_last_at(self, job_id: str) -> float:
+        """When the last reading landed (any window) — the daily-read throttle."""
+        with self._conn() as c:
+            row = c.execute("SELECT MAX(at) AS t FROM metric_readings WHERE job_id = ?",
+                            (job_id,)).fetchone()
+            return (row["t"] if row and row["t"] else 0) or 0
+
+    # measurement/verdict fields the finish path may (re)write — pinned so a
+    # replayed or post-redo _finish_watch can NEVER clobber the human's
+    # learning/decided_by/decided_at (audit-ledger integrity)
+    OUTCOME_VERDICT_FIELDS = ("metric", "metric_event", "target", "observed",
+                              "baseline", "window_days", "verdict", "verdict_inputs")
+
+    def outcome_add(self, job_id: str, feature_id: str, workspace_id: int | None,
+                    **fields):
+        """UPSERT the ledger row for a finished watch. ONE semantics: verdict/
+        measurement fields update in place (a /redo re-finish records the new
+        verdict), created_at survives, and learning/decided_* are untouchable
+        here — they belong to outcome_set (the human's answer)."""
+        fields = {k: v for k, v in fields.items() if k in self.OUTCOME_VERDICT_FIELDS}
+        cols = ", ".join(fields)
+        marks = ", ".join("?" for _ in fields)
+        sets = ", ".join(f"{k} = excluded.{k}" for k in fields)
+        with self._conn() as c:
+            c.execute(
+                f"INSERT INTO outcomes (job_id, feature_id, workspace_id"
+                f"{', ' + cols if cols else ''}, created_at) "
+                f"VALUES (?, ?, ?{', ' + marks if marks else ''}, ?) "
+                f"ON CONFLICT(job_id) DO UPDATE SET "
+                f"feature_id = excluded.feature_id, workspace_id = excluded.workspace_id"
+                f"{', ' + sets if sets else ''}",
+                (job_id, feature_id, workspace_id, *fields.values(), time.time()),
+            )
+
+    def outcome_set(self, job_id: str, **fields):
+        """The human's side of the ledger row (learning/decided_by/decided_at)."""
+        if not fields:
+            return
+        cols = ", ".join(f"{k} = ?" for k in fields)
+        with self._conn() as c:
+            c.execute(f"UPDATE outcomes SET {cols} WHERE job_id = ?",
+                      (*fields.values(), job_id))
+
+    def outcome_for(self, job_id: str) -> dict | None:
+        with self._conn() as c:
+            row = c.execute("SELECT * FROM outcomes WHERE job_id = ?", (job_id,)).fetchone()
+            return dict(row) if row else None
+
+    def outcome_for_feature(self, feature_id: str) -> dict | None:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM outcomes WHERE feature_id = ? ORDER BY id DESC LIMIT 1",
+                (feature_id,)).fetchone()
+            return dict(row) if row else None
+
+    def outcomes_recent(self, limit: int = 200) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute("SELECT * FROM outcomes ORDER BY id DESC LIMIT ?",
+                             (limit,)).fetchall()
+            return [dict(r) for r in rows]
 
     # ---------- per-stage state ----------
 
@@ -794,11 +2737,12 @@ class JobStore:
                        queued_at: float | None = None) -> int:
         now = time.time()
         with self._conn() as c:
-            cur = c.execute(
+            _, run_id = self._insert_returning(
+                c,
                 "INSERT INTO stage_runs (job_id, stage, attempt, queued_at, started_at) VALUES (?, ?, ?, ?, ?)",
                 (job_id, stage, attempt, queued_at or now, now),
             )
-            return cur.lastrowid
+            return run_id
 
     def stage_run_close(self, run_id: int, result_status: str,
                         cost_usd: float | None = None, num_turns: int | None = None,
@@ -842,11 +2786,233 @@ class JobStore:
                     (time.time(), action, row["id"]),
                 )
 
+    def latest_gate_posted(self, job_id: str, stage: int) -> float:
+        """When the current gate was posted — the SLA / inbox-age clock. Falls
+        back to the job's updated_at (error/timeout parks may never have posted
+        a gate; 'overdue since epoch' must be impossible)."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT MAX(gate_posted_at) AS t FROM stage_runs "
+                "WHERE job_id = ? AND stage = ? AND gate_posted_at IS NOT NULL",
+                (job_id, stage),
+            ).fetchone()
+            if row and row["t"]:
+                return row["t"]
+            jrow = c.execute("SELECT updated_at FROM jobs WHERE issue_id = ?",
+                             (job_id,)).fetchone()
+            return (jrow["updated_at"] if jrow else 0) or 0
+
     def stage_runs_for(self, job_id: str) -> list[dict]:
         with self._conn() as c:
             rows = c.execute(
                 "SELECT * FROM stage_runs WHERE job_id = ? ORDER BY id", (job_id,)
             ).fetchall()
+            return [dict(r) for r in rows]
+
+    # ---------- autonomy (Epic C: the trust ladder, docs/ENGINE.md §15) ----------
+    # Scores/pins/events are configuration + telemetry, each written in a
+    # single atomic statement — deliberately OUTSIDE the job-state CAS paths.
+
+    def autonomy_run_rows(self, since: float) -> list[dict]:
+        """The scorer's single stage_runs input: feature-job runs started in
+        the window, stamped with their job's workspace/project. Stage 9 rows
+        are excluded at the source (levels cover 0–8 only; P9 is terminal)."""
+        with self._conn() as c:
+            rows = c.execute(
+                """SELECT r.*, j.workspace_id AS workspace_id, j.project AS project
+                   FROM stage_runs r JOIN jobs j ON j.issue_id = r.job_id
+                   WHERE j.kind = 'feature' AND j.workspace_id IS NOT NULL
+                     AND r.stage BETWEEN 0 AND 8 AND r.started_at >= ?
+                   ORDER BY r.id""", (since,)).fetchall()
+            return [dict(r) for r in rows]
+
+    def autonomy_redo_rows(self, since: float) -> list[dict]:
+        """Human redos in the window, attributed to their TARGET stage —
+        guidance_log records the stage the human actually rejected (a
+        retargeted '/redo P<k>' answered at a P<n> gate lands on stage k),
+        while stage_runs.gate_action stamps the parked stage n. The scorer's
+        redo numerator reads THIS, never gate_action (which stays the
+        answered-gate denominator only)."""
+        with self._conn() as c:
+            rows = c.execute(
+                """SELECT g.stage AS stage, g.at AS at,
+                          j.workspace_id AS workspace_id, j.project AS project
+                   FROM guidance_log g JOIN jobs j ON j.issue_id = g.job_id
+                   WHERE g.action = 'redo' AND j.kind = 'feature'
+                     AND j.workspace_id IS NOT NULL AND g.stage IS NOT NULL
+                     AND g.at >= ?
+                   ORDER BY g.id""", (since,)).fetchall()
+            return [dict(r) for r in rows]
+
+    def redo_counts(self, since: float) -> list[dict]:
+        """Human redos per (job, TARGET stage) in the window — the Epic I4
+        trust-decay signal. Same attribution rule as autonomy_redo_rows:
+        guidance_log records the stage the human actually rejected."""
+        with self._conn() as c:
+            rows = c.execute(
+                """SELECT g.job_id AS job_id, g.stage AS stage, COUNT(*) AS n,
+                          j.workspace_id AS workspace_id, j.project AS project,
+                          j.title AS title
+                   FROM guidance_log g JOIN jobs j ON j.issue_id = g.job_id
+                   WHERE g.action = 'redo' AND g.stage IS NOT NULL AND g.at >= ?
+                   GROUP BY g.job_id, g.stage""", (since,)).fetchall()
+            return [dict(r) for r in rows]
+
+    def shepherd_rounds_by_project(self, since: float) -> dict[str, float]:
+        """Avg review rounds per project over feature-job PRs touched in the
+        window. kind='feature' is explicit — memory-bootstrap and outcome PRs
+        are tracked in prs too and must not poison the signal."""
+        with self._conn() as c:
+            rows = c.execute(
+                """SELECT j.project AS project, AVG(p.review_rounds) AS rounds
+                   FROM prs p JOIN jobs j ON j.issue_id = p.job_id
+                   WHERE j.kind = 'feature' AND p.updated_at >= ?
+                   GROUP BY j.project""", (since,)).fetchall()
+            return {r["project"]: float(r["rounds"] or 0) for r in rows}
+
+    def autonomy_score_upsert(self, workspace_id: int, project: str, stage: int,
+                              level: int, score: float, inputs_json: str,
+                              sample_runs: int, computed_started: float) -> dict:
+        """Conditional upsert of one cell. The previous-level read, the write
+        and the post-write re-read share ONE transaction; the DO UPDATE is
+        guarded so a clawback that landed after the compute pass started can
+        never be overwritten (clawback_at itself is never touched here).
+        Theoretical under today's single-threaded sync SQLite; load-bearing
+        under multi-worker Postgres (Epic F2). Returns
+        {prev_level, level (stored after), applied}."""
+        now = time.time()
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT level FROM autonomy_scores WHERE workspace_id = ? AND project = ? AND stage = ?",
+                (workspace_id, project, stage)).fetchone()
+            prev = row["level"] if row else None
+            cur = c.execute(
+                """INSERT INTO autonomy_scores
+                     (workspace_id, project, stage, level, score, inputs, sample_runs, computed_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(workspace_id, project, stage) DO UPDATE SET
+                     level = excluded.level, score = excluded.score,
+                     inputs = excluded.inputs, sample_runs = excluded.sample_runs,
+                     computed_at = excluded.computed_at
+                   WHERE autonomy_scores.clawback_at IS NULL
+                      OR autonomy_scores.clawback_at < ?""",
+                (workspace_id, project, stage, level, score, inputs_json,
+                 sample_runs, now, computed_started))
+            applied = cur.rowcount == 1
+            after = c.execute(
+                "SELECT level FROM autonomy_scores WHERE workspace_id = ? AND project = ? AND stage = ?",
+                (workspace_id, project, stage)).fetchone()
+            return {"prev_level": prev, "level": after["level"] if after else level,
+                    "applied": applied}
+
+    def autonomy_score_get(self, workspace_id: int, project: str, stage: int) -> dict | None:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM autonomy_scores WHERE workspace_id = ? AND project = ? AND stage = ?",
+                (workspace_id, project, stage)).fetchone()
+            return dict(row) if row else None
+
+    def autonomy_scores_for(self, workspace_id: int) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM autonomy_scores WHERE workspace_id = ? ORDER BY project, stage",
+                (workspace_id,)).fetchall()
+            return [dict(r) for r in rows]
+
+    def autonomy_scores_all(self) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM autonomy_scores ORDER BY workspace_id, project, stage").fetchall()
+            return [dict(r) for r in rows]
+
+    def autonomy_clawback(self, workspace_id: int, stage: int,
+                          project: str | None) -> list[str]:
+        """Drop cell(s) to level 0 and stamp clawback_at — re-earning starts
+        from zero (the scorer ignores runs started before the stamp). A
+        workspace-wide clawback (project=None) derives its slug list HERE, in
+        the same transaction: every project that ever earned a score row in
+        this workspace UNION the current repo slugs — a slug since removed
+        from (or moved out of) the workspace keeps its stale cell clawable.
+        Returns the affected project slugs."""
+        now = time.time()
+        with self._conn() as c:
+            if project is None:
+                slugs = {r["project"] for r in c.execute(
+                    "SELECT DISTINCT project FROM autonomy_scores WHERE workspace_id = ?",
+                    (workspace_id,)).fetchall()}
+                slugs |= {r["slug"] for r in c.execute(
+                    "SELECT slug FROM workspace_repos WHERE workspace_id = ?",
+                    (workspace_id,)).fetchall()}
+            else:
+                slugs = {project}
+            for p in sorted(slugs):
+                c.execute(
+                    """INSERT INTO autonomy_scores
+                         (workspace_id, project, stage, level, score, inputs,
+                          sample_runs, clawback_at, computed_at)
+                       VALUES (?, ?, ?, 0, 0, '{}', 0, ?, ?)
+                       ON CONFLICT(workspace_id, project, stage) DO UPDATE SET
+                         level = 0, score = 0,
+                         clawback_at = excluded.clawback_at,
+                         computed_at = excluded.computed_at""",
+                    (workspace_id, p, stage, now, now))
+            return sorted(slugs)
+
+    def autonomy_pin_set(self, workspace_id: int, stage: int, pin: str, set_by: str):
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO autonomy_pins (workspace_id, stage, pin, set_by, set_at) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(workspace_id, stage) DO UPDATE SET "
+                "pin=excluded.pin, set_by=excluded.set_by, set_at=excluded.set_at",
+                (workspace_id, stage, pin, set_by, time.time()))
+
+    def autonomy_pin_clear(self, workspace_id: int, stage: int):
+        with self._conn() as c:
+            c.execute("DELETE FROM autonomy_pins WHERE workspace_id = ? AND stage = ?",
+                      (workspace_id, stage))
+
+    def autonomy_pins_for(self, workspace_id: int) -> dict[int, dict]:
+        with self._conn() as c:
+            rows = c.execute("SELECT * FROM autonomy_pins WHERE workspace_id = ? ORDER BY stage",
+                             (workspace_id,)).fetchall()
+            return {r["stage"]: dict(r) for r in rows}
+
+    def autonomy_pins_all(self) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM autonomy_pins ORDER BY workspace_id, stage").fetchall()
+            return [dict(r) for r in rows]
+
+    def autonomy_event_add(self, kind: str, workspace_id: int | None = None,
+                           project: str = "", stage: int | None = None,
+                           job_id: str = "", detail: str = "", actor: str = ""):
+        """INSERT-only audit substrate for every autonomy mutation (Epic E4
+        folds/exports these later; nothing here waits for it)."""
+        with self._conn() as c:
+            c.execute(
+                """INSERT INTO autonomy_events
+                     (workspace_id, project, stage, job_id, kind, detail, actor, at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (workspace_id, project, stage, job_id, kind, detail, actor, time.time()))
+
+    def autonomy_events_recent(self, workspace_ids: list[int] | None,
+                               limit: int = 50, since: float = 0.0) -> list[dict]:
+        """Newest-first event log. None = all workspaces (admins). `since`
+        (Epic I2) bounds the digest's changes-since-yesterday section."""
+        with self._conn() as c:
+            if workspace_ids is None:
+                rows = c.execute(
+                    "SELECT * FROM autonomy_events WHERE at >= ? "
+                    "ORDER BY id DESC LIMIT ?", (since, limit)).fetchall()
+            elif not workspace_ids:
+                rows = []
+            else:
+                marks = ",".join("?" for _ in workspace_ids)
+                rows = c.execute(
+                    f"SELECT * FROM autonomy_events WHERE workspace_id IN ({marks}) "
+                    f"AND at >= ? ORDER BY id DESC LIMIT ?",
+                    (*workspace_ids, since, limit)).fetchall()
             return [dict(r) for r in rows]
 
     # ---------- gate chat (INSERT-only transcript) ----------
@@ -856,14 +3022,15 @@ class JobStore:
                  duration_ms: float | None = None, session_id: str = "",
                  degraded: bool = False, lane: str = "", author: str = "") -> int:
         with self._conn() as c:
-            cur = c.execute(
+            _, chat_id = self._insert_returning(
+                c,
                 """INSERT INTO gate_chat (job_id, stage, attempt, role, text,
                      cost_usd, num_turns, duration_ms, session_id, degraded, lane, author, at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (job_id, stage, attempt, role, text, cost_usd, num_turns,
                  duration_ms, session_id, int(degraded), lane, author, time.time()),
             )
-            return cur.lastrowid
+            return chat_id
 
     def chat_last(self, job_id: str, stage: int, attempt: int | None = None) -> dict | None:
         """Latest turn for a stage — scoped to one ATTEMPT when given, so a

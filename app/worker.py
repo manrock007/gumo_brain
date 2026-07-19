@@ -13,19 +13,26 @@ or any artifact subtask), sweep, stale-run reaper.
 
 import asyncio
 import itertools
+import json
 import logging
 import re
 import time
+import uuid
 from pathlib import Path
 
-from .clickup import ClickUp
+from . import analytics, audit, autonomy, budgets, logconfig, outcome, people, rbac, roles
+from .clickup import ClickUp  # noqa: F401 — re-exported for tests/back-compat
+from .tracker import tracker_for
 from .config import ENGINE_NAME, Settings
+from . import db
 from .db import JobStore
 from .engine import ENGINE_COMMENT_PREFIXES, GATE_PREFIX, Engine, RepoLocks
 from .fixer import (
     BASE_ALLOWED_TOOLS,
     TRANSIENT_ERROR_RE,
     BranchLostError,
+    engine_dir,
+    git,
     prepare_feature_workspace,
     prepare_workspace,
     run_claude,
@@ -40,12 +47,21 @@ from .prompts import (
     build_task_plan_prompt,
 )
 from .sentry_api import SentryClient, format_stacktrace
+from .textutil import single_line
 from . import transcripts
 
 log = logging.getLogger("brain.worker")
 
 ACTIVE_STATUSES = ("received", "queued", "running")
-TERMINAL_STATUSES = ("pr_opened", "no_fix", "skipped", "error", "timeout")
+TERMINAL_STATUSES = ("pr_opened", "no_fix", "skipped", "error", "timeout", "done")
+
+# a watch job reads its metric at most ~daily; 22h tolerates loop jitter
+WATCH_READ_THROTTLE_SECONDS = 79200
+
+# F4: on the SQLite path the worker blocks on queue.get(); cap the wait so the
+# loop re-stamps last_tick on an idle system and /health/ready's worker check
+# (900s window) can't flap to false overnight. A real enqueue wakes it sooner.
+IDLE_HEARTBEAT_POLL_SECONDS = 300
 
 # priority classes: live sentry >= answered feature stages / tasks > sweep
 PRIO_SENTRY = 0
@@ -61,10 +77,39 @@ INTAKE_RE = re.compile(r"^\s*\[\s*(fix|task|bug|feature|sentry|memory)(?:\s+([A-
                        re.IGNORECASE)
 PROJECT_LINE_RE = re.compile(r"^\s*\**project\**\s*[:=]\s*\**\s*([A-Za-z0-9_-]+)\**\s*$",
                              re.IGNORECASE | re.MULTILINE)
+# Epic B1: metric goal lines in a [feature] ticket description, the same
+# bold-tolerant shape as the project line; matched lines strip from `request`
+METRIC_LINE_RE = re.compile(r"^\s*\**metric\**\s*[:=]\s*(.+)$",
+                            re.IGNORECASE | re.MULTILINE)
+TARGET_LINE_RE = re.compile(r"^\s*\**target\**\s*[:=]\s*(.+)$",
+                            re.IGNORECASE | re.MULTILINE)
+WINDOW_LINE_RE = re.compile(r"^\s*\**window\**\s*[:=]\s*\**\s*(\d{1,3})\**\s*$",
+                            re.IGNORECASE | re.MULTILINE)
+
+
+def _clean_metric_value(raw: str) -> str:
+    """Strip ClickUp's bold markers and whitespace off a captured line value."""
+    return (raw or "").strip().strip("*").strip()
+
+
+# Metric/target values are interpolated into engine-voiced prompt headers on
+# EVERY stage run: a multiline value could smuggle markdown headings/
+# instructions into the prompt as if the engine had written them, so the
+# stored value is forced single-line and capped at intake (both channels
+# funnel through here). Moved to textutil (Epic I) — this alias stays for
+# existing call sites and tests.
+_single_line = single_line
 
 
 class GateConflict(Exception):
     """The gate was already answered through the other channel."""
+
+
+class GateForbidden(Exception):
+    """The acting user does not own this gate (Epic A3). Deliberately NOT a
+    ValueError subclass: main.py maps ValueError->409 and _scan_verbs catches
+    (ValueError, KeyError) with a generic reply — this must surface as a 403 /
+    ownership refusal, never be swallowed by those handlers."""
 
 
 def extract_questions(analysis: str) -> str:
@@ -87,12 +132,28 @@ class Worker:
         self.queue: asyncio.PriorityQueue = asyncio.PriorityQueue()
         self._seq = itertools.count()
         self.sentry = SentryClient(settings)
-        self.clickup = ClickUp(settings)
-        self.locks = RepoLocks()
+        self.clickup = tracker_for(settings)
+        # Epic F2: SQLite → in-process asyncio locks (single consumer); Postgres
+        # → cross-process advisory locks (multi-worker safe).
+        from .repolocks import resolve_locks
+        self.locks = resolve_locks(store)
+        self.worker_id = settings.resolved_worker_id()
         self.engine = Engine(settings, store, self.clickup, locks=self.locks)
+        # F4: heartbeat updated each run-loop iteration; /health/ready reads it.
+        self.last_tick: float = time.time()
         self.workspaces = None  # WorkspaceService, injected at startup (main.lifespan)
+        # strong refs for fire-and-forget background tasks (outcome memory PRs) —
+        # bare create_task results can be GC'd mid-flight (same as main._chat_tasks)
+        self._bg_tasks: set = set()
 
     def _enqueue(self, job_id: str, priority: int):
+        # Epic F2 multi-worker: dispatch is DB-authoritative (claim_next_job);
+        # _next_job never drains this in-process PriorityQueue on that path, so
+        # every push here would be an orphan — an unbounded, ever-growing leak
+        # for the process lifetime (and a meaningless /health backlog gauge). The
+        # 'queued'/'received' DB row IS the work item; skip the push entirely.
+        if self.settings.multi_worker:
+            return
         self.queue.put_nowait((priority, next(self._seq), job_id, time.time()))
 
     def _priority_for(self, job: dict) -> int:
@@ -131,6 +192,11 @@ class Worker:
             return self.workspaces.product_name_for(ws), self.workspaces.briefing(ws)
         return self.settings.product_name, self.settings.business_context
 
+    def _ws_row(self, job: dict) -> dict | None:
+        """The job's workspace row (attribution/role/SLA config), when the
+        service is injected — mirrors _job_context."""
+        return self.workspaces.for_job(job) if self.workspaces else None
+
     def _stamp_workspace(self, job_id: str, project: str):
         """Record the owning workspace on the job row (slugs are global)."""
         if self.workspaces and project:
@@ -167,8 +233,20 @@ class Worker:
                        clickup_task_id: str | None = None,
                        clickup_task_url: str | None = None,
                        cu_list_id: str = "", owner: str = "",
-                       related_jobs: str = "", gate_mode: str = "") -> str:
-        """Enqueue a feature pipeline at P0."""
+                       founder_dri: str = "", dev_dri: str = "",
+                       related_jobs: str = "", gate_mode: str = "",
+                       success_metric: str = "", metric_target: str = "",
+                       metric_window_days: int | None = None) -> str:
+        """Enqueue a feature pipeline at P0. Dual DRIs (Epic A2): the legacy
+        `owner` column becomes a computed alias at write time. A re-intake
+        resets ALL of them from the fresh submission (consistent with the
+        atomic pipeline-reset contract). NOTE (Epic D1): with
+        PEOPLE_ROUTING_DEFAULTS on and people profiles covering the repo, an
+        EMPTY slot re-fills from the profiles — resubmitting without DRIs no
+        longer guarantees enforcement turns off; PEOPLE_ROUTING_DEFAULTS=false
+        is the opt-out (ENGINE.md §16). Explicit submitted values always win;
+        the fill is computed BEFORE store.feature_intake so the DRIs land
+        inside the single atomic upsert (never a second write)."""
         existing = self.store.get(job_id)
         if existing:
             if existing["status"] in ACTIVE_STATUSES:
@@ -184,6 +262,21 @@ class Worker:
             # terminal skipped/no_fix -> fresh restart of the pipeline (atomic below)
 
         mode = gate_mode if gate_mode in ("full", "light") else self.settings.default_gate_mode
+        if metric_window_days is not None and not 1 <= int(metric_window_days) <= 365:
+            metric_window_days = None  # fail closed: never store a nonsense window
+        founder_dri = (founder_dri or "").strip()
+        dev_dri = (dev_dri or "").strip()
+        # Epic D1: people-profile routing defaults fill ONLY empty slots —
+        # explicit submitted values (dashboard AND ClickUp adoption's people
+        # fields, both funneling here) always win. Guarded for bare-Worker
+        # tests (no workspace service → no membership check → no fill).
+        if (self.settings.people_routing_defaults and self.workspaces
+                and (not founder_dri or not dev_dri)):
+            ws = self.workspaces.for_project(project)
+            d_founder, d_dev = people.default_dris(self.store, ws, project)
+            founder_dri = founder_dri or d_founder
+            dev_dri = dev_dri or d_dev
+        owner = (owner or "").strip() or dev_dri or founder_dri  # legacy computed alias
         self.store.feature_intake(
             job_id, title=title, project=project,
             request=request,
@@ -206,18 +299,34 @@ class Worker:
             clickup_task_url=clickup_task_url or "",
             cu_list_id=cu_list_id,
             owner=owner,
+            founder_dri=founder_dri,
+            dev_dri=dev_dri,
             related_jobs=related_jobs,
+            # Epic B1: metric goal from the fresh submission (a re-intake
+            # overwrites, consistent with the atomic pipeline reset) — and the
+            # previous lap's engine-owned metric/watch state clears with it.
+            # Single-line + capped: these values render inside engine-voiced
+            # prompt headers (feature_prompts._metric_goal_block) — see
+            # _single_line for why multiline/unbounded values are refused.
+            success_metric=_single_line(success_metric),
+            metric_target=_single_line(metric_target),
+            metric_window_days=metric_window_days,
+            metric_event="",
+            watch_started_at=None,
+            watch_deadline=None,
         )
         self._stamp_workspace(job_id, project)
         self._enqueue(job_id, PRIO_HUMAN)
         return f"feature {job_id} queued at P0"
 
-    def intake_memory(self, project: str) -> str:
+    def intake_memory(self, project: str, source: str = "manual") -> str:
+        """source='routine' records upkeep-queued bootstraps' provenance
+        (Epic I3); grading/caps are unaffected — memory jobs bypass grading."""
         job_id = f"mem-{project}"
         existing = self.store.get(job_id)
         if existing and existing["status"] in ACTIVE_STATUSES:
             return f"memory bootstrap for {project} already in progress ({existing['status']})"
-        self.store.insert(job_id, source="manual", forced=True,
+        self.store.insert(job_id, source=source, forced=True,
                           title=f"memory bootstrap: {project}", project=project, kind="memory")
         self._stamp_workspace(job_id, project)
         self._enqueue(job_id, PRIO_HUMAN)
@@ -225,21 +334,69 @@ class Worker:
 
     # ---------- main loop ----------
 
+    async def _next_job(self) -> tuple[dict, float | None] | None:
+        """Fetch the next job to run. Returns (job, queued_at) ready to process,
+        or None (a stale wakeup / idle poll — caller loops).
+
+        - SQLite (default): the in-process priority queue is the dispatch
+          source. A wakeup is validated against the DB row (received/queued).
+        - Postgres (multi-worker): the DB claim is authoritative — the asyncio
+          queue is NOT drained as a parallel dispatch source (that would
+          double-dispatch the same job). We poll claim_next_job, which
+          atomically advances the row to 'running' + stamps claimed_by."""
+        if self.settings.multi_worker:
+            job = self.store.claim_next_job(self.worker_id)
+            if job is None:
+                await asyncio.sleep(max(1, self.settings.job_poll_interval_seconds))
+                return None
+            return job, job.get("claimed_at")
+        try:
+            item = await asyncio.wait_for(self.queue.get(),
+                                          timeout=IDLE_HEARTBEAT_POLL_SECONDS)
+        except asyncio.TimeoutError:
+            return None  # idle poll — caller loops and re-stamps the heartbeat
+        _, _, job_id, queued_at = item
+        try:
+            job = self.store.get(job_id)
+            if job is None or job["status"] not in ("received", "queued"):
+                return None  # stale wakeup — the DB row moved on
+            return job, queued_at
+        finally:
+            self.queue.task_done()
+
     async def run_forever(self):
         await self.clickup.load_statuses()
-        # SQLite is the queue of record: re-enqueue whatever a restart dropped
-        for job in self.store.requeueable():
-            self._enqueue(job["issue_id"], self._priority_for(job))
-            log.info("startup requeue: %s (%s)", job["issue_id"], job["status"])
+        # SQLite is the queue of record: re-enqueue whatever a restart dropped.
+        # On Postgres the DB claim loop is authoritative — no in-process queue.
+        if not self.settings.multi_worker:
+            for job in self.store.requeueable():
+                self._enqueue(job["issue_id"], self._priority_for(job))
+                log.info("startup requeue: %s (%s)", job["issue_id"], job["status"])
         await self._recover_interrupted()
-        log.info("worker started")
+        log.info("worker started (id=%s, backend=%s)", self.worker_id,
+                 self.settings.db_backend)
         while True:
-            _, _, job_id, queued_at = await self.queue.get()
+            self.last_tick = time.time()  # F4 heartbeat
             try:
-                job = self.store.get(job_id)
-                if job is None or job["status"] not in ("received", "queued"):
-                    continue  # stale wakeup — the DB row moved on
-                await self._process(job, queued_at)
+                nxt = await self._next_job()
+            except Exception:
+                # A transient fetch error (e.g. sqlite3.OperationalError
+                # 'database is locked' past the busy timeout, or a Postgres
+                # claim hiccup) must NOT kill the unsupervised loop — run_forever
+                # is a bare fire-and-forget task with no restarter. Log, brief
+                # backoff, and keep dispatching (matches the pre-F4 per-job
+                # resilience the store.get read used to have inside the try).
+                log.exception("job fetch failed; continuing loop")
+                await asyncio.sleep(1)
+                continue
+            if nxt is None:
+                continue
+            job, queued_at = nxt
+            job_id = job["issue_id"]
+            try:
+                # F4: every log line emitted while this job runs carries its id
+                with logconfig.logctx(job_id=job_id):
+                    await self._process(job, queued_at)
             except Exception as e:
                 log.exception("job %s failed", job_id)
                 self.store.set_status(job_id, "error", detail=str(e)[:2000])
@@ -249,20 +406,38 @@ class Worker:
                     f"{GATE_PREFIX} internal error on this job: {str(e)[:500]}",
                 )
             finally:
-                self.queue.task_done()
+                if self.settings.multi_worker:
+                    # guard on worker_id: a re-queue-during-run path (C2
+                    # auto-advance / P6 skip / transient retry) may have already
+                    # handed this row to a sibling that re-claimed it while we
+                    # finished post-run I/O — never wipe the sibling's ownership.
+                    self.store.release_claim(job_id, self.worker_id)  # drop OUR claim
 
     async def _recover_interrupted(self):
-        """Boot-time crash recovery: at startup NO run can legitimately be
-        'running' — the CLI subprocess dies with the process (deploys restart
-        the container mid-run). Requeue those corpses immediately instead of
-        letting the stale-run reaper surface them as errors an hour later;
-        the stage/phase machinery re-runs them cleanly (attempts bump, fresh
-        checkout). The reaper stays for mid-life zombies in a live process."""
-        for job in self.store.by_status(["running"]):
-            self.store.set_status(
-                job["issue_id"], "queued",
-                detail="recovered: a restart interrupted the previous run — re-running")
-            self._enqueue(job["issue_id"], self._priority_for(job))
+        """Boot-time crash recovery: at startup NO run this worker owns can
+        legitimately be 'running' — the CLI subprocess dies with the process
+        (deploys restart the container mid-run). Requeue those corpses
+        immediately instead of letting the stale-run reaper surface them as
+        errors an hour later; the stage/phase machinery re-runs them cleanly
+        (attempts bump, fresh checkout).
+
+        Epic F2: with multiple live workers, a blanket reset of EVERY 'running'
+        row would corrupt a sibling's in-flight run. On Postgres recovery is
+        SCOPED to this worker's own claims (claimed_by == worker_id); cross-
+        worker zombies are left to the reaper (run_started_at + grace). SQLite
+        (single consumer) keeps the blanket reset."""
+        if self.settings.multi_worker:
+            recovered = self.store.recover_worker_claims(self.worker_id)
+        else:
+            recovered = []
+            for job in self.store.by_status(["running"]):
+                self.store.set_status(
+                    job["issue_id"], "queued",
+                    detail="recovered: a restart interrupted the previous run — re-running")
+                recovered.append(job)
+        for job in recovered:
+            if not self.settings.multi_worker:
+                self._enqueue(job["issue_id"], self._priority_for(job))
             log.info("startup recovery: requeued interrupted run %s", job["issue_id"])
             await self.clickup.comment(
                 job.get("clickup_task_id") or "",
@@ -273,6 +448,16 @@ class Worker:
         """Every workspace toucher runs under its repo's lock (chat runs and the
         canonical product-scope reads take the same locks — see Engine.RepoLocks)."""
         kind = job.get("kind") or "sentry"
+        if kind == "watch":
+            # fail closed, forever: a watch job must NEVER reach a Claude run —
+            # the watch loop owns its whole lifecycle. Any path that queues one
+            # (stale wakeup, future bug) lands here and is handed back.
+            log.warning("watch job %s reached the run queue — returning it to the "
+                        "watch loop, no Claude run", job["issue_id"])
+            self.store.set_status(job["issue_id"], "watching",
+                                  detail="watch jobs never run Claude — returned to "
+                                         "the watch loop")
+            return
         if kind == "sentry":
             # a fresh sentry job's project isn't known until the issue is fetched;
             # _process_sentry acquires the repo lock itself once it is
@@ -307,6 +492,9 @@ class Worker:
             title=issue.get("title", "unknown")[:300],
             project=project_slug,
             issue_url=issue.get("permalink", ""),
+            # Epic I5: the cluster substrate — single-lined + capped at write.
+            # Pre-upgrade rows keep culprit='' (clusters accumulate forward).
+            culprit=_single_line(issue.get("culprit") or "", 300),
         )
         # webhook intake has no project yet — stamp the workspace the moment
         # the slug is known (before any skip path), or webhook-sourced jobs
@@ -326,6 +514,13 @@ class Worker:
                 issue_id, "skipped",
                 detail=f"daily cap of {self.settings.max_runs_per_day} Claude runs reached",
             )
+            return
+
+        # Epic G4: budget block BEFORE a Claude run is dispatched. Mirrors the
+        # daily-cap posture exactly — forced (live-sentry webhook / manual)
+        # runs are exempt, matching runs_today above (never stricter than the
+        # existing cap for the sentry lane).
+        if self._budget_block(self.store.get(issue_id), forced):
             return
 
         target = self.settings.repo_for_project(project_slug)
@@ -365,7 +560,13 @@ class Worker:
             "project": project_slug,
         }
         stacktrace = format_stacktrace(event)
-        branch = f"brain/sentry-{issue_id}"
+        # stored branch wins (phase-2 runs and backfilled pre-rename rows keep
+        # the branch phase 1 pushed); new jobs get the configured prefix,
+        # persisted before first use
+        branch = (row.get("branch") or "").strip() \
+            or f"{self.settings.branch_prefix}/sentry-{issue_id}"
+        if branch != (row.get("branch") or ""):
+            self.store.set_fields(issue_id, branch=branch)
 
         # live observation: v1 runs stream into the same broker the inbox detail
         # pane subscribes to (session/stream), exactly like feature stages —
@@ -391,22 +592,27 @@ class Worker:
             pname, brief = self._job_context(row)
             async with self.locks.for_repo(target.repo):  # workspace toucher
                 emit("status", "preparing the repository workspace")
+                # workspace FIRST: the prompt's memory-write paths resolve the
+                # repo's engine namespace from the actual clone, so legacy
+                # `.gumo/` repos keep feeding memory (ENGINE.md §4)
                 if phase == 2:
+                    workspace = await prepare_workspace(self.settings, target, branch, keep_branch=True)
                     prompt = build_phase2_prompt(
                         target=target, branch=branch, issue=issue_info, stacktrace=stacktrace,
                         clickup_task_id=task_id,
                         analysis=row.get("analysis") or "(analysis missing)",
                         guidance=row.get("guidance") or "(no guidance recorded)",
                         product_name=pname, business_context=brief,
+                        ns=engine_dir(workspace),
                     )
-                    workspace = await prepare_workspace(self.settings, target, branch, keep_branch=True)
                 else:
+                    workspace = await prepare_workspace(self.settings, target, branch)
                     prompt = build_fix_prompt(
                         target=target, branch=branch, issue=issue_info, stacktrace=stacktrace,
                         clickup_task_id=task_id,
                         product_name=pname, business_context=brief,
+                        ns=engine_dir(workspace),
                     )
-                    workspace = await prepare_workspace(self.settings, target, branch)
 
                 log.info("running claude for issue %s phase %s (%s)", issue_id, phase, target.repo)
                 result = await run_claude(
@@ -470,7 +676,11 @@ class Worker:
             "project": project,
         }
         request_text = row.get("request") or row.get("title") or ""
-        branch = f"brain/{job_id}"
+        # stored branch wins (phase 2 / backfilled rows); else configured prefix
+        branch = (row.get("branch") or "").strip() \
+            or f"{self.settings.branch_prefix}/{job_id}"
+        if branch != (row.get("branch") or ""):
+            self.store.set_fields(job_id, branch=branch)
 
         # live observation: stream this run to the inbox detail pane (see
         # _process_sentry for the same wiring on the sentry path), teeing every
@@ -489,22 +699,25 @@ class Worker:
         try:
             pname, brief = self._job_context(row)
             emit("status", "preparing the repository workspace")
+            # workspace FIRST — see _process_sentry: prompt memory paths follow
+            # the clone's actual engine namespace
             if phase == 2:
+                workspace = await prepare_workspace(self.settings, target, branch, keep_branch=True)
                 prompt = build_task_implement_prompt(
                     target=target, branch=branch, task=task_info, request=request_text,
                     clickup_task_id=task_id or None,
                     analysis=row.get("analysis") or "(analysis missing)",
                     guidance=row.get("guidance") or "(no guidance recorded)",
                     product_name=pname, business_context=brief,
+                    ns=engine_dir(workspace),
                 )
-                workspace = await prepare_workspace(self.settings, target, branch, keep_branch=True)
             else:
+                workspace = await prepare_workspace(self.settings, target, branch)
                 prompt = build_task_plan_prompt(
                     target=target, branch=branch, task=task_info, request=request_text,
                     clickup_task_id=task_id or None,
                     product_name=pname, business_context=brief,
                 )
-                workspace = await prepare_workspace(self.settings, target, branch)
 
             log.info("running claude for request %s phase %s (%s)", job_id, phase, target.repo)
             result = await run_claude(
@@ -594,19 +807,53 @@ class Worker:
             raise ValueError("steering is only valid for feature pipelines")
         return self.engine.request_steer(job_id, note, via=via)
 
-    async def answer_job(self, job_id: str, action: str, text: str, via: str) -> str:
+    async def answer_job(self, job_id: str, action: str, text: str, via: str,
+                         actor: dict | None = None, override: bool = False) -> str:
         """Single resolution path for gate answers from BOTH channels.
         Returns the new status. Raises KeyError (unknown), ValueError (invalid
-        action/state), GateConflict (lost the CAS race)."""
+        action/state), GateConflict (lost the CAS race), GateForbidden (the
+        actor does not own a role-exclusive gate — Epic A3). `actor` is the
+        acting user row when resolvable (dashboard: always; ClickUp: via the
+        clickup_user_id mapping); `override` is the audited dashboard-only
+        admin bypass."""
         job = self.store.get(job_id)
         if job is None:
             raise KeyError(job_id)
         kind = job.get("kind") or "sentry"
+        stage_at_answer = job.get("stage")
         if kind == "feature":
-            return await self._answer_feature(job, action, text, via)
-        if action == "redo":
-            raise ValueError(f"redo is only valid for feature pipelines, not kind '{kind}'")
-        return await self._answer_v1(job, action, text, via)
+            status = await self._answer_feature(job, action, text, via,
+                                                actor=actor, override=override)
+        elif kind == "watch":
+            # BEFORE the v1 redo-refusal: the Iterate gate supports /redo <days>
+            status = await self._answer_watch(job, action, text, via,
+                                              actor=actor, override=override)
+        else:
+            if action == "redo":
+                raise ValueError(f"redo is only valid for feature pipelines, not kind '{kind}'")
+            status = await self._answer_v1(job, action, text, via)
+        # Epic E4: audit the gate decision AFTER the answer won its CAS (any
+        # loser raised GateConflict/GateForbidden above and never reaches here).
+        # answer_job is the single choke point BOTH channels funnel through
+        # (dashboard + the ClickUp poller at worker.py:1501), so this one hook
+        # covers both. Channel derived from `via`; the acting principal too.
+        self._audit_gate_decision(job, action, via, actor, status, stage_at_answer)
+        return status
+
+    def _audit_gate_decision(self, job, action, via, actor, status, stage):
+        try:
+            channel = "clickup" if via.startswith("clickup") else "dashboard"
+            actor_str = via if actor is None else (
+                f"dashboard:{actor['username']}" if channel == "dashboard"
+                else f"clickup:{actor['username']}")
+            audit.record(
+                self.store, audit.GATE_DECISION, actor=actor_str, actor_kind="user",
+                scope="job", workspace_id=job.get("workspace_id"),
+                job_id=job.get("issue_id") or "", channel=channel,
+                target=f"P{stage}" if stage is not None else "",
+                detail={"stage": stage, "verdict": action, "state": status})
+        except Exception:  # audit must never break a won gate transition
+            log.debug("gate-decision audit failed", exc_info=True)
 
     async def _answer_v1(self, job: dict, action: str, text: str, via: str) -> str:
         job_id = job["issue_id"]
@@ -649,7 +896,75 @@ class Worker:
         await self.clickup.field_append(task_id, "Decisions",
                                         f"P{stage}{label}: {text[:400]}")
 
-    async def _answer_feature(self, job: dict, action: str, text: str, via: str) -> str:
+    def _register_decision(self, job: dict, stage: int | None, title: str,
+                           text: str, via: str, *, gid: int,
+                           scope: str = "job", job_id: str | None = None):
+        """Epic D2: auto-register a SUBSTANTIVE gate answer (non-empty text —
+        the same emptiness guard as _sync_decision_field) into the decision
+        registry, ref='g<guidance id>' so any replay dedupes. Best-effort:
+        a registry hiccup must never break a won gate transition."""
+        if not (text or "").strip():
+            return
+        links = [job["clickup_task_url"]] if job.get("clickup_task_url") else []
+        try:
+            self.store.decision_add(
+                "gate", text.strip(), ref=f"g{gid}", scope=scope,
+                job_id=job_id if job_id is not None else job["issue_id"],
+                workspace_id=job.get("workspace_id"),
+                project=job.get("project") or "", stage=stage,
+                title=title, decided_by=via, links=links)
+        except Exception:
+            log.exception("decision auto-registration failed for %s (non-fatal)",
+                          job.get("issue_id"))
+
+    def _owner_guard(self, job: dict, actor: dict | None,
+                     override: bool) -> tuple["roles.GateOwner | None", bool]:
+        """Role-exclusive enforcement shared by feature gates AND the watch
+        Iterate gate (Epic A3 / ENGINE.md §2b): raises GateForbidden for a
+        non-owner, or returns (owner, admin_override) — True only for the
+        explicit, dashboard-only admin bypass (audited by the caller AFTER a
+        won CAS). Inert when the job records no explicit DRIs."""
+        owner = roles.gate_owner(self.store, self.settings, self._ws_row(job), job)
+        admin_override = False
+        if owner is not None and owner.enforce and not roles.actor_is_owner(owner, actor):
+            # Epic E3: the admin override is a workspace-admin power (instance
+            # admins are admin everywhere) — resolved via rbac, not a string
+            # compare, so a workspace admin can override their workspace's gate.
+            if (actor and override
+                    and rbac.can_configure_workspace(self.store, actor, job.get("workspace_id"))):
+                admin_override = True  # dashboard-only, explicit, audited by caller
+            else:
+                raise GateForbidden(f"this is a {owner.role} gate, owned by {owner.display}")
+        return owner, admin_override
+
+    async def _answer_feature(self, job: dict, action: str, text: str, via: str,
+                              actor: dict | None = None, override: bool = False) -> str:
+        """Role-exclusive gates (Epic A3), enforced at the single choke point
+        BOTH channels funnel through — before any CAS, never replacing it.
+        Inert when the job records no explicit DRIs (gate_owner enforce=False
+        or None — solo installs and pre-upgrade jobs behave exactly as today).
+        Applies to proceed/redo/skip including ask-gates and redo-from-error;
+        gate chat and plain comments are untouched."""
+        owner, admin_override = self._owner_guard(job, actor, override)
+        result = await self._answer_feature_inner(job, action, text, via, override=override)
+        if admin_override:
+            # recorded only AFTER the transition succeeded — a lost CAS raises
+            # GateConflict above and must leave NO override audit row. The ref
+            # is a uuid: an audit record must never be eaten by the dedupe key.
+            self.store.gate_event_add(
+                job["issue_id"], "admin_override", ref=uuid.uuid4().hex,
+                stage=int(job.get("stage") or 0), actor=via,
+                detail=f"{action} on a {owner.role} gate owned by {owner.display}")
+            audit.record(self.store, audit.GATE_OVERRIDE, actor=via, actor_kind="user",
+                         scope="job", workspace_id=job.get("workspace_id"),
+                         job_id=job["issue_id"],
+                         channel="clickup" if via.startswith("clickup") else "dashboard",
+                         detail={"verdict": action, "role": owner.role})
+            log.info("admin override: %s %s by %s", job["issue_id"], action, via)
+        return result
+
+    async def _answer_feature_inner(self, job: dict, action: str, text: str, via: str,
+                                    override: bool = False) -> str:
         job_id = job["issue_id"]
         stage = int(job.get("stage") or 0)
         task_id = job.get("clickup_task_id") or ""
@@ -683,13 +998,33 @@ class Worker:
                                          gate_kind="", resume_session_id="",
                                          resume_stage=None, resume_attempt=None,
                                          resume_head="", resume_answer="", ask_count=0,
-                                         auto_retries=0):
+                                         auto_retries=0,
+                                         # F2: a redo re-queues the job; drop any stale
+                                         # claim so the multi-worker claim loop can pick
+                                         # it up (claimed_by non-empty iff running).
+                                         claimed_by="", claimed_at=None):
                 raise GateConflict("already answered")
-            self.store.guidance_add(job_id, target_stage, "redo", text, via,
-                                    job.get("parked_head") or "")
+            if override:
+                # Epic G4: an explicit admin redo carries a ONE-SHOT budget
+                # override so a budget-blocked stage (parked as 'error') can be
+                # re-kicked and proceed once. engine.run_stage consumes it and
+                # audits BUDGET_OVERRIDE; the next over-budget stage re-parks.
+                self.store.set_fields(job_id, budget_override=1)
+            gid = self.store.guidance_add(job_id, target_stage, "redo", text, via,
+                                          job.get("parked_head") or "")
+            self._register_decision(job, target_stage, f"P{target_stage} redo",
+                                    text, via, gid=gid)
             self.store.stage_run_gate_answered(job_id, stage, "redo")
+            # Epic I5: a human redo IS friction — recorded as ENGINE data
+            # unconditionally (independent of the ClickUp field-sync flag;
+            # the row is the record, the mirror below stays visibility)
+            if text:
+                self.store.friction_add(job_id, job.get("workspace_id"),
+                                        job.get("project") or "",
+                                        target_stage, "redo", text)
             await self._sync_decision_field(task_id, target_stage, " (redo)", text)
-            if self.settings.clickup_field_sync_enabled and text and task_id:
+            if (self.settings.clickup_field_sync_enabled and text and task_id
+                    and self.settings.clickup_friction_field):
                 # a human redo IS workflow friction — feed the improvement loop
                 await self.clickup.field_append(
                     task_id, self.settings.clickup_friction_field,
@@ -716,8 +1051,9 @@ class Worker:
                                          expected_stage=stage,
                                          question="", resume_answer=answer):
                 raise GateConflict("already answered")
-            self.store.guidance_add(job_id, stage, "answer", answer, via,
-                                    job.get("parked_head") or "")
+            gid = self.store.guidance_add(job_id, stage, "answer", answer, via,
+                                          job.get("parked_head") or "")
+            self._register_decision(job, stage, f"P{stage} answer", text, via, gid=gid)
             self.store.stage_run_gate_answered(job_id, stage, "answer")
             self._distill_chat(job, stage)
             await self._sync_decision_field(task_id, stage, " (ask)", text)
@@ -735,8 +1071,9 @@ class Worker:
                                          expected_stage=stage, question="",
                                          detail="pipeline complete — P9 approved"):
                 raise GateConflict("already answered")
-            self.store.guidance_add(job_id, stage, "proceed", guidance, via,
-                                    job.get("parked_head") or "")
+            gid = self.store.guidance_add(job_id, stage, "proceed", guidance, via,
+                                          job.get("parked_head") or "")
+            self._register_decision(job, stage, f"P{stage} proceed", text, via, gid=gid)
             self.store.stage_run_gate_answered(job_id, stage, "proceed")
             await self._sync_decision_field(task_id, stage, "", text)
             await self.clickup.comment(
@@ -746,6 +1083,14 @@ class Worker:
             # conveyor mirror: the shipped feature sits in Dogfood until its PR
             # merges (the shepherd then slides it to Complete)
             await self.engine.sync_stage_field(job, "shipped")
+            # outcome loop (Epic B4), early-merge case: a human merged the PR
+            # before P9 approval — the shepherd's merged branch fired while the
+            # pipeline was live and the spawn guard refused. Now the feature is
+            # terminal: spawn if a tracked PR is already merged.
+            if final == "pr_opened" and any(
+                    (p.get("state") or "") == "merged"
+                    for p in self.store.prs_for(job_id)):
+                await self._maybe_spawn_watch(self.store.get(job_id) or job)
             return final
 
         if not self.store.cas_status(job_id, ["awaiting_input"], "queued",
@@ -753,8 +1098,9 @@ class Worker:
                                      stage=stage + 1, stage_attempts=0, question="",
                                      ask_count=0):
             raise GateConflict("already answered")
-        self.store.guidance_add(job_id, stage, "proceed", guidance, via,
-                                job.get("parked_head") or "")
+        gid = self.store.guidance_add(job_id, stage, "proceed", guidance, via,
+                                      job.get("parked_head") or "")
+        self._register_decision(job, stage, f"P{stage} proceed", text, via, gid=gid)
         self.store.stage_run_gate_answered(job_id, stage, "proceed")
         self._distill_chat(job, stage)
         await self._sync_decision_field(task_id, stage, "", text)
@@ -814,6 +1160,380 @@ class Worker:
             "If it asks for input, reply `/proceed <guidance>` or `/skip`._"
         )
 
+    # ---------- the outcome loop (Epic B4/B5) ----------
+
+    WATCH_REDO_RE = re.compile(r"^\s*(\d{1,4})\b\s*")
+
+    def _analytics_provider_for(self, job: dict):
+        """The job's analytics driver. Guards the bare-Worker shape (tests
+        construct Worker without the workspace service) — NullAnalytics-or-
+        instance-env instead of an AttributeError."""
+        if self.workspaces:
+            return self.workspaces.analytics_for(self.workspaces.for_job(job))
+        return analytics.provider_for(self.settings, None)
+
+    async def _maybe_spawn_watch(self, job: dict):
+        """Spawn the post-ship watch for a merged feature. Idempotent by the
+        `watch-<feature id>` row; fires ONLY when the feature pipeline is
+        terminal at 'pr_opened' — a PR merged mid-pipeline must never put a
+        second gate on the same ticket while feature gates are still live
+        (the P9-approval path re-checks and spawns then)."""
+        if not self.settings.watch_enabled:
+            return
+        if (job.get("kind") or "") != "feature":
+            return
+        if (job.get("status") or "") != "pr_opened":
+            return
+        job_id = job["issue_id"]
+        watch_id = f"watch-{job_id}"
+        if self.store.get(watch_id):
+            return  # already spawned (this lap; re-intake resets the row)
+        metric = (job.get("success_metric") or "").strip()
+        event = (job.get("metric_event") or "").strip()
+        task_id = job.get("clickup_task_id") or ""
+        if not metric and not event:
+            # one note per FEATURE, not per merged PR (multi-PR features hit
+            # the shepherd's merged branch once per PR) — gate_events dedupe
+            if self.store.gate_event_add(
+                    job_id, "watch_skipped", ref="no-metric", actor="engine",
+                    detail="no success metric recorded — outcome watch skipped"):
+                await self.clickup.comment(
+                    task_id, f"{GATE_PREFIX} no success metric recorded — outcome "
+                             "watch skipped. Add a metric at intake (or a P9 "
+                             "SUCCESS_METRIC/METRIC_EVENT line) next time.")
+            return
+        days = job.get("metric_window_days") or self.settings.metric_window_days_default
+        days = max(1, min(365, int(days)))
+        now = time.time()
+        try:
+            self.store.watch_insert(
+                watch_id,
+                title=f"watch: {job.get('title') or job_id}"[:300],
+                project=job.get("project") or "",
+                workspace_id=job.get("workspace_id"),
+                related_jobs=job_id,
+                success_metric=metric,
+                metric_target=(job.get("metric_target") or "").strip(),
+                metric_event=event,
+                metric_window_days=days,
+                watch_started_at=now,
+                watch_deadline=now + days * 86400,
+                # founder-owned Iterate gate: BOTH DRI columns are copied so
+                # roles.gate_owner enforces it exactly like feature gates
+                # (founder slot wins, dev is the fallback owner; legacy `owner`
+                # stays display/assignment only)
+                owner=(job.get("founder_dri") or "").strip() or (job.get("owner") or "").strip(),
+                founder_dri=(job.get("founder_dri") or "").strip(),
+                dev_dri=(job.get("dev_dri") or "").strip(),
+                clickup_task_id=task_id,
+                clickup_task_url=job.get("clickup_task_url") or "",
+                cu_list_id=job.get("cu_list_id") or "",
+            )
+        except db.IntegrityError:
+            # Epic F2 multi-worker: get(watch_id)==None above, then a concurrent
+            # process inserted the same watch-<id> row before we did — the two
+            # shepherds racing each other, or a shepherd racing the P9-approval
+            # spawn path (worker.py answer_job). The row lands exactly ONCE; this
+            # is the idempotent no-op this method promises, NOT an error. Swallow
+            # so the loser never 500s an already-committed P9 gate (whose CAS,
+            # guidance, decision and ClickUp side effects all succeeded) — the
+            # winner posts the watch-started comment.
+            log.info("watch %s already spawned by a concurrent worker — skipping",
+                     watch_id)
+            return
+        # deliberately NO clickup.set_status here: the shepherd just slid the
+        # Stage field to Complete — the ticket status flips only at park/close
+        await self.clickup.comment(
+            task_id, f"{GATE_PREFIX} 📈 outcome watch started: "
+                     f"'{metric or event}' for {days} day(s). The Iterate gate "
+                     "parks here when the window closes.")
+        log.info("watch %s spawned for %s (%d days)", watch_id, job_id, days)
+
+    async def watch_forever(self):
+        """The post-ship watch loop: pure HTTP metric reads (no repo locks, no
+        Claude tokens), a verdict + founder-owned Iterate gate at deadline."""
+        while True:
+            await asyncio.sleep(self.settings.watch_interval_seconds)
+            try:
+                await self._watch_pass()
+            except Exception:
+                log.exception("watch pass failed")
+
+    async def _watch_pass(self):
+        if not self.settings.watch_enabled:
+            return
+        now = time.time()
+        for job in self.store.by_status(["watching"]):
+            if (job.get("kind") or "") != "watch":
+                continue
+            try:
+                provider = self._analytics_provider_for(job)
+                if now >= float(job.get("watch_deadline") or 0):
+                    await self._finish_watch(job, provider)
+                elif self.store.reading_last_at(job["issue_id"]) < now - WATCH_READ_THROTTLE_SECONDS:
+                    await self._watch_read(job, provider, now)
+            except Exception:
+                log.exception("watch %s pass failed", job["issue_id"])
+
+    async def _watch_read(self, job: dict, provider, now: float):
+        """One daily window-to-date read. Failures leave a visible detail on
+        the job — never a fake reading row."""
+        job_id = job["issue_id"]
+        started = float(job.get("watch_started_at") or now)
+        window = int(job.get("metric_window_days") or self.settings.metric_window_days_default)
+        day = min(window, int((now - started) // 86400) + 1)
+        metric = job.get("success_metric") or ""
+        event = job.get("metric_event") or ""
+        res = await provider.query_metric(metric, day, event=event)
+        if res.get("status") == "ok":
+            self.store.reading_add(job_id, metric, event, observed=res.get("total"),
+                                   window_day=day, detail=(res.get("detail") or "")[:400],
+                                   window_start=started)
+            self.store.set_fields(job_id, detail=f"day {day}/{window}: "
+                                                 f"window-to-date {res.get('total')}")
+        else:
+            self.store.set_fields(
+                job_id, detail=f"metric read {res.get('status')}: "
+                               f"{(res.get('detail') or '')[:300]}")
+
+    async def _finish_watch(self, job: dict, provider):
+        """Window closed: final read, verdict, ledger row, Iterate-gate park.
+        Ordering contract: the outcomes row and the CAS to awaiting_input
+        commit BEFORE any ClickUp call (all of which are best-effort)."""
+        job_id = job["issue_id"]
+        started = float(job.get("watch_started_at") or 0)
+        window = int(job.get("metric_window_days") or self.settings.metric_window_days_default)
+        metric = job.get("success_metric") or ""
+        event = job.get("metric_event") or ""
+        final = await provider.query_metric(metric, window, event=event)
+        if final.get("status") == "ok":
+            self.store.reading_add(job_id, metric, event, observed=final.get("total"),
+                                   window_day=window, detail="final read",
+                                   window_start=started)
+        existing = self.store.outcome_for(job_id)
+        if existing and existing.get("baseline") is not None:
+            # a /redo re-finish keeps the ORIGINAL pre-merge baseline — a
+            # window ending at the refreshed start would include post-ship data
+            baseline = existing["baseline"]
+        else:
+            # no persisted baseline (first finish, or the first finish's query
+            # failed and stored NULL): the query must END at the ORIGINAL
+            # merge-time spawn, never the current window's start — a /redo
+            # overwrites watch_started_at, and a window ending there would be
+            # entirely post-ship data mislabeled "same-length pre-ship window"
+            # (ENGINE.md §2b). The spawn instant survives as the row's
+            # created_at (watch_insert stamps it in the same transaction).
+            anchor = float(job.get("created_at") or started)
+            base_res = await provider.query_metric(metric, window, event=event, end=anchor)
+            baseline = base_res.get("total") if base_res.get("status") == "ok" else None
+        readings = self.store.readings_for(job_id, window_start=started)
+        verdict, inputs = outcome.compute_verdict(
+            readings, job.get("metric_target") or "", baseline,
+            self.settings.outcome_flat_band_pct)
+        feature_id = (job.get("related_jobs") or "").split(",")[0].strip()
+        self.store.outcome_add(
+            job_id, feature_id, job.get("workspace_id"),
+            metric=metric, metric_event=event,
+            target=(job.get("metric_target") or "").strip(),
+            observed=inputs.get("observed"), baseline=baseline, window_days=window,
+            verdict=verdict, verdict_inputs=json.dumps(inputs))
+        fields = self.store.outcome_for(job_id) or {}
+        packet = outcome.build_gate_packet(job, fields, readings)
+        task_id = job.get("clickup_task_id") or ""
+        comments = await self.clickup.comments(task_id)
+        marker = comments[-1]["id"] if comments else ""
+        if not self.store.cas_status(job_id, ["watching"], "awaiting_input",
+                                     analysis=packet,
+                                     question=extract_questions(packet),
+                                     comment_marker=marker,
+                                     detail=packet[:2000]):
+            return  # a human raced the finish (e.g. /skip) — theirs wins, silently
+        # everything below is best-effort visibility AFTER the committed CAS
+        await self.clickup.comment(
+            task_id,
+            f"{GATE_PREFIX} **Iterate gate: {job.get('title') or job_id} — "
+            f"verdict {verdict}**\n\n{packet[:6000]}\n\n---\n"
+            "Reply `/proceed <learning>` to log the learning and close, "
+            "`/redo <days>` to watch again, or `/skip` to close without a "
+            "learning — here or on the dashboard.")
+        await self.clickup.set_status(task_id, "awaiting_input")
+        owner = (job.get("owner") or "").strip()
+        if owner:
+            await self.clickup.set_assignee(task_id, owner)
+        if self.workspaces:
+            await self.workspaces.notify_gate(
+                job, f"📊 {job.get('title') or job_id} — outcome verdict "
+                     f"'{verdict}'; the Iterate gate is waiting.")
+        log.info("watch %s parked at the Iterate gate (verdict %s)", job_id, verdict)
+
+    async def _answer_watch(self, job: dict, action: str, text: str, via: str,
+                            actor: dict | None = None, override: bool = False) -> str:
+        """The Iterate gate's verbs. Founder-owned and role-enforced exactly
+        like feature gates (ENGINE.md §2b — gate_owner handles kind='watch');
+        inert without explicit DRIs on the row. Every mutation is CAS-guarded
+        and lands in guidance_log (auditable); ClickUp strictly after the CAS,
+        best-effort."""
+        owner, admin_override = self._owner_guard(job, actor, override)
+        result = await self._answer_watch_inner(job, action, text, via)
+        if admin_override:
+            # recorded only AFTER the transition succeeded (a lost CAS raises
+            # GateConflict and must leave NO override row); uuid ref so the
+            # dedupe key can never eat an audit record — same discipline as
+            # the feature-gate override
+            self.store.gate_event_add(
+                job["issue_id"], "admin_override", ref=uuid.uuid4().hex,
+                stage=None, actor=via,
+                detail=f"{action} on the {owner.role}-owned Iterate gate "
+                       f"owned by {owner.display}")
+            audit.record(self.store, audit.GATE_OVERRIDE, actor=via, actor_kind="user",
+                         scope="job", workspace_id=job.get("workspace_id"),
+                         job_id=job["issue_id"],
+                         channel="clickup" if via.startswith("clickup") else "dashboard",
+                         detail={"verdict": action, "role": owner.role})
+            log.info("admin override: %s %s by %s", job["issue_id"], action, via)
+        return result
+
+    async def _answer_watch_inner(self, job: dict, action: str, text: str, via: str) -> str:
+        job_id = job["issue_id"]
+        task_id = job.get("clickup_task_id") or ""
+        now = time.time()
+        text = (text or "").strip()
+
+        if action == "skip":
+            # also valid mid-window: cancelling a watch is a human decision
+            if not self.store.cas_status(job_id, ["awaiting_input", "watching"], "skipped",
+                                         question="",
+                                         detail=f"watch closed by human via {via}"):
+                raise GateConflict("already answered")
+            if self.store.outcome_for(job_id):
+                self.store.outcome_set(job_id, decided_by=via, decided_at=now)
+            self.store.guidance_add(job_id, None, "skip", text, via)
+            await self.clickup.comment(
+                task_id, f"{GATE_PREFIX} Outcome watch closed (via {via}) — the "
+                         "verdict stands; no learning recorded.")
+            await self.clickup.set_status(task_id, "skipped")
+            return "skipped"
+
+        if action == "redo":
+            days = int(job.get("metric_window_days")
+                       or self.settings.metric_window_days_default)
+            m = self.WATCH_REDO_RE.match(text)
+            if m:
+                requested = int(m.group(1))
+                if not 1 <= requested <= 365:
+                    raise ValueError(f"watch window must be 1–365 days, got {requested}")
+                days = requested
+                text = text[m.end():].strip()
+            if not self.store.cas_status(job_id, ["awaiting_input"], "watching",
+                                         question="", metric_window_days=days,
+                                         watch_started_at=now,
+                                         watch_deadline=now + days * 86400,
+                                         detail=f"watch re-armed for {days} day(s) via {via}"):
+                raise GateConflict("already answered")
+            self.store.guidance_add(job_id, None, "redo", text, via)
+            await self.clickup.comment(
+                task_id, f"{GATE_PREFIX} Watching again for {days} day(s) (via {via})."
+                         + (f" Notes: {text[:300]}" if text else ""))
+            return "watching"
+
+        if action != "proceed":
+            raise ValueError(f"unknown action '{action}'")
+        if not self.store.cas_status(job_id, ["awaiting_input"], "done",
+                                     question="", detail="outcome recorded"):
+            raise GateConflict("already answered")
+        self.store.outcome_set(job_id, learning=text, decided_by=via, decided_at=now)
+        gid = self.store.guidance_add(job_id, None, "proceed", text, via)
+        # Epic D2: the Iterate learning is the measured-reality decision the
+        # next lap starts from — registered scope='product' against the
+        # FEATURE id, ref='g<gid>' (the proceed guidance row) so any replay
+        # dedupes instead of duplicating.
+        feature_id = (job.get("related_jobs") or "").split(",")[0].strip()
+        feature_title = (job.get("title") or job_id).removeprefix("watch: ")
+        self._register_decision(job, None, f"Outcome: {feature_title}"[:200],
+                                text, via, gid=gid, scope="product",
+                                job_id=feature_id)
+        await self.clickup.comment(
+            task_id, f"{GATE_PREFIX} Outcome recorded (via {via})."
+                     + (f" Learning: {text[:400]}" if text else ""))
+        await self.clickup.set_status(task_id, "done")
+        if self.settings.outcome_memory_prs:
+            # background, strong-ref'd: the HTTP answer never blocks on a repo lock
+            t = asyncio.create_task(self._outcome_memory_task(self.store.get(job_id) or job))
+            self._bg_tasks.add(t)
+            t.add_done_callback(self._bg_tasks.discard)
+        return "done"
+
+    async def _outcome_memory_task(self, job: dict):
+        """Mechanical (NO model run) memory propagation: changelog entry (+ ADR
+        when a learning was recorded) on a fresh branch, pushed, opened as a
+        draft PR. Git stays truth — the entry only enters the memory tree via a
+        human-merged PR; the outcomes DB row is the record either way. Never
+        raises: failures land in the job detail + a ClickUp note."""
+        job_id = job["issue_id"]
+        try:
+            feature_id = (job.get("related_jobs") or "").split(",")[0].strip()
+            feature = self.store.get(feature_id) or {}
+            row = self.store.outcome_for(job_id) or {}
+            target = self.settings.repo_for_project(job.get("project") or "")
+            if target is None:
+                self.store.set_fields(job_id, detail="outcome memory PR skipped: "
+                                                     "no repo mapped")
+                return
+            branch = f"{self.settings.branch_prefix}/outcome-{feature_id or job_id}"
+            async with self.locks.for_repo(target.repo):
+                workspace = await prepare_workspace(self.settings, target, branch)
+                # the CLONE resolves the namespace (legacy `.gumo/` repos keep
+                # their tree) — never the literal constant
+                ns = engine_dir(workspace)
+                rel, body = outcome.build_outcome_entry(row, feature, ns=ns)
+                path = Path(workspace) / rel
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(body)
+                if (row.get("learning") or "").strip():
+                    arel, abody = outcome.build_outcome_adr(row, feature, ns=ns)
+                    apath = Path(workspace) / arel
+                    apath.parent.mkdir(parents=True, exist_ok=True)
+                    apath.write_text(abody)
+                await git(workspace, "add", "-A")
+                code, out = await git(workspace, "commit", "-m",
+                                      f"outcome: {row.get('verdict') or 'recorded'} — "
+                                      f"{feature_id or job_id}")
+                if code != 0 and "nothing to commit" not in out:
+                    raise RuntimeError(f"commit failed: {out[-300:]}")
+                code, out = await git(workspace, "push", "-u", "origin", branch)
+                if code != 0:
+                    raise RuntimeError(f"push failed: {out[-300:]}")
+            url = await self.engine.github.create_pr(
+                target.repo, head=branch, base=target.base,
+                title=f"outcome: {job.get('title') or feature_id}"[:200],
+                body=f"Measured outcome for `{feature_id or job_id}` — verdict "
+                     f"**{row.get('verdict') or 'unmeasured'}**.\n\n"
+                     "Mechanical memory-propagation PR opened by the outcome loop; "
+                     "review and merge to fold the result into product memory.",
+                draft=True)
+            if url:
+                # doc draft: tracked, never review-bot kicked
+                await self.engine.record_prs(job_id, [url], kickoff=False)
+                await self.clickup.comment(
+                    job.get("clickup_task_id") or "",
+                    f"{GATE_PREFIX} 📝 outcome written into product memory — "
+                    f"draft PR to review: {url}")
+            else:
+                self.store.set_fields(
+                    job_id, detail=f"outcome memory: files pushed to {branch} but "
+                                   "the draft PR could not be opened")
+        except Exception as e:
+            log.exception("outcome memory task failed for %s", job_id)
+            try:
+                self.store.set_fields(job_id,
+                                      detail=f"outcome memory PR failed: {str(e)[:300]}")
+                await self.clickup.comment(
+                    job.get("clickup_task_id") or "",
+                    f"{GATE_PREFIX} outcome memory PR failed (non-fatal — the "
+                    f"ledger row is the record): {str(e)[:200]}")
+            except Exception:
+                pass
+
     # ---------- background loops ----------
 
     async def poll_clickup_forever(self):
@@ -852,10 +1572,9 @@ class Worker:
                         break
 
     def _latest_gate_posted(self, job: dict) -> float:
-        runs = self.store.stage_runs_for(job["issue_id"])
-        stamps = [r["gate_posted_at"] for r in runs
-                  if r["stage"] == job.get("stage") and r["gate_posted_at"]]
-        return max(stamps) if stamps else job.get("updated_at") or 0
+        # one implementation, shared with the inbox/SLA readers (JobStore owns
+        # it so main.py never reaches into the worker)
+        return self.store.latest_gate_posted(job["issue_id"], int(job.get("stage") or 0))
 
     async def _scan_verbs(self, job: dict, source_task_id: str, use_marker: bool,
                           after: float = 0.0) -> bool:
@@ -891,9 +1610,11 @@ class Worker:
                         self.store.set_fields(job["issue_id"], comment_marker=c["id"])
                     continue
                 # a human replied conversationally — never drop it silently
-                # (docs/CONVERSATIONS.md §2): nudge once per comment, keep scanning
+                # (docs/CONVERSATIONS.md §2): nudge once per comment, keep scanning.
+                # Watch (Iterate) gates included — a non-verb reply on a parked
+                # verdict must not be re-scanned forever with no response.
                 if (use_marker and job["status"] == "awaiting_input"
-                        and (job.get("kind") or "") == "feature" and text):
+                        and (job.get("kind") or "") in ("feature", "watch") and text):
                     await self.clickup.comment(
                         job.get("clickup_task_id") or "",
                         f"{GATE_PREFIX} I only act on `/proceed`, `/redo` or `/skip` here — "
@@ -902,12 +1623,61 @@ class Worker:
                     )
                     self.store.set_fields(job["issue_id"], comment_marker=c["id"])
                 continue
+            # ---- answer attribution (Epic A1): who is issuing this verb? ----
+            user_id = str(c.get("user_id") or "")
+            actor = self.store.user_for_clickup_id(user_id)
+            parent_task = job.get("clickup_task_id") or ""
+            if actor is None and roles.attribution_required(
+                    self.settings, self._ws_row(job), self.store):
+                # refuse, idempotently per comment id: the UNIQUE(job, kind,
+                # ref) row is what makes subtask-stream refusals (no marker)
+                # reply exactly once. DB writes (event + marker) land BEFORE
+                # the ClickUp reply, and the dedupe-hit path SKIPS the comment
+                # (continue) so a refused comment can never wedge the scan —
+                # the real owner's later verb on the same stream still runs.
+                first = self.store.gate_event_add(
+                    job["issue_id"], "refused_unattributed", ref=c["id"],
+                    stage=job.get("stage"),
+                    actor=f"clickup:{c.get('username') or '?'}#{user_id or '?'}")
+                if use_marker:
+                    self.store.set_fields(job["issue_id"], comment_marker=c["id"])
+                if not first:
+                    continue
+                await self.clickup.comment(
+                    parent_task,
+                    f"{GATE_PREFIX} `{text[:80]}` from @{c.get('username') or 'unknown'} "
+                    "was NOT applied — this ClickUp account isn't linked to a "
+                    f"{ENGINE_NAME} user. An admin can link it in Settings → Users; "
+                    "meanwhile link your ClickUp account or answer on the dashboard.")
+                return True
+            via = (f"clickup:{actor['username']}" if actor
+                   else f"clickup:{c.get('username') or 'unknown'}#{user_id or '?'}")
             try:
-                await self.answer_job(job["issue_id"], action, payload, via="clickup")
+                await self.answer_job(job["issue_id"], action, payload, via=via, actor=actor)
             except GateConflict:
                 pass  # answered elsewhere — fine
+            except GateForbidden as e:
+                # role-exclusive gate (Epic A3): not this person's gate. Same
+                # idempotence/ordering discipline as the attribution refusal;
+                # ClickUp offers NO override path (fail closed) — an admin
+                # overrides from the dashboard.
+                first = self.store.gate_event_add(
+                    job["issue_id"], "refused_wrong_role", ref=c["id"],
+                    stage=job.get("stage"), actor=via, detail=str(e)[:300])
+                if use_marker:
+                    self.store.set_fields(job["issue_id"], comment_marker=c["id"])
+                if not first:
+                    continue
+                await self.clickup.comment(
+                    parent_task,
+                    f"{GATE_PREFIX} Not applied: {e} — only they can `/proceed`/`/redo`/"
+                    "`/skip` this gate. If this IS your gate, link your ClickUp account "
+                    "(Settings → Users) or answer on the dashboard. Otherwise you can "
+                    "still comment, use the dashboard chat, or ask an admin to override "
+                    "from the dashboard.")
+                return True
             except (ValueError, KeyError) as e:
-                await self.clickup.comment(job.get("clickup_task_id") or "",
+                await self.clickup.comment(parent_task,
                                            f"{GATE_PREFIX} could not apply `{text[:80]}`: {e}")
             if use_marker:
                 self.store.set_fields(job["issue_id"], comment_marker=c["id"])
@@ -958,6 +1728,14 @@ class Worker:
             return why
 
         if kind == "sentry":
+            if not self.settings.sentry_enabled:
+                # reject-pin, never a silent skip: an unresolvable short id on a
+                # Sentry-less instance would otherwise rescan (and re-fail) forever
+                why = reject("Sentry integration is not configured on this instance "
+                             "(SENTRY_ORG / SENTRY_AUTH_TOKEN) — cannot adopt a "
+                             "[sentry] ticket")
+                await self.clickup.comment(task_id, f"{GATE_PREFIX} could not adopt: {why}")
+                return
             issue_id = arg if arg.isdigit() else None
             if issue_id is None and arg:
                 resolved = await self.sentry.resolve_short_id(arg.upper())
@@ -1010,17 +1788,52 @@ class Worker:
 
         if kind == "feature":
             # the workflow contract: the ticket creator sets the DRI people
-            # fields; gates assign/notify that person (Dev DRI first, Founder
-            # as the fallback approver)
+            # fields (names configured via clickup_dri_field_map — read-side
+            # lookups against the customer's own schema, quiet no-op when the
+            # fields don't exist); BOTH roles are captured independently
+            # (Epic A2) and the legacy `owner` alias is computed at intake
             fields = await self.clickup.task_fields(task_id)
-            dri = fields.get("assigned dev dri") or fields.get("assigned founder dri")
-            owner = ""
-            if isinstance(dri, list) and dri:
-                owner = str((dri[0] or {}).get("id") or "")
+            try:
+                dri_map = json.loads(self.settings.clickup_dri_field_map) or {}
+            except (ValueError, TypeError):
+                dri_map = {}
+
+            def _pid(v):
+                return str((v[0] or {}).get("id") or "") if isinstance(v, list) and v else ""
+
+            founder_dri = _pid(fields.get(str(dri_map.get("founder") or "").lower()))
+            dev_dri = _pid(fields.get(str(dri_map.get("dev") or "").lower()))
+            # Epic B1: metric goal lines in the description ('metric:'/'target:'/
+            # 'window:'), stripped from the request exactly like the project
+            # line; the ticket's `Success metric` custom field is the fallback
+            # when no metric: line exists
+            mm = METRIC_LINE_RE.search(desc)
+            tm = TARGET_LINE_RE.search(desc)
+            wm = WINDOW_LINE_RE.search(desc)
+            success_metric = _clean_metric_value(mm.group(1)) if mm else ""
+            metric_target = _clean_metric_value(tm.group(1)) if tm else ""
+            window_days = None
+            if wm:
+                days = int(wm.group(1))
+                if 1 <= days <= 365:  # same clamp as the API — never silently accept
+                    window_days = days
+            if not success_metric:
+                cu_metric = fields.get("success metric")
+                if isinstance(cu_metric, str) and cu_metric.strip():
+                    # unlike the METRIC_LINE_RE path (single-line by
+                    # construction), a custom-field value can span lines —
+                    # collapse it, same bound as everywhere else
+                    success_metric = _single_line(cu_metric)
+            for rx in (METRIC_LINE_RE, TARGET_LINE_RE, WINDOW_LINE_RE):
+                request = rx.sub("", request)
+            request = request.strip() or title
             job_id = f"feat-{task_id}"
             decision = self.intake_feature(
                 job_id, title=title, project=project, request=request,
-                clickup_task_id=task_id, clickup_task_url=task_url, owner=owner,
+                clickup_task_id=task_id, clickup_task_url=task_url,
+                founder_dri=founder_dri, dev_dri=dev_dri,
+                success_metric=success_metric, metric_target=metric_target,
+                metric_window_days=window_days,
                 cu_list_id=t.get("list_id") or self.settings.clickup_list_id)
             adopted_as = ("FEATURE PIPELINE (P0 Intake → P9 Ship) — each stage posts its "
                           "artifact as a subtask and parks here for your `/proceed`, "
@@ -1036,16 +1849,147 @@ class Worker:
             task_id, f"{GATE_PREFIX} 📥 adopted as a {adopted_as}. ({decision})")
         log.info("clickup intake: %s %s from ticket %s (%s)", kind, job_id, task_id, decision)
 
-    async def sweep_forever(self):
-        if not self.settings.sweep_enabled:
+    async def slack_ingest_forever(self):
+        """Epic D3 (FLAG, off by default): poll allowlisted Slack channels for
+        decision-shaped messages and park them as registry CANDIDATES — inbox
+        items for human confirmation, never auto-committed, no job state ever
+        touched. Plain worker loop today (sla_forever shape) so Epic I1's
+        routine engine can adopt it as a routine kind without rework."""
+        if not (self.settings.slack_ingest_enabled and self.settings.slack_bot_token):
+            log.info("slack ingestion disabled (flag off or no bot token)")
             return
-        await asyncio.sleep(300)  # let the stack settle after deploy
+        while True:
+            await asyncio.sleep(self.settings.slack_ingest_interval_seconds)
+            try:
+                await self._slack_ingest_once()
+            except Exception:
+                log.exception("slack ingest pass failed")
+
+    def _slack_reader(self, transport=None):
+        from .slack_ingest import SlackReader
+
+        return SlackReader(self.settings, transport=transport)
+
+    async def _slack_ingest_once(self, transport=None):
+        """One ingest pass. Per-channel isolation: one bad channel never
+        starves the rest. Everything best-effort + logged."""
+        if not (self.settings.slack_ingest_enabled and self.settings.slack_bot_token):
+            return
+        if not self.workspaces:
+            return
+        reader = self._slack_reader(transport=transport)
+        for ws in self.store.workspace_list():
+            channels = self.workspaces.slack_channels_of(ws)
+            for channel in channels:
+                try:
+                    await self._slack_ingest_channel(reader, ws, channel)
+                except Exception:
+                    log.exception("slack ingest failed for channel %s", channel)
+
+    async def _slack_ingest_channel(self, reader, ws: dict, channel: str):
+        from . import slack_ingest
+
+        cursor = self.store.slack_cursor_get(channel)
+        if cursor is None:
+            # never initialized (hand-edited row / pre-init channel): start
+            # NOW and ingest forward only — no historical candidate flood
+            self.store.slack_cursor_set(channel, f"{time.time():.6f}")
+            return
+        # bounded overlap re-scan so late reactions on recent messages are
+        # seen (conversations.history keys on ORIGINAL ts); the (source, ref)
+        # dedupe absorbs the re-reads. Reactions older than the overlap are a
+        # documented limit.
+        oldest = f"{max(0.0, float(cursor) - slack_ingest.RESCAN_OVERLAP_SECONDS):.6f}"
+        messages: list[dict] = []
+        page_cursor = ""
+        max_pages = max(1, int(self.settings.slack_ingest_max_pages
+                               or slack_ingest.MAX_PAGES_PER_PASS))
+        truncated = True
+        for _ in range(max_pages):
+            page = await reader.history(channel, oldest, cursor=page_cursor)
+            if page["status"] != "ok":
+                # a failed page aborts THIS channel without advancing the
+                # watermark — a partial fetch must never skip messages
+                log.warning("slack history failed for %s: %s", channel,
+                            page.get("detail") or "")
+                return
+            messages.extend(page["messages"])
+            if not (page["has_more"] and page["next_cursor"]):
+                truncated = False
+                break
+            page_cursor = page["next_cursor"]
+        if truncated:
+            # pagination bound hit with more remaining. History pages are
+            # NEWEST-first, so the unfetched remainder is the OLDER part of
+            # the window: process what we have (candidates still flow; the
+            # dedupe absorbs the next pass's re-reads) but HOLD the
+            # watermark — advancing to any fetched ts would jump past the
+            # unfetched older segment and, once it aged out of the overlap,
+            # exclude it forever. Same fail-closed posture as a failed page
+            # (ENGINE.md §16: advanced only after a fully-fetched batch).
+            # SLACK_INGEST_MAX_PAGES is the catch-up lever.
+            log.warning("slack channel %s: pagination bound hit; watermark "
+                        "held until a pass fetches to exhaustion", channel)
+        emoji = self.settings.slack_decision_emoji
+        max_ts = float(cursor)
+        for msg in messages:
+            ts = str(msg.get("ts") or "")
+            if not ts:
+                continue
+            if slack_ingest.is_decision_shaped(msg, emoji):
+                fields = slack_ingest.candidate_fields(msg)
+                if not fields["text"]:
+                    continue
+                link = await reader.permalink(channel, ts)
+                try:
+                    did = self.store.decision_add(
+                        "slack", fields["text"], ref=f"{channel}:{ts}",
+                        status="candidate", scope="product",
+                        workspace_id=ws["id"], title=fields["title"],
+                        decided_by=fields["decided_by"],
+                        origin_author=fields["decided_by"],
+                        links=[link] if link else [])
+                    if did is not None:
+                        log.info("slack candidate #%s from %s (%s)", did,
+                                 channel, ts)
+                except ValueError:
+                    pass  # empty text — guarded above, belt and braces
+            try:
+                max_ts = max(max_ts, float(ts))
+            except ValueError:
+                continue
+        # advance the watermark ONLY after the whole batch committed AND the
+        # batch was fully fetched (a crash or a bound-hit re-fetches; the
+        # dedupe absorbs). Dismissed candidates stay dismissed: their
+        # (source, ref) row is kept, so a re-scan can never re-create one.
+        if not truncated and max_ts > float(cursor):
+            self.store.slack_cursor_set(channel, f"{max_ts:.6f}")
+
+    async def autonomy_forever(self):
+        """Nightly autonomy scorer (Epic C1, docs/ENGINE.md §15). The flag is
+        checked once — flipping AUTONOMY_ENABLED requires a restart (env-only,
+        documented in OPERATIONS.md). compute() is synchronous SQLite work, so
+        it runs in a thread — a full 30-day scan must never block gates or
+        webhooks on the event loop."""
+        if not self.settings.autonomy_enabled:
+            log.info("autonomy disabled; scorer not started")
+            return
+        await asyncio.sleep(120)  # settle after deploy, then first pass immediately
         while True:
             try:
-                await self._sweep_once()
+                res = await asyncio.to_thread(
+                    autonomy.compute, self.store, self.settings)
+                log.info("autonomy recompute: %(cells)d cells, %(changed)d level changes", res)
             except Exception:
-                log.exception("sweep iteration failed")
-            await asyncio.sleep(self.settings.sweep_interval_hours * 3600)
+                log.exception("autonomy recompute failed")
+            await asyncio.sleep(self.settings.autonomy_recompute_hours * 3600)
+
+    # Epic I1: the sweep/reaper/janitor `while True` wrappers moved into the
+    # routine scheduler (app/routines.py — builtin rows, settings-derived
+    # cadence, boot settle bump). The `_once` bodies below are unchanged. The
+    # shepherd, SLA, watch, autonomy and ClickUp-poll loops deliberately stay
+    # native worker loops (control-flow-adjacent / tight cadence — and the
+    # shepherd invokes Claude, which a routine never may).
 
     async def _sweep_once(self):
         known = self.store.known_issue_ids()
@@ -1062,22 +2006,54 @@ class Worker:
                 break
         log.info("sweep done: %d candidates enqueued (grading decides the rest)", picked)
 
-    async def prune_sessions_forever(self):
-        """Daily janitor for session transcripts (docs/CONVERSATIONS.md §4):
-        prune by file mtime with a keep-set — never by job terminal status alone,
-        which misses abandoned gates and unattributed v1 traffic. Run transcripts
-        (§13) ride the same schedule — they have no keep-set (replay history, not
-        resume state) so age alone decides, even with session persistence off."""
-        while True:
-            await asyncio.sleep(86400)
-            try:
-                pruned = transcripts.prune(self.settings, self.settings.transcript_ttl_days)
-                if pruned:
-                    log.info("transcript janitor pruned %d run transcripts", pruned)
-                if self.settings.session_persistence:
-                    self._prune_sessions()
-            except Exception:
-                log.exception("session janitor failed")
+    def _budget_block(self, job: dict | None, override: bool) -> bool:
+        """Epic G4: park a job when its workspace is at/over 100% of budget and
+        the run carries no override. Returns True when it parked the job (caller
+        returns without dispatching). Fail-closed to NOT blocking when budget is
+        inert (0). In the sentry lane `override` is the deliberate manual /
+        live-webhook trigger (mirrors the daily-cap exemption) — NOT the generic
+        intake `forced` flag the feature pipeline stamps on every job."""
+        if job is None:
+            return False
+        ws = None
+        ws_id = job.get("workspace_id")
+        if ws_id is not None:
+            ws = self.store.workspace_get(ws_id)
+        blocked, status = budgets.should_block(self.store, self.settings, ws, override)
+        if not blocked:
+            return False
+        reason = (f"budget block: ${status['spent']:.2f} of ${status['budget']:.2f} "
+                  f"({status['pct']}%) this month — re-kick with override to run anyway")
+        self.store.set_status(job["issue_id"], "error", detail=reason)
+        try:
+            self.store.inbox_item_add(
+                "budget_block", f"budget:{job['issue_id']}",
+                title=f"Budget block — {job.get('title') or job['issue_id']}",
+                body=reason, workspace_id=ws_id,
+                source="budget", source_sig=f"budget:{job['issue_id']}")
+        except Exception:
+            log.debug("budget-block inbox add failed", exc_info=True)
+        audit.record(self.store, audit.BUDGET_BLOCK, actor="engine", actor_kind="system",
+                     scope="workspace", workspace_id=ws_id, job_id=job["issue_id"],
+                     detail={"spent": status["spent"], "budget": status["budget"],
+                             "pct": status["pct"]})
+        log.info("job %s budget-blocked (%s%% of budget)", job["issue_id"], status["pct"])
+        return True
+
+    def _janitor_once(self):
+        """Daily janitor body (now driven by the routine scheduler): prune run
+        transcripts by mtime (no keep-set — replay history, not resume state)
+        and, with session persistence on, prune CLI session transcripts with
+        the keep-set. Inbox-notice expiry + routine-run retention ride the
+        janitor routine handler (app/routines.py)."""
+        pruned = transcripts.prune(self.settings, self.settings.transcript_ttl_days)
+        if pruned:
+            log.info("transcript janitor pruned %d run transcripts", pruned)
+        # Epic E4: prune audit_log only when a retention window is set (0 = keep
+        # forever; the SIEM export is the archive).
+        self.store.audit_prune(self.settings.audit_retention_days)
+        if self.settings.session_persistence:
+            self._prune_sessions()
 
     def _prune_sessions(self):
         keep: set[str] = set()
@@ -1114,6 +2090,13 @@ class Worker:
     SHEPHERD_VERDICT_RE = re.compile(
         r"^FINDING\s+(\d+):\s*(FIXED|REBUT)\s*[—:-]*\s*(.*)$", re.MULTILINE)
     SHEPHERD_STATES = ("ready", "in_review", "changes_requested")
+    # States the review loop never drives, but whose merge/close MUST still be
+    # detected (Epic B4): the mainline flow parks a PR at 'approved' ("ready
+    # to merge") before the human merges it on GitHub — without re-polling,
+    # prs.state never becomes 'merged', the outcome watch never spawns, and
+    # the P9-approval fallback reads the same stale state. 'stalled' (round
+    # cap) and 'draft' (pr_auto_ready off) PRs get merged by humans too.
+    MERGE_SCAN_STATES = ("approved", "stalled", "draft")
 
     async def shepherd_forever(self):
         """Drive every tracked PR through Sentry review autonomously: verify
@@ -1130,7 +2113,7 @@ class Worker:
     async def _shepherd_pass(self):
         if not (self.settings.shepherd_enabled and self.engine.github.enabled):
             return
-        for pr in self.store.prs_in_state(self.SHEPHERD_STATES):
+        for pr in self.store.prs_in_state(self.SHEPHERD_STATES + self.MERGE_SCAN_STATES):
             try:
                 await self._shepherd_pr(pr)
             except Exception:
@@ -1140,10 +2123,29 @@ class Worker:
                 self.store.pr_set(pr["url"], last_checked=time.time())
 
     async def _shepherd_pr(self, pr: dict):
-        gh = self.engine.github
         repo, number, url = pr["repo"], pr["number"], pr["url"]
         if not repo or not number:
             return
+        # Epic F2 multi-worker: shepherd_forever runs in EVERY worker process
+        # (main.lifespan starts it unconditionally) and PRs carry no dispatch
+        # claim, so without this two processes would each run a full paid Claude
+        # fix on the SAME finding, post duplicate thread replies, and fire two
+        # '@sentry review' triggers per real round — a double-spend + a violation
+        # of the single-writer invariant on pr state/review_rounds. Serialize per
+        # PR across processes (a cross-process advisory lock on Postgres, an
+        # in-process asyncio lock on SQLite) and RE-READ the row inside the lock:
+        # a worker that blocked here while a sibling drove the whole round then
+        # sees the fresh state + the sibling's replies (unreplied collapses to
+        # empty) instead of acting on the snapshot it read before blocking.
+        async with self.locks.for_repo(f"shepherd-pr:{url}"):
+            fresh = self.store.pr_get(url)
+            if fresh is None:
+                return
+            await self._shepherd_pr_locked(fresh)
+
+    async def _shepherd_pr_locked(self, pr: dict):
+        gh = self.engine.github
+        repo, number, url = pr["repo"], pr["number"], pr["url"]
         info = await gh.get_pr(repo, number)
         if info is None:
             return  # unknown, never 'closed' — try again next pass
@@ -1153,9 +2155,19 @@ class Worker:
             job = self.store.get(pr["job_id"])
             if job:  # conveyor mirror: merged feature slides to Complete
                 await self.engine.sync_stage_field(job, "merged")
+                # outcome loop (Epic B4): a merged, TERMINAL feature starts its
+                # watch (the guard inside refuses mid-pipeline merges; the
+                # P9-approval path covers PRs merged before approval)
+                await self._maybe_spawn_watch(job)
             return
         if info.get("state") == "closed":
             self.store.pr_set(url, state="closed", detail="closed without merge")
+            return
+        if (pr.get("state") or "") in self.MERGE_SCAN_STATES:
+            # merge/close detection ONLY for approved/stalled/draft rows: the
+            # review loop stays terminal for 'approved' (post-approval pushes
+            # re-kick via record_prs), handed off for 'stalled', and off by
+            # operator choice for 'draft' — never resume driving from here
             return
         if info.get("draft"):
             # the kickoff's un-draft failed earlier — retry before anything else
@@ -1299,18 +2311,108 @@ class Worker:
             await self.clickup.comment(job.get("clickup_task_id") or "",
                                        f"{GATE_PREFIX} 🐑 {message}")
 
-    async def reap_forever(self):
-        """A 'running' row older than any plausible live run means the process
-        died mid-run (the subprocess dies with us) — surface it instead of
-        letting the job hang forever."""
-        # memory bootstraps hold 'running' across TWO full-length runs; size for the worst
-        horizon = 2 * self.settings.claude_timeout_seconds + self.settings.reaper_grace_seconds
+    # ---------- gate SLA & escalation (Epic A5) ----------
+
+    async def sla_forever(self):
+        """Escalate overdue gates: nudge the owner → notify the other DRI
+        (visibility, never authority) → flag for the standup surface. Pure
+        visibility — no job state changes, no CAS involvement."""
         while True:
+            await asyncio.sleep(self.settings.sla_check_interval_seconds)
             try:
-                await self._reap_once(horizon)
+                await self._sla_once()
             except Exception:
-                log.exception("reaper iteration failed")
-            await asyncio.sleep(300)
+                log.exception("sla sweep failed")
+
+    async def _sla_once(self):
+        now = time.time()
+        for job in self.store.by_status(["awaiting_input"]):
+            if (job.get("kind") or "") != "feature":
+                continue  # v1 items have no DRIs; the inbox overdue flag covers them
+            ws = self._ws_row(job)
+            sla = ws["gate_sla_hours"] if ws and ws.get("gate_sla_hours") is not None \
+                else self.settings.gate_sla_hours
+            if not sla:
+                continue  # 0 disables escalation
+            owner = roles.gate_owner(self.store, self.settings, ws, job)
+            if owner is None or not owner.enforce:
+                # inert without explicit DRIs: solo installs (and pre-upgrade
+                # legacy-owner jobs) get NO new noise — exactly as today
+                continue
+            stage = int(job.get("stage") or 0)
+            # the ladder keys on the gated RUN's id: globally unique, so a
+            # /redo re-park (new run) re-arms it, and a restarted pipeline's
+            # fresh gates can never collide with a dead pipeline's rows
+            runs = [r for r in self.store.stage_runs_for(job["issue_id"])
+                    if r["stage"] == stage and r["gate_posted_at"]]
+            if not runs:
+                continue
+            run = runs[-1]
+            waited = now - run["gate_posted_at"]
+            if waited < sla * 3600:
+                continue
+            await self._sla_escalate(job, ws, owner, stage, run, waited, sla)
+
+    async def _sla_escalate(self, job, ws, owner, stage, run, waited, sla):
+        """One overdue gate's escalation ladder. Each step records its
+        gate_event BEFORE any send (crash = under-notify, never double-fire);
+        UNIQUE(job, kind, ref) makes every step fire exactly once per gate."""
+        job_id = job["issue_id"]
+        task_id = job.get("clickup_task_id") or ""
+        h = int(waited // 3600)
+        title = job.get("title") or job_id
+        # step 1 (≥ 1.0×SLA): re-nudge the owning DRI
+        if self.store.gate_event_add(job_id, "sla_nudge", ref=f"run{run['id']}-step1",
+                                     stage=stage, actor="engine",
+                                     detail=f"waited {h}h of {sla}h SLA"):
+            if owner.clickup_id:
+                await self.clickup.set_assignee(task_id, owner.clickup_id)
+            await self.clickup.comment(
+                task_id, f"{GATE_PREFIX} ⏰ this P{stage} gate has waited {h}h "
+                         f"(SLA {sla}h) — {owner.display}, it needs your `/proceed`, "
+                         "`/redo` or `/skip`.")
+            if self.workspaces:
+                await self.workspaces.notify_gate(
+                    job, f"⏰ {title} — P{stage} gate over SLA ({h}h > {sla}h), "
+                         f"waiting on {owner.display}.")
+        # step 2 (≥ 1.5×SLA): notify the OTHER DRI — visibility, not authority.
+        # When the owning role's DRI slot is empty, gate_owner already fell
+        # back to the other role's DRI as the EFFECTIVE owner — the "other"
+        # person IS the owner (step 1 nudged them), and telling them they
+        # "can't answer" their own gate would be false. Suppress the step.
+        other = roles.other_dri(job, owner.role)
+        if other == owner.value:
+            other = ""
+        if other and waited >= 1.5 * sla * 3600:
+            if self.store.gate_event_add(job_id, "sla_second_dri",
+                                         ref=f"run{run['id']}-step2", stage=stage,
+                                         actor="engine",
+                                         detail=f"waited {h}h of {sla}h SLA"):
+                other_name = roles.dri_display(self.store, other)
+                await self.clickup.comment(
+                    task_id, f"{GATE_PREFIX} ⏰ {other_name}: this P{stage} "
+                             f"{owner.role} gate has waited {h}h (SLA {sla}h) and "
+                             f"{owner.display} hasn't answered. You can't answer this "
+                             f"{owner.role} gate, but they may need a nudge — or an "
+                             "admin can override from the dashboard.")
+                if self.workspaces:
+                    await self.workspaces.notify_gate(
+                        job, f"⏰ {title} — P{stage} gate still unanswered at {h}h; "
+                             f"{other_name}, {owner.display} may need a nudge "
+                             "(visibility only).")
+        # step 3 (≥ 2.0×SLA): record for the standup surface — no more sends
+        if waited >= 2.0 * sla * 3600:
+            self.store.gate_event_add(job_id, "sla_standup_flag",
+                                      ref=f"run{run['id']}-step3", stage=stage,
+                                      actor="engine",
+                                      detail=f"escalation exhausted at {h}h "
+                                             f"of {sla}h SLA")
+
+    def reap_horizon(self) -> float:
+        """A 'running' row older than any plausible live run means the process
+        died mid-run. Memory bootstraps hold 'running' across TWO full-length
+        runs — size for the worst."""
+        return 2 * self.settings.claude_timeout_seconds + self.settings.reaper_grace_seconds
 
     async def _reap_once(self, horizon: float):
         for job in self.store.stale_running(horizon):
@@ -1318,6 +2420,11 @@ class Worker:
                         job["issue_id"], time.time() - (job["run_started_at"] or 0))
             self.store.set_status(job["issue_id"], "error",
                                   detail="reaped: run went stale (process restart?) — redo to resume")
+            # F2: the owning worker is dead (that is what 'stale' means), so its
+            # release_claim will never fire. Drop the claim here or the row stays
+            # claimed_by='<dead worker>' forever and, once a human /redo moves it
+            # back to 'queued', it would be permanently unclaimable.
+            self.store.release_claim(job["issue_id"])
             # visibility on the owning ticket — a silently-reaped job looks
             # identical to a slow one from ClickUp (dogfood-found)
             await self.clickup.comment(

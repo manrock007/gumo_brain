@@ -1,49 +1,48 @@
 import json
+import logging
 import os
 import re
 from functools import lru_cache
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings
+
+log = logging.getLogger("brain.config")
 
 
 class RepoTarget:
     def __init__(self, repo: str, base: str, setup_cmd: str | None = None,
                  test_cmd: str | None = None, allow: list[str] | None = None):
-        self.repo = repo          # e.g. "manrock007/gumoserver"
-        self.base = base          # PR base branch, e.g. "master"
+        self.repo = repo          # e.g. "acme/api"
+        self.base = base          # PR base branch, e.g. "main"
         self.setup_cmd = setup_cmd  # run once to install test deps, e.g. "npm ci"
         self.test_cmd = test_cmd    # how Claude should run the unit tests
         self.allow = allow or []    # extra --allowedTools entries for this repo
 
 
-DEFAULT_REPO_MAP = {
-    "gumo": {
-        "repo": "manrock007/gumoserver", "base": "master",
-        # Django tests need postgres/GDAL — not runnable in this container yet
-        "setup_cmd": None, "test_cmd": None, "allow": [],
-    },
-    "web": {
-        "repo": "manrock007/gumowebclient", "base": "dev",
-        "setup_cmd": "npm ci", "test_cmd": "npm test",
-        "allow": ["Bash(npm:*)", "Bash(npx:*)", "Bash(node:*)"],
-    },
-    "react-native": {
-        "repo": "manrock007/gumoclient", "base": "master",
-        "setup_cmd": "cd codebase/Gumo && npm ci",
-        "test_cmd": "cd codebase/Gumo && npx jest --ci",
-        "allow": ["Bash(npm:*)", "Bash(npx:*)", "Bash(node:*)", "Bash(cd:*)"],
-    },
-    "gumo-video-analyser": {
-        "repo": "manrock007/gumo_video_analyser", "base": "main",
-        "setup_cmd": None, "test_cmd": None, "allow": [],
-    },
-}
+# Neutral out of the box: a fresh install carries NO repos — the first-run
+# wizard demands the first one via the workspace API. A concrete example map
+# (the original Gumo instance) lives in docs/OPERATIONS.md.
+DEFAULT_REPO_MAP: dict = {}
 
 # The engine's own identity (the tool), distinct from product_name (what a
 # team builds with it). Single source of truth for branding, gate-comment
 # prefixes and the git author.
 ENGINE_NAME = "CtrlLoop"
 ENGINE_SLUG = "ctrlloop"
+
+# The engine namespace inside customer repos (like `.github/`): artifacts,
+# memory and product scope all live under it. Repos initialized before the
+# rename keep their legacy tree working — ONE precedence rule governs every
+# resolution helper (fixer.engine_dir, fixer.git_show_ns, the memory reads):
+# legacy wins when present, so a repo is never split-brained across two trees.
+# Migrate a repo with a single `git mv .gumo .ctrlloop` PR on the base branch
+# (MIGRATION-CTRLLOOP.md).
+ENGINE_DIR = ".ctrlloop"
+LEGACY_ENGINE_DIRS = (".gumo",)
+# Archival refs for rejected code-stage attempts: refs/<ns>/<job>/P<n>-attempt-<k>.
+# Write-only (no read path), so no legacy fallback is needed.
+REFS_NAMESPACE = "ctrlloop"
 
 # Engine-authored ClickUp comments carry a fixed prefix the poller uses to
 # ignore its own comments. Pre-rename comments still in threads must stay
@@ -52,27 +51,54 @@ GATE_PREFIX = f"**[{ENGINE_SLUG}]**"
 LEGACY_GATE_PREFIXES = ("**[gumo_brain]**",)
 ENGINE_COMMENT_PREFIXES = (GATE_PREFIX, *LEGACY_GATE_PREFIXES)
 
-DEFAULT_PRODUCT_NAME = "Gumo"
+DEFAULT_PRODUCT_NAME = "your product"
 
-DEFAULT_BUSINESS_CONTEXT = """\
-Gumo is one product built across three main repositories:
-- `gumo` (manrock007/gumoserver) — the Django backend: API, data models, business \
-logic. This is the canonical repo hosting product-scope memory (`.gumo/product/`).
-- `web` (manrock007/gumowebclient) — the web client.
-- `react-native` (manrock007/gumoclient) — the React Native mobile app.
-The clients consume the backend's API; cross-repo features ship server-first, then
-clients. Deeper, versioned product knowledge (what the product is, who it's for, the
-cross-repo API contract) lives in product memory (`.gumo/product/` and `.gumo/memory/`)."""
+# Empty on purpose: any non-empty code default would be injected verbatim into
+# EVERY run's prompt. Operators write their own via the dashboard's context
+# panel (a template ships as its placeholder) or PUT /api/context; a worked
+# example lives in docs/OPERATIONS.md.
+DEFAULT_BUSINESS_CONTEXT = ""
 
 # Project-context fields an operator may override at runtime (persisted in the
 # app_config table, applied over env/code defaults at startup and via the API).
 RUNTIME_CONTEXT_KEYS = ("product_name", "business_context", "repo_map",
                         "memory_canonical_project")
 
+# Epic A3: built-in stage→role ownership. Every stage overridable per
+# workspace (stage_role_map) or instance-wide (STAGE_ROLE_MAP env).
+DEFAULT_STAGE_ROLE_MAP = {"0": "founder", "1": "founder", "2": "dev", "3": "dev",
+                          "4": "dev", "5": "dev", "6": "dev", "7": "dev",
+                          "8": "dev", "9": "founder"}
 
-def validate_repo_map(mapping) -> dict:
+
+def validate_stage_role_map(mapping) -> dict:
+    """Validate a stage→role override map. Keys must be '0'..'9', values
+    'founder' | 'dev'. Partial maps are allowed (missing stages fall back to
+    the default ladder). Raises ValueError; returns the cleaned mapping."""
+    if not isinstance(mapping, dict):
+        raise ValueError("stage_role_map must be an object of {stage: role}")
+    cleaned: dict = {}
+    for stage, role in mapping.items():
+        stage = str(stage).strip()
+        if stage not in DEFAULT_STAGE_ROLE_MAP:
+            raise ValueError(f"stage_role_map stage '{stage}' must be '0'..'9'")
+        role = str(role).strip().lower()
+        if role not in ("founder", "dev"):
+            raise ValueError(f"stage_role_map['{stage}'] must be 'founder' or 'dev', got '{role}'")
+        cleaned[stage] = role
+    return cleaned
+
+
+def validate_repo_map(mapping, allow_empty: bool = False) -> dict:
     """Normalize + validate an operator-supplied repo map. Raises ValueError
-    with a human-readable reason; returns the cleaned mapping."""
+    with a human-readable reason; returns the cleaned mapping.
+
+    allow_empty=True accepts {} (the neutral fresh-install default — used only
+    where an empty map is a valid state, e.g. the setup wizard's default
+    comparison). The default stays strict/fail-closed: operator writes may
+    never empty a repo set through validation."""
+    if isinstance(mapping, dict) and not mapping and allow_empty:
+        return {}
     if not isinstance(mapping, dict) or not mapping:
         raise ValueError("repo_map must be a non-empty object of {slug: target}")
     cleaned: dict = {}
@@ -101,11 +127,14 @@ def validate_repo_map(mapping) -> dict:
 
 
 class Settings(BaseSettings):
-    # Sentry
-    sentry_org: str = "gumo"
-    # EU-region org — do NOT use https://sentry.io here
-    sentry_api_base: str = "https://de.sentry.io/api/0"
-    sentry_web_base: str = "https://gumo.sentry.io"
+    # Sentry — the whole Sentry lane is OFF until both SENTRY_ORG and
+    # SENTRY_AUTH_TOKEN are configured (see the sentry_enabled property)
+    sentry_org: str = ""
+    # EU-region orgs must set SENTRY_API_BASE=https://de.sentry.io/api/0
+    sentry_api_base: str = "https://sentry.io/api/0"
+    # DEPRECATED/UNUSED: kept only so existing SENTRY_WEB_BASE env vars don't
+    # fail settings validation — nothing reads it
+    sentry_web_base: str = ""
     # Client secret of the Sentry internal integration (verifies webhook signatures)
     sentry_client_secret: str = ""
     # Auth token of the same internal integration (reads issues, posts comments)
@@ -113,6 +142,22 @@ class Settings(BaseSettings):
 
     # GitHub token used for git push + `gh pr create` (fine-grained PAT)
     github_token: str = ""
+    # Branch prefix for engine-created branches (<prefix>/feat-…, <prefix>/
+    # sentry-…, <prefix>/memory-…). Jobs record their branch at first use, so
+    # changing this never strands in-flight work (pre-upgrade rows are
+    # backfilled with their historical 'brain/…' branches).
+    branch_prefix: str = "ctrlloop"
+
+    @field_validator("branch_prefix")
+    @classmethod
+    def _validate_branch_prefix(cls, v: str) -> str:
+        v = (v or "").strip()
+        # one git-valid path segment: no '/', no leading '.', no '.lock' suffix
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", v) or v.endswith(".lock"):
+            raise ValueError(
+                "branch_prefix must be a single git-valid branch segment "
+                "(start alphanumeric; chars A-Za-z0-9._-; no '/', no '.lock' suffix)")
+        return v
     # PR lifecycle: auto-flip captured draft PRs to ready-for-review and post
     # the first `@sentry review` trigger (the Seer bot ignores plain pushes)
     pr_auto_ready: bool = True
@@ -124,35 +169,243 @@ class Settings(BaseSettings):
 
     # ClickUp — one task per issue being fixed; Claude posts progress comments
     clickup_token: str = ""
-    clickup_list_id: str = "901615853762"  # "Sentry Autofix" list in Gumo Space
+    clickup_list_id: str = ""  # instance-default autofix list; empty = ClickUp off
     clickup_poll_seconds: int = 120  # how often to check awaiting-input tickets
     # ClickUp as an INTAKE channel: tasks named '[fix] …', '[feature] …' or
     # '[sentry <id>] …' in the autofix list are adopted and queued
     clickup_intake_enabled: bool = True
-    # Mirror engine state onto the gumo-speed workflow's custom fields (the
-    # Stage board, per-repo PR fields, Decisions, Dashboard link). Best-effort
-    # display only — never drives control flow (ENGINE.md §7).
+    # Mirror engine state onto a workflow board's custom fields (the Stage
+    # board, per-repo PR fields, Decisions, Dashboard link — originally the
+    # gumo-speed workflow). Best-effort display only — never drives control
+    # flow (ENGINE.md §7). All maps/field names default EMPTY: with no
+    # configuration every field-sync helper is inert. A worked example lives
+    # in docs/OPERATIONS.md.
     clickup_field_sync_enabled: bool = True
-    # brain stage -> Stage dropdown option; 'build' resolves per-repo below
-    clickup_stage_field_map: str = ('{"0": "Brief", "1": "PRD", "2": "PRD", "3": "Contract", '
-                                    '"4": "Grounding", "5": "build", "6": "build", '
-                                    '"7": "Integration", "8": "Tech Review", "9": "Launch", '
-                                    '"shipped": "Dogfood", "merged": "Complete"}')
-    # repo -> its build-stage column and its PR url field
-    clickup_repo_stage_map: str = ('{"manrock007/gumoserver": "Backend", '
-                                   '"manrock007/gumowebclient": "Frontend - Web", '
-                                   '"manrock007/gumoclient": "Frontend - App"}')
-    clickup_pr_field_map: str = ('{"manrock007/gumoserver": "Backend PR", '
-                                 '"manrock007/gumowebclient": "Web PR", '
-                                 '"manrock007/gumoclient": "App PR"}')
-    # public dashboard base for the ticket's Dashboard deep link
-    public_base_url: str = "https://gumo.co.in/brain"
-    # artifact mirror -> doc url field (the brain's editable equivalent of the
-    # workflow's Google Docs), + the folder field pointing at the branch's
-    # .gumo tree, + the append-only friction log field
-    clickup_doc_field_map: str = '{"P1-prd.md": "PRD Doc", "P3-design.md": "Contract Doc"}'
-    clickup_folder_field: str = "PRD Folder"
-    clickup_friction_field: str = "Gumo Workflow Improvements"
+    # engine stage -> Stage dropdown option; the literal value 'build'
+    # resolves per-repo via clickup_repo_stage_map
+    clickup_stage_field_map: str = "{}"
+    # repo (owner/name) -> its build-stage column
+    clickup_repo_stage_map: str = "{}"
+    # repo (owner/name) -> its PR url field
+    clickup_pr_field_map: str = "{}"
+    # public dashboard base for deep links (Dashboard field, Slack nudges);
+    # empty = no links are emitted
+    public_base_url: str = ""
+    # artifact mirror -> doc url field (the engine's editable equivalent of
+    # doc links), + the folder field pointing at the branch's engine-namespace
+    # tree, + the append-only friction log field — empty = skip
+    clickup_doc_field_map: str = "{}"
+    clickup_folder_field: str = ""
+    clickup_friction_field: str = ""
+    # P9 launch fields for FLAG_NAME / SUCCESS_METRIC protocol lines — empty = skip
+    clickup_flag_field: str = ""
+    clickup_metric_field: str = ""
+    # role -> the ClickUp people field feature adoption reads that role's DRI
+    # from (Epic A2). Engine-generic role names addressed by NAME with a quiet
+    # no-op when the workspace lacks them (same posture as Stage/Dashboard/
+    # Decisions — see OPERATIONS.md); '{}' disables the reads entirely.
+    clickup_dri_field_map: str = '{"founder": "Assigned Founder DRI", "dev": "Assigned Dev DRI"}'
+
+    # ---- Team coordination (Epic A) ----
+    # Instance fallback for jobs without a workspace row: auto | on | off.
+    # 'auto' = strict once ANY user carries a ClickUp mapping (Epic A1).
+    require_attributed_answers: str = "auto"
+    # Instance-level stage→role override map (JSON, keys '0'..'9', values
+    # founder|dev); '' = the built-in ladder (P0/P1/P9 founder, P2–P8 dev).
+    stage_role_map: str = ""
+    gate_sla_hours: int = 24            # 0 disables SLA escalation (Epic A5)
+    sla_check_interval_seconds: int = 900  # escalation sweep cadence
+
+    # ---- Organizational context (Epic D) ----
+    # People profiles fill EMPTY DRI slots at feature intake (exactly-one-match
+    # per role, workspace members only — ambiguity fills nothing). Neutral:
+    # with an empty people table (every fresh/upgraded install) this is inert.
+    # False = profiles feed prompts/display only, never the DRI columns —
+    # the opt-out when profiles cover a repo but a team wants DRI-less jobs.
+    people_routing_defaults: bool = True
+    # FTS memory retrieval: top-k snippets injected into stage prompts.
+    # 0 disables the block entirely; values OUTSIDE 1..20 also disable it
+    # (never clamped toward permissiveness — same posture as AUTONOMY_AUTO_LEVEL).
+    memory_search_top_k: int = 5
+    # Slack read ingestion (D3) — FLAG, off by default. Even when enabled it
+    # needs the bot token AND a per-workspace channel allowlist.
+    slack_ingest_enabled: bool = False
+    slack_bot_token: str = ""       # secret; env-only, never in any API response
+    slack_api_base: str = "https://slack.com/api"  # test seam (Mixpanel-driver style)
+    slack_ingest_interval_seconds: int = 600
+    # Pagination bound per channel per pass (pages of 100). A bound-hit pass
+    # processes what it fetched but HOLDS the watermark (never advanced past
+    # unfetched messages — fail closed); raise this to let a backlogged
+    # channel catch up to exhaustion.
+    slack_ingest_max_pages: int = 10
+    # Reaction NAME that marks a decision thread; the '!decision' message
+    # prefix is always recognized when the flag is on.
+    slack_decision_emoji: str = "pushpin"
+
+    # ---- Outcome loop (Epic B) ----
+    # Default measurement window (days) for features submitted without one.
+    metric_window_days_default: int = 14
+    # Post-ship watcher: spawn watch jobs on merge + run the watch loop.
+    watch_enabled: bool = True
+    watch_interval_seconds: int = 3600  # loop cadence; reads throttle to ~daily per job
+    # 'flat' verdict band around the baseline, in percent.
+    outcome_flat_band_pct: int = 10
+    # Write the verdict into product memory via a mechanical draft PR.
+    outcome_memory_prs: bool = True
+    # Instance-level analytics fallback (per-workspace settings win): provider
+    # name ('' = none — the null driver) and its config as a JSON object string
+    # ({project_id, service_account, secret, api_base}). Neutral defaults.
+    analytics_provider: str = ""
+    analytics_config: str = "{}"
+
+    # ---- Abstraction seams (Epic H) ----
+    # Issue-tracker driver (H1). 'clickup' (default) is today's behavior
+    # byte-for-byte; 'jira' is an inert scaffold (dashboard-only). Empty or
+    # unknown → clickup (fail closed to the working driver — there is no null
+    # tracker steady state).
+    tracker_provider: str = "clickup"
+    # VCS driver (H2). 'github' (default) = today's behavior; 'gitlab' is an
+    # inert scaffold (PAT-only, PR ops no-op). Empty or unknown → github.
+    vcs_provider: str = "github"
+    # Agent-runtime driver (H3). 'cli' (default) = today's `claude -p`
+    # subprocess; 'agent-sdk' is a scaffold that raises on run. Empty or
+    # unknown → cli.
+    agent_runtime: str = "cli"
+
+    # ---- Graduated autonomy (Epic C, docs/ENGINE.md §15) ----
+    # Master switch for the trust ladder: nightly scoring, the autonomy
+    # surface, and workspace pins. False = legacy behavior — only the per-job
+    # gate_mode='light' path auto-advances; pins are ignored. Env-only (not a
+    # RUNTIME_CONTEXT_KEY): flipping it requires a restart.
+    autonomy_enabled: bool = True
+    autonomy_window_days: int = 30      # rolling stage_runs window the scorer reads
+    autonomy_min_runs: int = 5          # cells below this sample stay level 0
+    # Computed level required for a cell to auto-advance. FAIL-CLOSED DEFAULT:
+    # 0 = computed levels NEVER auto-advance (scores/matrix/pins still work —
+    # pins are explicit admin actions). Set 1..3 to opt in (3 = only full
+    # trust). Any value outside 1..3 disables the computed-level rule — it is
+    # never clamped toward permissiveness.
+    autonomy_auto_level: int = 0
+    autonomy_recompute_hours: int = 24  # nightly scorer cadence
+
+    # ---- Proactive routines (Epic I, docs/ENGINE.md §17) ----
+    # Master flag for the PER-WORKSPACE Epic I routines (standup, memory
+    # upkeep, risk scan, proposal scan, planning) ONLY — the builtin
+    # sweep/reaper/janitor rows keep firing when it is off ('off' must never
+    # mean 'less safe'). Env-only like autonomy_enabled: restart to flip.
+    routines_enabled: bool = True
+    routine_tick_seconds: int = 60
+    routine_tz: str = "UTC"           # schedule evaluation timezone (zoneinfo)
+    # Seed defaults ONLY — after the first seed the routine ROW is
+    # authoritative (edit via PUT /api/routines/{id}); builtin loops derive
+    # their cadence from the live settings instead (schedule='').
+    standup_schedule: str = "daily@09:00;days=mon,tue,wed,thu,fri"
+    memory_upkeep_schedule: str = "daily@07:00"
+    risk_scan_schedule: str = "every:3600"
+    proposal_scan_schedule: str = "every:86400"
+    planning_schedule: str = "weekly@mon 09:00"
+    # Memory upkeep (I3): 0 = inert (opt-in spend — a fresh install queues
+    # nothing). Bounded one refresh per repo per cooldown window.
+    memory_staleness_threshold: int = 0
+    memory_upkeep_cooldown_days: int = 7
+    # Risk surfacing (I4): sentry spike alerts off until a threshold is set
+    # (absolute 24h event count — no historical snapshot store in v1).
+    risk_sentry_spike_events: int = 0
+    risk_redo_threshold: int = 3
+    # Instance fallback for the per-workspace budget column; 0 = no budget
+    # (spend pacing alerts + digest budget section stay inert).
+    budget_monthly_usd: float = 0
+    # Epic G4: budget ladder. warn at >= this pct of budget; block non-forced
+    # Claude runs at >= 100%. block_enabled=False = warn-only (never blocks —
+    # neutral/safe). budget 0 stays inert (state always 'ok').
+    budget_warn_pct: int = 80
+    budget_block_enabled: bool = True
+    # Proposal lane (I5) windows/thresholds.
+    proposal_window_days: int = 30
+    proposal_friction_min: int = 3
+    proposal_sentry_cluster_min: int = 3
+    # Inbox notice aging (risk alerts, notes, digests, packs expire visibly)
+    # and routine run-history retention (newest N per routine always kept).
+    inbox_notice_ttl_days: int = 30
+    routine_run_ttl_days: int = 90
+
+    # ---- SSO / identity (Epic E1) — all neutral/off by default ----
+    oidc_enabled: bool = False
+    oidc_issuer: str = ""            # https://…/  (discovery at {issuer}/.well-known/openid-configuration)
+    oidc_client_id: str = ""
+    oidc_client_secret: str = ""     # SECRET — never in any API response or log
+    oidc_redirect_url: str = ""      # the registered callback, e.g. https://host/auth/oidc/callback
+    oidc_scopes: str = "openid email profile"
+    oidc_role_claim: str = ""        # claim carrying group/role info (e.g. 'groups')
+    oidc_role_map: str = "{}"        # JSON {claim_value: role}
+    oidc_default_role: str = "member"
+    oidc_admin_group: str = ""       # membership -> instance_admin
+    oidc_role_sync: bool = True      # re-map role on repeat login (never demotes the last admin)
+    saml_enabled: bool = False       # SCAFFOLD — interface only
+    scim_enabled: bool = False       # SCAFFOLD — interface only
+    scim_token: str = ""             # SECRET
+    # Break-glass: local password login can never be turned off in a way that
+    # locks out. False only HIDES the login form; verify_login still honors any
+    # local-provider account with a usable password (auth.is_break_glass).
+    ctrlloop_local_login: bool = True
+
+    @property
+    def oidc_configured(self) -> bool:
+        """Fail-closed: partial/unknown config disables OIDC entirely."""
+        return bool(self.oidc_enabled and self.oidc_issuer and self.oidc_client_id
+                    and self.oidc_client_secret and self.oidc_redirect_url)
+
+    # ---- Audit log (Epic E4) ----
+    # Max rows per /api/audit/export page (cursor-paged JSONL for SIEM).
+    audit_export_page_size: int = 500
+    # 0 = keep forever (the SIEM is the archive); >0 lets the daily janitor
+    # prune audit_log rows older than N days.
+    audit_retention_days: int = 0
+
+    # ---- Scoped API tokens (Epic E2) ----
+    # Default expiry (days) for a token created without an explicit ttl.
+    # 0 = no expiry (neutral).
+    api_token_default_ttl_days: int = 0
+
+    # ---- Secrets provider & subprocess env allow-list (Epic G2) ----
+    # Where sensitive config is read from: 'env' (default — the process
+    # environment, what Settings already does), 'file' (SECRETS_DIR/<name>
+    # files, Docker/K8s secrets), or 'vault' (scaffold — falls back to env).
+    # Unknown values fail closed to 'env'.
+    secrets_provider: str = "env"
+    secrets_dir: str = ""
+    # Extra environment variable NAMES (comma list) to pass THROUGH to Claude/
+    # git subprocesses on top of the built-in allow-list. Neutral empty: a run
+    # only ever sees plumbing + model-auth + VCS vars + these. The hard-deny
+    # secret set (dashboard/OIDC/Sentry/app-key/…) can never be re-added here.
+    subprocess_env_allowlist: str = ""
+
+    # ---- GitHub App (Epic G1) — per-repo short-lived installation tokens ----
+    # Additive to the PAT (github_token): when both are configured the app mints
+    # a fresh installation token per repo per run; a repo the app cannot reach
+    # falls back to the PAT. On ANY app error the run falls back to the PAT
+    # (fail-open to the working path) — the app is never a hard replacement.
+    github_app_id: str = ""
+    # SECRET — the app's RSA private key. Supports the '@/path' convention for a
+    # mounted PEM file (resolved via secrets.read_secret). Never logged, never
+    # placed in any subprocess env.
+    github_app_private_key: str = ""
+    # Installation-token TTL cache slack: refresh a minted token this many
+    # seconds before its stated expiry.
+    github_app_token_refresh_slack_seconds: int = 300
+
+    @property
+    def github_app_enabled(self) -> bool:
+        return bool(self.github_app_id and self.github_app_private_key)
+
+    @property
+    def using_max_oauth_token(self) -> bool:
+        """Epic G5 policy signal: personal Max OAuth creds are in use with no
+        API key set. Anthropic policy forbids routing OTHER users' requests
+        through personal Max credentials — a >1-user instance must flip to
+        ANTHROPIC_API_KEY (see the startup warning in main.py)."""
+        return bool(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+                    and not os.environ.get("ANTHROPIC_API_KEY"))
 
     # ---- Auth (docs/ENGINE.md §11) ----
     # First-boot admin bootstrap: when the users table is empty, an admin
@@ -202,7 +455,9 @@ class Settings(BaseSettings):
     # Feature pipeline (docs/ENGINE.md)
     doc_stage_timeout_seconds: int = 900   # P0-P4 are document-only runs
     clickup_mirror_max_chars: int = 50000  # artifact size above this -> pointer mirror
-    memory_canonical_project: str = "gumo"  # repo hosting .gumo/product (product scope)
+    # project slug hosting product-scope memory; empty = no instance-level
+    # product scope (workspaces own their own canonical, ENGINE.md §12)
+    memory_canonical_project: str = ""
     stage_gates: str = ""  # future: comma list of auto-advance stages, e.g. "5,7"; empty = all gated
     reaper_grace_seconds: int = 600
 
@@ -259,6 +514,59 @@ class Settings(BaseSettings):
     # Storage
     data_dir: str = "/data"
 
+    # Epic F1: execution substrate — the DB driver seam. EMPTY database_url =
+    # today's behavior EXACTLY (SQLite at db_path, the zero-config default). A
+    # `postgresql://…` value opts into the Postgres driver (Alembic owns the
+    # schema; psycopg required — see requirements-postgres.txt). The pool/timeout
+    # knobs are Postgres-only (ignored on SQLite).
+    database_url: str = ""
+    db_pool_size: int = 5
+    db_pool_max_overflow: int = 5
+    db_statement_timeout_ms: int = 0  # 0 = no statement timeout (PG-only)
+
+    @property
+    def db_backend(self) -> str:
+        return "postgres" if (self.database_url or "").strip().startswith("postgres") else "sqlite"
+
+    # Epic F2: multi-worker DB-claim queue (Postgres only; SQLite stays the
+    # single-process in-memory-queue path). worker_id defaults to hostname:pid
+    # at startup when empty. workers>1 REQUIRES Postgres (see OPERATIONS.md).
+    worker_id: str = ""
+    job_poll_interval_seconds: int = 2
+
+    # Epic F3: sandboxed container runner (FLAG, off). runner_backend='local'
+    # (default) runs Claude as today's direct subprocess — byte-for-byte. Set
+    # 'container' to sandbox each run in a disposable `docker run --rm` with the
+    # clone bind-mounted, only the G2 allow-listed env (via a 0600 --env-file),
+    # and an operator-provided egress-allowlist network. An empty network fails
+    # closed. The image must carry claude + git + gh. See OPERATIONS.md §20.3.
+    runner_backend: str = "local"
+    runner_container_cmd: str = "docker"
+    runner_container_image: str = ""
+    runner_container_network: str = ""
+    runner_container_extra_args: str = ""
+
+    # Epic F4: observability. log_format='text' (default) keeps today's exact
+    # log format byte-for-byte; 'json' emits structured lines with request/job
+    # ids. metrics_token empty (default) → /metrics requires instance-admin
+    # auth (never unauthenticated-open — workspace names/costs are sensitive);
+    # set a token → Prometheus authenticates with `Authorization: Bearer <token>`.
+    log_format: str = "text"
+    metrics_token: str = ""
+
+    @property
+    def multi_worker(self) -> bool:
+        """The DB-claim loop + advisory locks engage only on Postgres. SQLite
+        keeps the single-consumer asyncio queue no matter what."""
+        return self.db_backend == "postgres"
+
+    def resolved_worker_id(self) -> str:
+        wid = (self.worker_id or "").strip()
+        if wid:
+            return wid
+        import socket
+        return f"{socket.gethostname()}:{os.getpid()}"
+
     @property
     def db_path(self) -> str:
         return f"{self.data_dir}/brain.db"
@@ -270,6 +578,12 @@ class Settings(BaseSettings):
     @property
     def clickup_enabled(self) -> bool:
         return bool(self.clickup_token and self.clickup_list_id)
+
+    @property
+    def sentry_enabled(self) -> bool:
+        """The Sentry lane (webhook intake, sweep, manual triggers, [sentry]
+        ticket adoption) requires both the org slug and an auth token."""
+        return bool(self.sentry_org and self.sentry_auth_token)
 
     def stage_runtime_overrides(self, overrides: dict) -> dict:
         """Validate + normalize project-context overrides WITHOUT applying them.
@@ -292,18 +606,28 @@ class Settings(BaseSettings):
                 if value or key == "business_context":
                     staged[key] = value
         # fail closed: a canonical project outside the map would silently kill
-        # product-scope memory for every client-repo run. Checked ONLY when one
-        # of the two involved fields is being staged — workspaces own canonical
-        # validation now (WorkspaceService.update), and the legacy instance
-        # value may legitimately be absent from the workspace-merged map, which
-        # must not block unrelated edits like product_name (finding 1595745)
-        if "repo_map" in staged or "memory_canonical_project" in staged:
+        # product-scope memory for every client-repo run. Checked ONLY when
+        # repo_map itself is being staged — workspaces own canonical validation
+        # now (WorkspaceService.update), and at startup this method runs BEFORE
+        # WorkspaceService.sync_settings rebuilds the merged map, so the live
+        # repo_map may legitimately be the empty neutral default. Rejecting a
+        # canonical staged alone would atomically drop EVERY persisted override
+        # (product_name, business_context) on legacy instances at boot — so a
+        # lone canonical is accepted with a logged warning instead. An empty
+        # canonical is the valid "no product scope" neutral state, never an error.
+        if "repo_map" in staged:
             canonical = staged.get("memory_canonical_project", self.memory_canonical_project)
-            repo_map = staged.get("repo_map", self.repo_map)
-            if canonical not in json.loads(repo_map):
+            if canonical and canonical not in json.loads(staged["repo_map"]):
                 raise ValueError(
                     f"canonical project '{canonical}' is not a project slug in the repo map"
                 )
+        elif "memory_canonical_project" in staged:
+            canonical = staged["memory_canonical_project"]
+            if canonical and canonical not in json.loads(self.repo_map):
+                log.warning(
+                    "canonical project '%s' is not in the currently-loaded repo map — "
+                    "accepted (workspaces own the merged map; verify it via the "
+                    "workspace settings)", canonical)
         return staged
 
     def apply_staged(self, staged: dict):

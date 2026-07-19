@@ -15,6 +15,7 @@ import logging
 import httpx
 
 from .config import Settings
+from .vcs import VCS
 
 log = logging.getLogger("brain.github")
 
@@ -22,9 +23,17 @@ API = "https://api.github.com"
 MAX_PAGES = 10  # 1000 items — far beyond any sane PR; bounds a pathological one
 
 
-class GitHub:
+class GitHubVCS(VCS):
+    """The DEFAULT VCS driver (Epic H2) — PR lifecycle + clone/token minting.
+    Conforms to the ``VCS`` ABC; the PR methods below are unchanged HTTP logic,
+    the seam adds only ``clone_url`` and ``mint_git_token`` (moved out of
+    fixer)."""
+
+    name = "github"
+
     def __init__(self, settings: Settings, transport: httpx.AsyncBaseTransport | None = None):
         self.enabled = bool(settings.github_token)
+        self._settings = settings
         self._transport = transport  # test seam — None means real HTTP
         self._headers = {
             "Authorization": f"Bearer {settings.github_token}",
@@ -34,6 +43,23 @@ class GitHub:
 
     def _client(self) -> httpx.AsyncClient:
         return httpx.AsyncClient(timeout=30, transport=self._transport)
+
+    def clone_url(self, repo: str) -> str:
+        """The HTTPS clone URL for a repo — today's hardcoded fixer value."""
+        return f"https://github.com/{repo}.git"
+
+    async def mint_git_token(self, repo: str) -> str | None:
+        """Resolve the GH_TOKEN a run for `repo` should carry (Epic G1). Returns
+        an app installation token when the GitHub App covers the repo, else None
+        so the caller lets the PAT env default apply. Never raises — app errors
+        fall back to the PAT. Semantics are exactly the former
+        ``fixer.mint_git_token``: gated on ``github_app_enabled`` and only the
+        ``kind=='app'`` token is returned."""
+        if not getattr(self._settings, "github_app_enabled", False):
+            return None
+        from .githubapp import effective_git_token
+        token, kind = await effective_git_token(self._settings, repo)
+        return token if kind == "app" else None
 
     async def _get_paged(self, path: str) -> list[dict] | None:
         """GET a list endpoint following Link rel=next — page 1 alone holds the
@@ -76,6 +102,28 @@ class GitHub:
                 return r.json()
         except Exception:
             log.exception("get_pr %s#%s failed", repo, number)
+            return None
+
+    async def create_pr(self, repo: str, head: str, base: str, title: str,
+                        body: str, draft: bool = True) -> str | None:
+        """Open a PR (draft by default) — the outcome loop's mechanical
+        memory-propagation PRs use this. Returns the PR's html_url, or None on
+        any failure (best-effort like everything here)."""
+        if not self.enabled or not repo or not head or not base:
+            return None
+        try:
+            async with self._client() as client:
+                r = await client.post(
+                    f"{API}/repos/{repo}/pulls", headers=self._headers,
+                    json={"title": title[:250], "head": head, "base": base,
+                          "body": body[:60000], "draft": draft})
+                if r.status_code != 201:
+                    log.warning("create_pr %s %s->%s -> %s %s", repo, head, base,
+                                r.status_code, str(r.text)[:300])
+                    return None
+                return (r.json().get("html_url") or "").strip() or None
+        except Exception:
+            log.exception("create_pr %s %s->%s failed", repo, head, base)
             return None
 
     async def mark_ready(self, repo: str, number: int) -> bool:
@@ -159,3 +207,8 @@ class GitHub:
         except Exception:
             log.exception("comment %s#%s failed", repo, number)
             return False
+
+
+# Back-compat alias — engine.py imports `GitHub`; test_shepherd/test_prs
+# construct it directly with transport=. Load-bearing, not cosmetic.
+GitHub = GitHubVCS

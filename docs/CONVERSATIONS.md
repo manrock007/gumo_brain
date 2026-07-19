@@ -28,7 +28,7 @@ change — auth and onboarding state live there. So:
 | **1** | Artifact-primed gate chat: `gate_chat` table, `POST/GET /api/jobs/{id}/chat`, dashboard chat panel, ClickUp mirroring + verb footer + non-verb nudge, the full per-repo lock domain, chat cost telemetry. Zero dependency on session storage. | **built** |
 | **2** | Session persistence behind `session_persistence` flag (+ §4 bootstrap contract, session-lost detection, `--session-id` ownership, janitor), STAGE_ASK resume for code stages only. | **built** (flag off by default) |
 | **3** | Fork-chat as the code-gate upgrade (session's memory of test output/exploration is the value there); chat sessions keyed by (job, stage, attempt); global claude-invocation lock for shared-store runs; artifact-primed mode stays the doc-gate default AND the fallback. | **built** (active only with the flag) |
-| **4** | Gate modes: per-feature `gate_mode=light` auto-advances P2/P4–P8 on a clean STAGE_DONE — with the critique's guards built in: non-boilerplate Questions park, first clean run after a /redo parks, P5 without a captured PR_URL parks, mid-run human edits park, mirror-down parks. Default remains `full`; relax only after week-one `stage_runs` data. | **built** (opt-in per feature) |
+| **4** | Gate modes: per-feature `gate_mode=light` auto-advances P2/P4–P8 on a clean STAGE_DONE — with the critique's guards built in: non-boilerplate Questions park, first clean run after a /redo parks, P5 without a captured PR_URL parks, mid-run human edits park, mirror-down parks. Default remains `full`; relax only after week-one `stage_runs` data. Since Epic C, light mode is rung 2 of the autonomy resolution order (workspace pin > light mode > computed level > full gating, ENGINE.md §15) — a pin or an opted-in earned level can extend or restrict it, the guards always apply. | **built** (opt-in per feature) |
 
 ## 2. Gate chat (increment 1 — as built)
 
@@ -187,3 +187,36 @@ Git as truth; artifact mirrors and human-wins sync; fail-closed parsing; the
 three verbs; ClickUp phone-answering; single-writer CAS gates; per-stage
 telemetry. Chat is an additive layer: the human's Proceed/Redo/Skip remains
 the only thing that moves the pipeline.
+
+## 7. Agent-runtime seam (H3)
+
+The CLI invocation itself sits behind a seam (`app/runtime.py`, `AgentRuntime`),
+so WHICH agent implementation runs a prompt is swappable without touching the
+engine/worker call sites.
+
+- **Interface** — `run` / `run_stream` (both return the shared `RawRunResult`),
+  covering the four capabilities BUILD-PLAN H3 names: **resume**
+  (`resume_session`), **fork** (`fork_session`), **stream** (`on_event`),
+  **interrupt** (`interrupt_event`) — plus `session_transcript_exists` as the
+  resume-availability query.
+- **Current driver: `CLIRuntime` (default).** It IS today's behavior: the
+  `claude -p` subprocess with the full envelope-parsing / session-lost / reaper
+  / interrupt contract that lives in `fixer._run_claude_raw_impl` /
+  `_run_claude_stream_impl` (unchanged). The public `fixer.run_claude_raw` /
+  `run_claude_stream` are thin shims that dispatch through `runtime_for(...)`;
+  CLIRuntime delegates back to the private `_impl` bodies (single hop — no
+  recursion). Every existing importer and test-patch of the public shim names
+  keeps intercepting runs.
+- **Stub: `AgentSDKRuntime` (migration target).** Documented, not wired: it
+  would drive in-process Agent-SDK session objects instead of subprocesses
+  (`resume` → SDK session resume, `interrupt` → SDK cancel; the G2 subprocess
+  env allow-list becomes the SDK tool sandbox). `run`/`run_stream` raise
+  `NotConfigured` — a run cannot proceed without a real runtime, so a mis-set
+  `AGENT_RUNTIME` fails loud, never fakes success. Default is `cli`, so this
+  path is never hit on a zero-config install.
+- **Config**: `AGENT_RUNTIME` — `cli` (default) or `agent-sdk`. Empty/unknown →
+  `cli` (fail closed to the working driver).
+- **Orthogonal to F3 (sandboxed runs).** H3 picks the agent PROTOCOL (CLI
+  subprocess vs SDK); F3's runner picks the ISOLATION (local exec vs disposable
+  container) and wraps the subprocess spawn INSIDE the CLI body. They compose
+  (container-of-CLI); they do not merge.

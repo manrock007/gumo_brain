@@ -3,6 +3,8 @@ import html
 import json
 import logging
 import re
+import secrets
+import sqlite3
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -13,6 +15,7 @@ from fastapi.responses import (
     FileResponse,
     HTMLResponse,
     JSONResponse,
+    PlainTextResponse,
     RedirectResponse,
     StreamingResponse,
 )
@@ -20,11 +23,14 @@ from pydantic import BaseModel
 
 from .auth import (
     SESSION_COOKIE,
+    SSOConflict,
     bootstrap_admin,
     current_user,
     hash_password,
     issue_session,
+    jit_provision,
     require_admin,
+    require_instance_admin,
     require_user,
     revoke_session,
     verify_login,
@@ -32,18 +38,23 @@ from .auth import (
 from .chatstream import ChatBroker
 from .config import ENGINE_NAME, Settings, get_settings, validate_repo_map
 from .db import JobStore
+from . import db as db_mod
 from .feature_prompts import stage_name
 from .fixer import ensure_session_store
 from .memory import MemoryReader
 from .sentry_api import extract_issue_ref, verify_signature
-from .worker import GateConflict, Worker
+from . import audit, autonomy, identity, inboxlib, people, rbac, roles, routines
+from .worker import GateConflict, GateForbidden, Worker
 from .workspaces import WorkspaceError, WorkspaceNotFound, WorkspaceService
 from . import transcripts
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
-log = logging.getLogger("brain")
+from . import logconfig, metrics as metrics_mod
 
 settings = get_settings()
+# Epic F4: LOG_FORMAT=text (default) keeps the historical basicConfig format
+# byte-for-byte; 'json' emits structured lines with request/job ids.
+logconfig.configure_logging(settings)
+log = logging.getLogger("brain")
 
 ISSUE_URL_RE = re.compile(r"/issues/(\d+)")
 SHORT_ID_RE = re.compile(r"^[A-Z][A-Z0-9_-]*-[A-Z0-9]+$")
@@ -52,13 +63,21 @@ CLICKUP_URL_RE = re.compile(r"app\.clickup\.com/t/(?:\d+/)?([A-Za-z0-9_-]+)")
 CLICKUP_ID_RE = re.compile(r"^[A-Za-z0-9_-]{4,}$")
 USERNAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{1,31}$")
 
+# OIDC login state bound to the initiating browser (login-CSRF / fixation guard).
+OIDC_STATE_COOKIE = "ctl_oidc_state"
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Path(settings.data_dir).mkdir(parents=True, exist_ok=True)
     if settings.session_persistence:
         ensure_session_store(settings)
-    store = JobStore(settings.db_path)
+    # Epic F1: an empty database_url keeps the SQLite zero-config default
+    # (db_path); a postgresql:// DSN opts into Postgres with the pool settings.
+    store = JobStore(settings.database_url or settings.db_path,
+                     pool_size=settings.db_pool_size,
+                     pool_max_overflow=settings.db_pool_max_overflow,
+                     statement_timeout_ms=settings.db_statement_timeout_ms)
     overrides = store.config_all()
     try:  # operator-saved project context (repos, business context) wins over env/defaults
         settings.apply_runtime_overrides(overrides)
@@ -75,6 +94,46 @@ async def lifespan(app: FastAPI):
     workspaces = WorkspaceService(store, settings)
     workspaces.ensure_default()  # upgrade path: wrap the §10 context into a workspace
     app.state.workspaces = workspaces
+    # loud warnings for half-configured integrations: defaults are neutral now,
+    # so a pre-existing instance that relied on the old baked-in values must
+    # set them as env vars (MIGRATION-CTRLLOOP.md upgrade checklist)
+    if settings.sentry_auth_token and not settings.sentry_org:
+        log.warning("SENTRY_AUTH_TOKEN is set but SENTRY_ORG is empty — the whole "
+                    "Sentry lane (webhooks, sweep, manual triggers) is DISABLED. "
+                    "Set SENTRY_ORG (and SENTRY_API_BASE for EU-region orgs).")
+    if settings.sentry_org and not settings.sentry_auth_token:
+        log.warning("SENTRY_ORG is set but SENTRY_AUTH_TOKEN is empty — the whole "
+                    "Sentry lane is DISABLED until the token is provided.")
+    if settings.clickup_token and not settings.clickup_list_id and \
+            not any((w.get("clickup_list_id") or "").strip() for w in store.workspace_list()):
+        log.warning("CLICKUP_TOKEN is set but no list id is configured anywhere "
+                    "(CLICKUP_LIST_ID or a per-workspace list) — the ClickUp "
+                    "integration is DISABLED.")
+    # Epic G2: a loud, non-secret line naming the detected model-auth backend
+    # so a starved/misconfigured env is visible at boot, not silent mid-run.
+    from .secrets import build_subprocess_env, detect_auth_backend, egress_selfcheck
+    backend = detect_auth_backend(build_subprocess_env(settings))
+    log.info("model auth backend detected: %s", backend)
+    # Epic G2 (amendment 1): loudly warn if a proxy/CA var the deployment relies
+    # on is present in the environment but dropped by the subprocess allow-list —
+    # otherwise every run would silently fail to reach the model API / verify TLS.
+    starved = egress_selfcheck(settings)
+    if starved:
+        log.warning(
+            "EGRESS: %s present in the environment but DROPPED from the run "
+            "allow-list — proxied/TLS-pinned runs will fail. Add them via "
+            "SUBPROCESS_ENV_ALLOWLIST. See OPERATIONS.md 'secrets provider'.",
+            ", ".join(starved))
+    # Epic G5: the Anthropic policy line — personal Max OAuth creds must not
+    # route OTHER users' requests. Warn loudly (not fatal — break-glass) when a
+    # Max token is in use on an instance with more than one enabled user.
+    if settings.using_max_oauth_token and store.enabled_user_count() > 1:
+        log.warning(
+            "POLICY: this instance uses personal Claude Max OAuth credentials "
+            "(CLAUDE_CODE_OAUTH_TOKEN) but has >1 enabled user. Anthropic policy "
+            "prohibits routing other users' requests through personal Max "
+            "credentials — flip to ANTHROPIC_API_KEY (unset CLAUDE_CODE_OAUTH_TOKEN) "
+            "before onboarding a second user. See OPERATIONS.md 'Model billing'.")
     # first-run wizard (§14): a deployment that has already processed jobs is
     # not a first run — never greet an upgrading operator with onboarding
     if "setup_done" not in store.config_all() and store.job_count() > 0:
@@ -83,16 +142,26 @@ async def lifespan(app: FastAPI):
     worker.workspaces = workspaces
     worker.engine.workspaces = workspaces
     worker.engine.memory.canonical_resolver = workspaces.canonical_for
+    # Epic I1: sweep/reaper/janitor now ride the routine scheduler (builtin
+    # rows, settings-derived cadence, EVERY-boot settle bump). The shepherd
+    # and the other control-flow-adjacent loops stay native.
+    routines.ensure_seeds(store, settings)
+    scheduler = routines.RoutineScheduler(settings, store, worker, workspaces)
     tasks = [
         asyncio.create_task(worker.run_forever()),
         asyncio.create_task(worker.poll_clickup_forever()),
-        asyncio.create_task(worker.sweep_forever()),
-        asyncio.create_task(worker.reap_forever()),
-        asyncio.create_task(worker.prune_sessions_forever()),
+        asyncio.create_task(scheduler.run_forever()),
         asyncio.create_task(worker.shepherd_forever()),
+        asyncio.create_task(worker.sla_forever()),
+        asyncio.create_task(worker.watch_forever()),
+        asyncio.create_task(worker.autonomy_forever()),
+        asyncio.create_task(worker.slack_ingest_forever()),
     ]
     app.state.store = store
     app.state.worker = worker
+    app.state.scheduler = scheduler
+    # Epic E1: resolve configured identity providers (Local is always present).
+    app.state.identity_providers = identity.registry(settings)
     yield
     for t in tasks:
         t.cancel()
@@ -101,9 +170,70 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title=ENGINE_NAME, lifespan=lifespan)
 
 
+@app.middleware("http")
+async def _request_id_mw(request: Request, call_next):
+    """Epic F4: correlate every request. Read (or mint) X-Request-ID, bind it to
+    the contextvar for the request's logs, and echo it on the response."""
+    import uuid
+    rid = request.headers.get("X-Request-ID") or uuid.uuid4().hex
+    with logconfig.logctx(request_id=rid):
+        response = await call_next(request)
+    response.headers["X-Request-ID"] = rid
+    return response
+
+
 @app.get("/health")
 async def health():
-    return {"status": "ok", "queued": app.state.worker.queue.qsize()}
+    # multi-worker: the in-process queue is bypassed (DB claim is authoritative),
+    # so qsize() is a meaningless 0 — report the real claimable backlog from the
+    # DB instead. Single-worker: the in-process queue IS the backlog.
+    worker = app.state.worker
+    depth = (app.state.store.queued_count()
+             if worker.settings.multi_worker else worker.queue.qsize())
+    return {"status": "ok", "queued": depth}
+
+
+@app.get("/health/ready")
+async def health_ready():
+    """Epic F4: readiness. Hard dependency = DB (503 when down). Worker and
+    scheduler liveness are reported from heartbeats. Never inlines credentials
+    or upstream error bodies — only booleans."""
+    store = app.state.store
+    worker = app.state.worker
+    scheduler = getattr(app.state, "scheduler", None)
+    db_ok = store.ping()
+    now = time.time()
+    # a worker/scheduler is 'alive' if its heartbeat is recent; generous window
+    # so a long-running job (no tick mid-run) isn't flagged unhealthy.
+    worker_ok = bool(worker is not None
+                     and (now - getattr(worker, "last_tick", 0)) < 900)
+    sched_ok = bool(scheduler is not None
+                    and (now - getattr(scheduler, "last_tick", now)) < 900)
+    checks = {"db": db_ok, "worker": worker_ok, "scheduler": sched_ok}
+    ready = db_ok  # DB is the only HARD dependency
+    return JSONResponse({"ready": ready, "checks": checks},
+                        status_code=200 if ready else 503)
+
+
+@app.get("/metrics")
+async def metrics_endpoint(request: Request):
+    """Epic F4: Prometheus text exposition. Auth: metrics_token empty (default)
+    → require instance-admin; a set token → Bearer token match."""
+    token = (app.state.settings.metrics_token or "").strip()
+    if token:
+        auth = request.headers.get("Authorization", "")
+        # constant-time compare of the shared secret (consistent with the OIDC
+        # state / Sentry-signature checks) so /metrics can't be probed for the
+        # token prefix via response timing.
+        if not secrets.compare_digest(auth, f"Bearer {token}"):
+            raise HTTPException(status_code=401, detail="metrics token required",
+                                headers={"WWW-Authenticate": "Bearer"})
+    else:
+        require_instance_admin(request)  # admin-gated by default (never open)
+    text = metrics_mod.render_cached(
+        app.state.store, app.state.worker, app.state.settings,
+        getattr(app.state, "workspaces", None))
+    return PlainTextResponse(text, media_type="text/plain; version=0.0.4")
 
 
 # The UI lives in app/static (docs/ENGINE.md §11): index behind auth (browser
@@ -123,9 +253,10 @@ async def dashboard(request: Request):
             "<code>DASHBOARD_PASSWORD</code>) and restart.</p>", status_code=503)
     if current_user(request) is None:
         return RedirectResponse("login")  # relative: survives proxy prefixes
-    # brand subtitle follows the configured product name (docs/ENGINE.md §10)
+    # brand subtitle follows the configured product name (docs/ENGINE.md §10);
+    # a single-anchor replace keeps the page proxy-prefix-safe
     return _INDEX_HTML.replace(
-        "the Gumo Engine", f"the {html.escape(settings.product_name)} Engine", 1
+        "{{product_name}}", html.escape(settings.product_name), 1
     )
 
 
@@ -169,12 +300,29 @@ class UserPatchBody(BaseModel):
     role: str | None = None
     disabled: bool | None = None
     password: str | None = None  # admin reset — forces a change at next login
+    clickup_user_id: str | None = None  # Epic A1: '' clears; digits link
+    # Epic D1 people profile (validated via people.validate_profile):
+    person_role: str | None = None      # '' | founder | product | dev | design
+    areas: list | None = None           # [{kind: workspace|repo|area, value}]
+    authority: list | None = None       # decision-authority tags
+    person_notes: str | None = None
+
+
+def _normalize_instance_role(role) -> str | None:
+    """Epic E3: instance-role vocabulary is {instance_admin, member}. Legacy
+    'admin' is accepted as an alias (normalized) so older clients never lock
+    themselves out; anything else is invalid (returns None)."""
+    role = (role or "").strip()
+    if role == "admin":
+        return "instance_admin"
+    return role if role in ("instance_admin", "member") else None
 
 
 def _public_user(u: dict) -> dict:
     return {"username": u["username"], "role": u["role"],
             "disabled": bool(u.get("disabled")),
-            "must_change_pw": bool(u.get("must_change_pw"))}
+            "must_change_pw": bool(u.get("must_change_pw")),
+            "clickup_user_id": u.get("clickup_user_id") or ""}
 
 
 @app.post("/api/login")
@@ -187,6 +335,9 @@ async def login(body: LoginBody, request: Request, response: Response):
         secure=settings.session_cookie_secure,
         max_age=settings.auth_session_ttl_days * 86400, path="/",
     )
+    audit.record(store, audit.LOGIN, actor=audit.dashboard_actor(user),
+                 actor_kind="user", target=user["username"],
+                 channel="dashboard", detail={"method": "password"})
     return _public_user(user)
 
 
@@ -197,6 +348,96 @@ async def logout(request: Request, response: Response):
         revoke_session(app.state.store, token)
     response.delete_cookie(SESSION_COOKIE, path="/")
     return {"ok": True}
+
+
+def _providers():
+    return getattr(app.state, "identity_providers", None) or identity.registry(settings)
+
+
+def _oidc_provider():
+    for p in _providers():
+        if p.name == "oidc":
+            return p
+    return None
+
+
+@app.get("/api/auth/providers")
+async def auth_providers():
+    """PUBLIC — powers the login page's SSO buttons. Never leaks any secret."""
+    out = []
+    for p in _providers():
+        if p.name == "local":
+            out.append({"name": "local", "kind": "password", "login_url": ""})
+        elif p.name == "oidc":
+            out.append({"name": "oidc", "kind": "browser_redirect",
+                        "login_url": "login/oidc"})
+    return {"providers": out,
+            "local_login_form": settings.ctrlloop_local_login}
+
+
+@app.get("/login/oidc")
+async def login_oidc(request: Request):
+    provider = _oidc_provider()
+    if provider is None:
+        raise HTTPException(status_code=404, detail="OIDC is not configured")
+    state, nonce = identity.new_state_nonce()
+    try:
+        endpoint, params = provider.authorize_params(settings, state, nonce)
+    except Exception as e:
+        log.warning("OIDC authorize failed: %s", type(e).__name__)
+        return RedirectResponse("login?error=oidc")
+    app.state.store.oidc_txn_create(state, nonce, redirect_after="/")
+    from urllib.parse import urlencode
+    resp = RedirectResponse(f"{endpoint}?{urlencode(params)}")
+    # Login-CSRF / session-fixation guard: bind `state` to THIS browser. The
+    # callback must present the same value in this cookie, so an attacker cannot
+    # complete their own login in a victim's browser (the victim never holds the
+    # attacker's state cookie). SameSite=lax still rides the top-level IdP
+    # redirect back to the callback. Short-lived, single txn.
+    resp.set_cookie(OIDC_STATE_COOKIE, state, httponly=True, samesite="lax",
+                    secure=settings.session_cookie_secure, max_age=600, path="/")
+    return resp
+
+
+@app.get("/auth/oidc/callback")
+async def oidc_callback(request: Request, response: Response,
+                        code: str = "", state: str = ""):
+    provider = _oidc_provider()
+    store: JobStore = app.state.store
+    if provider is None or not code or not state:
+        return RedirectResponse("../login?error=oidc")
+    # Login-CSRF / session-fixation guard: `state` must match the value bound to
+    # this browser in login_oidc. Absent/mismatched -> fail closed, and never
+    # consume the server-side txn (an attacker probing states cannot burn them).
+    cookie_state = request.cookies.get(OIDC_STATE_COOKIE) or ""
+    if not cookie_state or not secrets.compare_digest(cookie_state, state):
+        resp = RedirectResponse("../login?error=state")
+        resp.delete_cookie(OIDC_STATE_COOKIE, path="/")
+        return resp
+    txn = store.oidc_txn_take(state)
+    if txn is None:  # unknown / replayed / expired -> fail closed
+        resp = RedirectResponse("../login?error=state")
+        resp.delete_cookie(OIDC_STATE_COOKIE, path="/")
+        return resp
+    try:
+        claims = provider.exchange_and_validate(settings, code, txn["nonce"])
+        user = jit_provision(store, settings, provider, claims)
+    except SSOConflict as e:
+        log.warning("OIDC conflict: %s", e)
+        return RedirectResponse("../login?error=conflict")
+    except Exception as e:
+        log.warning("OIDC callback failed: %s", type(e).__name__)
+        return RedirectResponse("../login?error=oidc")
+    token = issue_session(store, settings, user)
+    audit.record(store, audit.LOGIN, actor=f"oidc:{user['username']}",
+                 actor_kind="user", target=user["username"], channel="oidc",
+                 detail={"method": "oidc"})
+    resp = RedirectResponse("../")
+    resp.set_cookie(SESSION_COOKIE, token, httponly=True, samesite="lax",
+                    secure=settings.session_cookie_secure,
+                    max_age=settings.auth_session_ttl_days * 86400, path="/")
+    resp.delete_cookie(OIDC_STATE_COOKIE, path="/")  # single-use state consumed
+    return resp
 
 
 @app.get("/api/me")
@@ -227,26 +468,203 @@ async def change_password(body: PasswordBody, response: Response,
     return {"ok": True, "detail": "password changed — other sessions signed out"}
 
 
+class TokenCreateBody(BaseModel):
+    name: str = ""
+    scopes: list | None = None   # reserved; '' = inherit the user's role (full)
+    ttl_days: int | None = None  # None = settings default; 0 = no expiry
+
+
+def _public_token(row: dict) -> dict:
+    return {"id": row["id"], "name": row.get("name") or "",
+            "prefix_hint": row.get("prefix_hint") or "",
+            "scopes": row.get("scopes") or "",
+            "created_at": row.get("created_at"),
+            "last_used_at": row.get("last_used_at"),
+            "expires_at": row.get("expires_at"),
+            "revoked_at": row.get("revoked_at")}
+
+
+@app.post("/api/tokens")
+async def create_token(body: TokenCreateBody, user: dict = Depends(require_user)):
+    """Mint a scoped API token (Epic E2). Returns the plaintext ONCE."""
+    store: JobStore = app.state.store
+    ttl = body.ttl_days if body.ttl_days is not None else settings.api_token_default_ttl_days
+    if ttl is not None and ttl < 0:
+        raise HTTPException(status_code=400, detail="ttl_days must be >= 0 (0 = no expiry)")
+    # Epic E2: `scopes` is reserved but NOT yet enforced — every ctl_ token
+    # inherits the owner's full role. Accepting+echoing a non-empty scopes list
+    # would present a token as least-privilege while granting full power (a
+    # confused-deputy trap). Fail closed: reject until enforcement lands, rather
+    # than mint a token that silently ignores its own restriction.
+    if body.scopes:
+        raise HTTPException(
+            status_code=400,
+            detail="scoped tokens are not yet supported — omit 'scopes' (a token "
+                   "inherits the owner's full role); scope enforcement is reserved")
+    scopes = ""
+    token, row = store.api_token_create(user["id"], name=(body.name or "").strip()[:80],
+                                        scopes=scopes, ttl_days=ttl or 0)
+    audit.record(store, audit.TOKEN_CREATE, actor=audit.dashboard_actor(user),
+                 actor_kind="user", target=str(row["id"]),
+                 detail={"name": row.get("name") or "", "ttl_days": ttl or 0})
+    return {"token": token, **_public_token(row),
+            "warning": "copy this token now — it is shown only once"}
+
+
+@app.get("/api/tokens")
+async def list_tokens(user: dict = Depends(require_user)):
+    return [_public_token(r) for r in app.state.store.api_token_list(user["id"])]
+
+
+@app.delete("/api/tokens/{token_id}")
+async def revoke_token(token_id: int, user: dict = Depends(require_user)):
+    store: JobStore = app.state.store
+    if not store.api_token_revoke(token_id, user["id"]):
+        raise HTTPException(status_code=404, detail="token not found")
+    audit.record(store, audit.TOKEN_REVOKE, actor=audit.dashboard_actor(user),
+                 actor_kind="user", target=str(token_id))
+    return {"ok": True}
+
+
+@app.get("/api/users/{username}/tokens", dependencies=[Depends(require_admin)])
+async def admin_list_user_tokens(username: str):
+    store: JobStore = app.state.store
+    target = store.user_get(username)
+    if target is None:
+        raise HTTPException(status_code=404, detail="user not found")
+    return [_public_token(r) for r in store.api_token_list(target["id"])]
+
+
+@app.delete("/api/users/{username}/tokens/{token_id}")
+async def admin_revoke_user_token(username: str, token_id: int,
+                                  admin: dict = Depends(require_admin)):
+    """Admin revoke for offboarding (Epic E2)."""
+    store: JobStore = app.state.store
+    target = store.user_get(username)
+    if target is None:
+        raise HTTPException(status_code=404, detail="user not found")
+    if not store.api_token_revoke(token_id, target["id"]):
+        raise HTTPException(status_code=404, detail="token not found")
+    audit.record(store, audit.TOKEN_REVOKE, actor=audit.dashboard_actor(admin),
+                 actor_kind="user", target=str(token_id),
+                 detail={"username": username})
+    return {"ok": True}
+
+
+def _audit_scope_for(user: dict, store: JobStore):
+    """Instance admin sees ALL rows (workspace_ids=None); a non-admin
+    (workspace-admin export) is scoped to their workspace memberships."""
+    if (user.get("role") or "") in ("admin", "instance_admin"):
+        return None
+    return sorted(store.workspace_ids_for_user(user["id"]))
+
+
+@app.get("/api/audit")
+async def audit_view(limit: int = 100, user: dict = Depends(require_user)):
+    """Paged audit viewer (Epic E4). Instance admin sees all; a workspace admin
+    sees their workspaces' rows. Members without a workspace-admin scope still
+    see only their memberships' rows (read-only)."""
+    store: JobStore = app.state.store
+    ws_ids = _audit_scope_for(user, store)
+    return {"events": store.audit_recent(min(int(limit), 1000), workspace_ids=ws_ids)}
+
+
+@app.get("/api/audit/export", dependencies=[Depends(require_admin)])
+async def audit_export(request: Request, after: int = 0, limit: int = 0):
+    """JSONL cursor-paged export for SIEM (Epic E4). One JSON object per line;
+    the next cursor is in the X-Next-Cursor header (and re-fetch with ?after=).
+    Instance-admin only; a workspace admin's export is membership-scoped."""
+    store: JobStore = app.state.store
+    user = current_user(request)
+    ws_ids = _audit_scope_for(user, store)
+    page_size = settings.audit_export_page_size
+    n = page_size if limit <= 0 else min(int(limit), page_size)
+    rows = store.audit_page(after_id=int(after), limit=n, workspace_ids=ws_ids)
+    next_cursor = rows[-1]["id"] if rows else int(after)
+
+    def _lines():
+        for r in rows:
+            yield json.dumps(r, default=str) + "\n"
+
+    return StreamingResponse(_lines(), media_type="application/x-ndjson",
+                             headers={"X-Next-Cursor": str(next_cursor)})
+
+
+def _decode_profile(row: dict) -> dict:
+    return {
+        "person_role": row.get("person_role") or "",
+        "areas": people._areas_of(row),
+        "authority": people._authority_of(row),
+        "notes": row.get("notes") or "",
+    }
+
+
 @app.get("/api/users", dependencies=[Depends(require_admin)])
 async def users_list():
-    return app.state.store.user_list()
+    store: JobStore = app.state.store
+    profiles = {p["id"]: p for p in store.people_all()}
+    out = []
+    for u in store.user_list():
+        p = profiles.get(u["id"], {})
+        out.append(u | _decode_profile(p))
+    return out
 
 
-@app.post("/api/users", dependencies=[Depends(require_admin)])
-async def users_create(body: UserCreateBody):
+@app.get("/api/people")
+async def people_list(user: dict = Depends(require_user)):
+    """Who owns what — the member-readable ownership directory (Epic D1).
+    Admins see everyone; members see only people whose areas intersect the
+    member's OWN workspaces (and only those area entries) — the rest of the
+    org's structure never leaks (same 404-posture as workspaces)."""
+    store: JobStore = app.state.store
+    rows = store.people_all()
+    if user.get("role") in ("admin", "instance_admin"):
+        return [{"username": p["username"],
+                 "person_role": p.get("person_role") or "",
+                 "areas": people._areas_of(p),
+                 "authority": people._authority_of(p)}
+                for p in rows if not p.get("disabled")]
+    my_ws = store.workspace_ids_for_user(user["id"])
+    ws_slugs = {w["slug"] for w in store.workspace_list() if w["id"] in my_ws}
+    repo_slugs = {r["slug"] for r in store.repo_rows_all()
+                  if r["workspace_id"] in my_ws}
+    out = []
+    for p in rows:
+        if p.get("disabled"):
+            continue
+        visible = [a for a in people._areas_of(p)
+                   if (a.get("kind") == "workspace" and a.get("value") in ws_slugs)
+                   or (a.get("kind") == "repo" and a.get("value") in repo_slugs)]
+        if not visible:
+            continue
+        out.append({"username": p["username"],
+                    "person_role": p.get("person_role") or "",
+                    "areas": visible,
+                    "authority": people._authority_of(p)})
+    return out
+
+
+@app.post("/api/users")
+async def users_create(body: UserCreateBody, admin: dict = Depends(require_admin)):
     store: JobStore = app.state.store
     username = body.username.strip()
     if not USERNAME_RE.match(username):
         raise HTTPException(status_code=400,
                             detail="username: 2-32 chars, letters/digits/._- , starting alphanumeric")
-    if body.role not in ("admin", "member"):
-        raise HTTPException(status_code=400, detail="role must be 'admin' or 'member'")
+    role = _normalize_instance_role(body.role)
+    if role is None:
+        raise HTTPException(status_code=400,
+                            detail="role must be 'instance_admin' or 'member'")
     if len(body.password) < 8:
         raise HTTPException(status_code=400, detail="password must be at least 8 characters")
     if store.user_get(username):
         raise HTTPException(status_code=409, detail=f"user '{username}' already exists")
-    user = store.user_create(username, hash_password(body.password), role=body.role,
+    user = store.user_create(username, hash_password(body.password), role=role,
                              must_change_pw=True)
+    # Epic E4: creating an account is authority-moving — audit it (actor = the
+    # acting admin), or a new principal appears with no trace in the SIEM export.
+    audit.record(store, audit.USER_CREATE, actor=audit.dashboard_actor(admin),
+                 actor_kind="user", target=username, detail={"role": role})
     return _public_user(user)
 
 
@@ -258,17 +676,33 @@ async def users_patch(username: str, body: UserPatchBody,
     if user is None:
         raise HTTPException(status_code=404, detail=f"unknown user '{username}'")
     if body.role is not None:
-        if body.role not in ("admin", "member"):
-            raise HTTPException(status_code=400, detail="role must be 'admin' or 'member'")
-        if user["username"] == admin["username"] and body.role != "admin":
+        role = _normalize_instance_role(body.role)
+        if role is None:
+            raise HTTPException(status_code=400,
+                                detail="role must be 'instance_admin' or 'member'")
+        if user["username"] == admin["username"] and role != "instance_admin":
             raise HTTPException(status_code=400, detail="you cannot demote yourself")
-        store.user_set(username, role=body.role)
+        # never demote the last enabled instance admin (fail closed)
+        if role != "instance_admin" and user.get("role") == "instance_admin" \
+                and store.instance_admin_count(enabled_only=True) <= 1:
+            raise HTTPException(status_code=400,
+                                detail="cannot demote the last instance admin")
+        store.user_set(username, role=role)
+        # Epic E4: an instance-role change moves authority (privilege grant /
+        # revoke) — audit the before/after with the acting admin.
+        audit.record(store, audit.USER_ROLE, actor=audit.dashboard_actor(admin),
+                     actor_kind="user", target=username,
+                     detail={"from": user.get("role") or "member", "to": role})
     if body.disabled is not None:
         if user["username"] == admin["username"] and body.disabled:
             raise HTTPException(status_code=400, detail="you cannot disable yourself")
         store.user_set(username, disabled=int(body.disabled))
         if body.disabled:
             store.auth_sessions_revoke_user(user["id"])
+        # Epic E4: enable/disable is offboarding/reinstatement — always audited.
+        audit.record(store, audit.USER_DISABLE, actor=audit.dashboard_actor(admin),
+                     actor_kind="user", target=username,
+                     detail={"disabled": bool(body.disabled)})
     if body.password is not None:
         if user["username"] == admin["username"]:
             # the admin reset hands out a TEMPORARY credential (arms
@@ -280,6 +714,75 @@ async def users_patch(username: str, body: UserPatchBody,
         store.user_set(username, pw_hash=hash_password(body.password), must_change_pw=1,
                        failed_attempts=0, locked_until=None)
         store.auth_sessions_revoke_user(user["id"])
+        # Epic E4: a forced credential reset is a security-sensitive mutation
+        # (it hands out a temporary password and kills live sessions) — audit it.
+        audit.record(store, audit.USER_UPDATE, actor=audit.dashboard_actor(admin),
+                     actor_kind="user", target=username,
+                     detail={"action": "password_reset"})
+    if body.clickup_user_id is not None:
+        # Epic A1: link/clear a ClickUp identity. One ClickUp id maps to at
+        # most ONE user (any state) — read-side 409 for a clean message, and
+        # the partial UNIQUE index closes the read-then-write race.
+        cu_id = body.clickup_user_id.strip()
+        if cu_id and not cu_id.isdigit():
+            raise HTTPException(status_code=400,
+                                detail="clickup_user_id must be a numeric ClickUp user id")
+        if cu_id:
+            other = next((u for u in store.user_list()
+                          if u.get("clickup_user_id") == cu_id
+                          and u["username"] != username), None)
+            if other:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"ClickUp id already linked to '{other['username']}'")
+        try:
+            store.user_set(username, clickup_user_id=cu_id)
+        except db_mod.IntegrityError:
+            raise HTTPException(status_code=409,
+                                detail="ClickUp id already linked to another user")
+        # the mapping decides WHOSE ClickUp comments answer role-owned gates
+        # (gate-answer authority + attribution) — every link/relink/clear is
+        # audited with the acting admin, or an impersonating relink would be
+        # unreconstructable afterwards
+        old = (user.get("clickup_user_id") or "").strip()
+        if cu_id != old:
+            store.admin_event_add(
+                "clickup_link", target=username,
+                detail=f"clickup_user_id: {old or '(none)'} -> {cu_id or '(cleared)'}",
+                actor=f"dashboard:{admin['username']}")
+    # Epic D1: people profile. Validated BEFORE any write (a bad areas list
+    # changes nothing); only-audit-when-changed against the current row —
+    # authority tags + areas GRANT routing/decision authority, so the change
+    # and its author must be reconstructable (same posture as clickup_link).
+    profile_fields = {}
+    if body.person_role is not None:
+        profile_fields["person_role"] = body.person_role
+    if body.areas is not None:
+        profile_fields["areas"] = body.areas
+    if body.authority is not None:
+        profile_fields["authority"] = body.authority
+    if body.person_notes is not None:
+        profile_fields["notes"] = body.person_notes
+    if profile_fields:
+        try:
+            cleaned = people.validate_profile(profile_fields)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        current = store.person_get(user["id"]) or {
+            "person_role": "", "areas": "[]", "authority": "[]", "notes": ""}
+        stored = {}
+        changed = {}
+        for key, value in cleaned.items():
+            encoded = json.dumps(value) if key in ("areas", "authority") else value
+            stored[key] = encoded
+            if (current.get(key) or ("[]" if key in ("areas", "authority") else "")) != encoded:
+                changed[key] = value
+        if changed:
+            store.person_set(user["id"], **stored)
+            store.admin_event_add(
+                "people_profile", target=username,
+                detail=json.dumps(changed, default=str)[:1000],
+                actor=f"dashboard:{admin['username']}")
     return _public_user(store.user_get(username))
 
 
@@ -294,10 +797,11 @@ async def setup_status():
     store: JobStore = app.state.store
     reader = MemoryReader(settings)
     live_map = json.loads(settings.repo_map)
-    # a fresh install still carries the code-default Gumo context and repos —
-    # "configured" means the operator actually made them theirs (semantic
-    # compare: the workspace migration re-serializes the same default map)
-    default_map = validate_repo_map(json.loads(_default_settings.repo_map))
+    # a fresh install still carries the neutral code defaults — "configured"
+    # means the operator actually made them theirs (semantic compare: the
+    # workspace migration re-serializes the same default map). allow_empty:
+    # the neutral default map IS empty and that must not raise here.
+    default_map = validate_repo_map(json.loads(_default_settings.repo_map), allow_empty=True)
     steps = {
         "business_context": settings.business_context != _default_settings.business_context
                             or settings.product_name != _default_settings.product_name,
@@ -328,6 +832,13 @@ class WorkspaceCreateBody(BaseModel):
     clickup_enabled: bool | None = None
     slack_webhook_url: str | None = None
     gate_mode_default: str | None = None
+    require_attributed_answers: str | None = None  # Epic A1: auto | on | off
+    stage_role_map: str | None = None              # Epic A3: JSON overrides; '' = inherit
+    gate_sla_hours: int | str | None = None        # Epic A5: '' = inherit instance default
+    analytics_provider: str | None = None          # Epic B3: '' = none | 'mixpanel'
+    analytics_config: dict | str | None = None     # Epic B3: stored secret; NEVER echoed back
+    slack_channels: list | str | None = None       # Epic D3: ingest allowlist; '' clears
+    budget_monthly_usd: float | str | None = None  # Epic I4/G4: '' = inherit instance
 
 
 class WorkspacePatchBody(WorkspaceCreateBody):
@@ -339,6 +850,8 @@ class WorkspacePatchBody(WorkspaceCreateBody):
 class MemberBody(BaseModel):
     username: str
     member: bool
+    role: str | None = None       # Epic E3: admin | member | viewer
+    repos: list | None = None     # per-member repo allow-list ([] = all)
 
 
 def _ws_svc() -> WorkspaceService:
@@ -358,6 +871,32 @@ def _require_project_access(project: str, user: dict):
     ws = _ws_svc().for_project(project)
     if ws is None or not _ws_svc().user_can_access(user, ws["id"]):
         raise HTTPException(status_code=400, detail=f"unknown project '{project}'")
+    # Epic E3 (RBAC v2): membership is visibility, not write authority. A viewer
+    # is read-only; a repo-restricted member may only submit against an
+    # allow-listed repo. Instance/workspace admins pass (can_submit -> True).
+    if not rbac.can_submit(app.state.store, user, ws["id"], project):
+        raise HTTPException(
+            status_code=403,
+            detail="write access required — this workspace role is read-only "
+                   "(viewer) or this repo is not in your allow-list")
+
+
+def _require_workspace_write(workspace_id, user: dict):
+    """RBAC v2 (Epic E3): a mutating action on a workspace-scoped resource
+    requires a WRITE role (admin/member) in that workspace — a viewer is
+    read-only. Instance/workspace admins pass. Epic D/I write endpoints
+    (decisions, inbox dismiss) gate only on membership (user_can_access =
+    visibility); this adds the write-authority check the pipeline surface gets
+    via can_submit, so a viewer can neither inject product memory into pipeline
+    prompts, ratify untrusted Slack candidates, nor permanently suppress
+    proposals. workspace_id None (instance-wide) is left to the endpoint's own
+    admin gate — a non-admin never resolves such a row (user_can_access -> False)."""
+    if workspace_id is None:
+        return
+    if rbac.is_read_only(rbac.workspace_role(app.state.store, user, workspace_id)):
+        raise HTTPException(
+            status_code=403,
+            detail="write access required — this workspace role is read-only (viewer)")
 
 
 @app.get("/api/workspaces")
@@ -366,19 +905,46 @@ async def workspaces_list(user: dict = Depends(require_user)):
     return [svc.public(w) for w in svc.user_workspaces(user)]
 
 
-@app.post("/api/workspaces", dependencies=[Depends(require_admin)])
-async def workspaces_create(body: WorkspaceCreateBody):
+def _audit_workspace_mutation(kind: str, workspace_id, admin: dict, provided: dict):
+    """Audit a workspace config mutation with the acting admin (BUILD-PLAN:
+    every new mutation is auditable). These keys are security-relevant —
+    stage_role_map reassigns gate ownership, require_attributed_answers='off'
+    disables ClickUp attribution enforcement — so the change and its author
+    must be reconstructable. Secret-bearing values are redacted, never stored
+    in the audit row."""
+    if not provided:
+        return
+    redacted = {}
+    for k, v in provided.items():
+        if k in ("analytics_config", "slack_webhook_url"):
+            redacted[k] = "(redacted)"
+        elif k == "repos":
+            redacted[k] = sorted(str((r or {}).get("slug") or "?") for r in (v or []))
+        else:
+            redacted[k] = v
+    app.state.store.admin_event_add(
+        kind, target=str(workspace_id),
+        detail=json.dumps(redacted, default=str)[:1000],
+        actor=f"dashboard:{admin['username']}")
+
+
+@app.post("/api/workspaces")
+async def workspaces_create(body: WorkspaceCreateBody,
+                            admin: dict = Depends(require_admin)):
     svc = _ws_svc()
     try:
         ws = svc.create(body.slug, body.name,
                         **body.model_dump(exclude={"slug", "name"}, exclude_none=True))
     except WorkspaceError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    _audit_workspace_mutation("workspace_create", ws["id"], admin,
+                              body.model_dump(exclude_none=True))
     return svc.public(ws)
 
 
-@app.patch("/api/workspaces/{workspace_id}", dependencies=[Depends(require_admin)])
-async def workspaces_patch(workspace_id: int, body: WorkspacePatchBody):
+@app.patch("/api/workspaces/{workspace_id}")
+async def workspaces_patch(workspace_id: int, body: WorkspacePatchBody,
+                           admin: dict = Depends(require_admin)):
     svc = _ws_svc()
     try:
         ws = svc.update(workspace_id, repos=body.repos,
@@ -387,6 +953,10 @@ async def workspaces_patch(workspace_id: int, body: WorkspacePatchBody):
         raise HTTPException(status_code=404, detail=str(e))
     except WorkspaceError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    # recorded only after the validated update landed — a 400 changes nothing
+    # and audits nothing
+    _audit_workspace_mutation("workspace_config", workspace_id, admin,
+                              body.model_dump(exclude={"slug"}, exclude_none=True))
     return svc.public(ws) | {"warning": _live_unmapped_warning(app.state.store)}
 
 
@@ -399,18 +969,722 @@ async def workspaces_member(workspace_id: int, body: MemberBody):
     if target is None:
         raise HTTPException(status_code=404, detail=f"unknown user '{body.username}'")
     store.workspace_member_set(workspace_id, target["id"], body.member)
+    # Epic E3: set the workspace role + per-member repo restriction when the
+    # member is being added/kept (only meaningful for a present member).
+    if body.member and (body.role is not None or body.repos is not None):
+        role = body.role if body.role in ("admin", "member", "viewer") else "member"
+        store.workspace_member_set_role(workspace_id, target["id"], role, body.repos)
     return _ws_svc().public(store.workspace_get(workspace_id))
+
+
+@app.get("/api/budgets")
+async def budgets_view(user: dict = Depends(require_user)):
+    """Per accessible workspace spend vs budget (Epic G4). Membership-scoped:
+    admins see all, members see their workspaces."""
+    from . import budgets as budgets_mod
+    store: JobStore = app.state.store
+    is_admin = (user.get("role") or "") in ("admin", "instance_admin")
+    my_ws = None if is_admin else store.workspace_ids_for_user(user["id"])
+    out = []
+    for ws in store.workspace_list():
+        if my_ws is not None and ws["id"] not in my_ws:
+            continue
+        st = budgets_mod.budget_status(store, settings, ws)
+        out.append({"workspace_id": ws["id"], "slug": ws.get("slug"),
+                    "name": ws.get("name") or ws.get("slug"), **st})
+    return {"budgets": out, "block_enabled": settings.budget_block_enabled}
 
 
 @app.get("/api/jobs")
 async def jobs(user: dict = Depends(require_user)):
-    rows = app.state.store.recent()
+    store: JobStore = app.state.store
+    rows = store.recent()
     svc = _ws_svc()
     rows = [r for r in rows if svc.user_can_access(user, r.get("workspace_id"))]
+    # autonomy annotation (Epic C3): two prefetches, never an N+1
+    scores = {(s["workspace_id"], s["project"], s["stage"]): s
+              for s in store.autonomy_scores_all()}
+    pins = {(p["workspace_id"], p["stage"]): p["pin"]
+            for p in store.autonomy_pins_all()}
     for r in rows:
         if r.get("kind") == "feature":
-            r["stage_name"] = stage_name(int(r.get("stage") or 0))
+            stage = int(r.get("stage") or 0)
+            r["stage_name"] = stage_name(stage)
+            cell = scores.get((r.get("workspace_id"), r.get("project") or "", stage))
+            r["autonomy_level"] = int(cell["level"]) if cell else 0
+            r["autonomy_pin"] = pins.get((r.get("workspace_id"), stage), "")
     return rows
+
+
+@app.get("/api/inbox")
+async def inbox(user: dict = Depends(require_user)):
+    """Per-person work queue (Epic A4): every answerable gate the user owns,
+    plus unassigned gates (no enforceable DRI — a solo instance sees
+    everything). Sorted overdue first, then oldest gate first. `counts.mine`
+    (which includes unassigned) is the badge number."""
+    store: JobStore = app.state.store
+    svc = _ws_svc()
+    now = time.time()
+    items = []
+    unassigned_n = 0
+    for job in store.awaiting_gates():
+        if not svc.user_can_access(user, job.get("workspace_id")):
+            continue
+        # Epic I2: the shared user-independent summary (one implementation of
+        # "overdue" for the inbox AND the standup digest); the per-user fields
+        # (is_you / mine-filtering) stay here — the digest has no acting user.
+        item, owner = inboxlib.gate_summary(store, settings, svc.for_job(job),
+                                            job, now)
+        enforced = owner is not None and owner.enforce
+        is_you = roles.actor_is_owner(owner, user) if enforced else False
+        unassigned = not enforced
+        if not (unassigned or is_you):
+            continue
+        if unassigned:
+            unassigned_n += 1
+        items.append(item | {
+            "gate_owner": ({"role": owner.role, "display": owner.display,
+                            "is_you": is_you} if enforced else None),
+            "unassigned": unassigned,
+        })
+    items.sort(key=lambda i: (not i["overdue"], i["gate_posted_at"] or 0))
+    # Epic D3: parked Slack decision candidates — inbox material awaiting a
+    # human confirm/dismiss, membership-scoped, oldest first. Additive keys
+    # only: items and counts.mine keep their exact pre-D3 semantics (the
+    # badge number never includes candidates).
+    ws_ids = None if user.get("role") in ("admin", "instance_admin") \
+        else sorted(store.workspace_ids_for_user(user["id"]))
+    candidates = [_decision_public(d) for d in store.decision_candidates(ws_ids, 50)]
+    # Epic I0: durable routine outputs — open notices, membership-scoped
+    # (workspace_id NULL rows are admin-only, matching the jobs posture).
+    # Additive keys only: items/counts.mine keep their exact pre-I semantics.
+    notices = [_notice_public(n) for n in store.inbox_items_open(ws_ids)]
+    return {"items": items,
+            "candidates": candidates,
+            "notices": notices,
+            "counts": {"mine": len(items), "unassigned": unassigned_n,
+                       "overdue": sum(1 for i in items if i["overdue"]),
+                       "candidates": len(candidates),
+                       "notices": len(notices)}}
+
+
+def _notice_public(n: dict) -> dict:
+    try:
+        refs = json.loads(n.get("refs") or "{}")
+        if not isinstance(refs, dict):
+            refs = {}
+    except (ValueError, TypeError):
+        refs = {}
+    return {k: n.get(k) for k in ("id", "workspace_id", "kind", "source",
+                                  "title", "body", "status", "status_by",
+                                  "status_at", "created_at", "updated_at")} | {"refs": refs}
+
+
+def _notice_scoped(item_id: int, user: dict) -> dict:
+    """The notice iff the user may see it — 404 either way (no existence
+    leaks). NULL-workspace notices are instance-wide → admin-only."""
+    item = app.state.store.inbox_item_get(item_id)
+    if item is None or not _ws_svc().user_can_access(user, item.get("workspace_id")):
+        raise HTTPException(status_code=404, detail="unknown notice")
+    return item
+
+
+class NoticeDismissBody(BaseModel):
+    reason: str = ""
+
+
+class NoticeAdoptBody(BaseModel):
+    as_: str = "feature"  # 'feature' | 'task'
+    project: str = ""
+    title: str | None = None
+    request: str | None = None
+    founder_dri: str | None = None
+    dev_dri: str | None = None
+    success_metric: str | None = None
+    metric_target: str | None = None
+    metric_window_days: int | None = None
+
+    model_config = {"populate_by_name": True}
+
+    def __init__(self, **data):
+        if "as" in data:  # accept the design's `as` key (reserved word in Python)
+            data.setdefault("as_", data.pop("as"))
+        super().__init__(**data)
+
+
+@app.post("/api/inbox/notices/{item_id}/dismiss")
+async def notice_dismiss(item_id: int, body: NoticeDismissBody,
+                         user: dict = Depends(require_user)):
+    """Dismiss a notice. The row is KEPT (dismissal memory): its dedupe key
+    blocks any unchanged re-proposal forever. CAS — 409 to the loser."""
+    store: JobStore = app.state.store
+    item = _notice_scoped(item_id, user)
+    # RBAC v2: dismissal is an irreversible workspace-wide mutation (its dedupe
+    # key blocks any unchanged re-proposal forever). A viewer is read-only —
+    # matching the sibling adopt endpoint, which blocks viewers via can_submit.
+    _require_workspace_write(item.get("workspace_id"), user)
+    extra = {"dismiss_reason": body.reason.strip()[:500]} if body.reason.strip() else None
+    if not store.inbox_item_resolve(item_id, "dismissed",
+                                    f"dashboard:{user['username']}", extra):
+        raise HTTPException(status_code=409, detail="notice changed state concurrently")
+    return _notice_public(store.inbox_item_get(item_id))
+
+
+@app.post("/api/inbox/notices/{item_id}/adopt")
+async def notice_adopt(item_id: int, body: NoticeAdoptBody,
+                       user: dict = Depends(require_user)):
+    """Adopt a proposal into the ordinary intake — the ONLY path from a
+    proposal to a pipeline (routines never self-initiate one). Validation
+    happens BEFORE the CAS resolve, exactly like POST /api/features: project
+    must be mapped, non-admins need project access. The brief flows into
+    job.request and takes the untrusted-fragment posture of a ClickUp
+    description in every stage prompt."""
+    store: JobStore = app.state.store
+    worker: Worker = app.state.worker
+    item = _notice_scoped(item_id, user)
+    if (item.get("kind") or "") != "proposal":
+        raise HTTPException(status_code=400, detail="only proposals can be adopted")
+    as_kind = (body.as_ or "feature").strip().lower()
+    if as_kind not in ("feature", "task"):
+        raise HTTPException(status_code=400, detail="as must be 'feature' or 'task'")
+    try:
+        refs = json.loads(item.get("refs") or "{}")
+        if not isinstance(refs, dict):
+            refs = {}
+    except (ValueError, TypeError):
+        refs = {}
+    project = (body.project or "").strip() or str(refs.get("project") or "").strip()
+    if not project or settings.repo_for_project(project) is None:
+        raise HTTPException(status_code=400, detail=f"unknown project '{project}'")
+    if user["role"] not in ("admin", "instance_admin"):
+        _require_project_access(project, user)
+    if body.metric_window_days is not None and not 1 <= body.metric_window_days <= 365:
+        raise HTTPException(status_code=400,
+                            detail="metric_window_days must be between 1 and 365")
+    title = (body.title or "").strip() or item["title"]
+    request_text = (body.request or "").strip() or (item.get("body") or "").strip() \
+        or item["title"]
+    request_text = f"{request_text}\n\n_adopted from proposal #{item['id']}_"
+    prefix = "feat" if as_kind == "feature" else "task"
+    job_id = f"{prefix}-prop-{item['id']}"
+    # CAS-resolve FIRST (409 to the loser) — after the validation above, the
+    # only intake refusal path (a duplicate job id) is unreachable post-CAS,
+    # so there is no compensating rollback.
+    if not store.inbox_item_resolve(
+            item_id, "adopted", f"dashboard:{user['username']}",
+            {"adopted_as": job_id, "adopted_kind": as_kind, "project": project}):
+        raise HTTPException(status_code=409, detail="notice changed state concurrently")
+    try:
+        if as_kind == "feature":
+            worker.intake_feature(
+                job_id, title=title, project=project, request=request_text,
+                founder_dri=(body.founder_dri or "").strip(),
+                dev_dri=(body.dev_dri or "").strip(),
+                success_metric=(body.success_metric or "").strip(),
+                metric_target=(body.metric_target or "").strip(),
+                metric_window_days=body.metric_window_days,
+            )
+        else:
+            worker.intake_task(job_id, title=title, project=project,
+                               request=request_text)
+        job = store.get(job_id)
+        if job is None:
+            raise RuntimeError("intake did not create the job row")
+    except HTTPException:
+        raise
+    except Exception as e:
+        # visible + auditable: the item stays 'adopted' with the error in
+        # refs — never a silent un-adopt (single-writer posture)
+        store.inbox_item_merge_refs(item_id, {"intake_error": str(e)[:300]})
+        log.exception("proposal adoption intake failed for notice %s", item_id)
+        raise HTTPException(status_code=500,
+                            detail=f"intake failed after adoption: {str(e)[:200]}")
+    return {"job_id": job_id, "kind": as_kind, "project": project,
+            "notice": _notice_public(store.inbox_item_get(item_id))}
+
+
+@app.get("/api/outcomes")
+async def outcomes_ledger(user: dict = Depends(require_user)):
+    """The outcome ledger (Epic B5): one row per finished watch — metric, goal,
+    observed, verdict, learning, decider — membership-scoped (fail closed: rows
+    whose workspace the user cannot access simply don't exist here), plus the
+    verdict distribution over the visible rows."""
+    store: JobStore = app.state.store
+    svc = _ws_svc()
+    rows = [r for r in store.outcomes_recent(200)
+            if svc.user_can_access(user, r.get("workspace_id"))]
+    verdicts = {"moved": 0, "flat": 0, "regressed": 0, "unmeasured": 0}
+    for r in rows:
+        v = r.get("verdict") or "unmeasured"
+        verdicts[v] = verdicts.get(v, 0) + 1
+    return {"outcomes": rows, "verdicts": verdicts}
+
+
+# ---------- decision registry (Epic D2, docs/ENGINE.md §16) ----------
+
+
+DECISION_SCOPES = ("job", "repo", "product", "org")
+
+
+class DecisionCreateBody(BaseModel):
+    scope: str
+    text: str
+    title: str = ""
+    project: str | None = None
+    links: list | None = None
+    workspace_id: int | None = None
+
+
+class DecisionPatchBody(BaseModel):
+    action: str  # supersede | reactivate
+
+
+class DecisionConfirmBody(BaseModel):
+    scope: str | None = None
+    title: str | None = None
+    text: str | None = None
+
+
+def _validate_decision_fields(scope: str | None, text: str | None,
+                              title: str | None, links: list | None,
+                              user: dict):
+    """Shared validation for create AND confirm-with-edits (amendment: the
+    exact same rules on both paths). Raises HTTPException."""
+    if scope is not None:
+        if scope not in DECISION_SCOPES:
+            raise HTTPException(status_code=400,
+                                detail="scope must be one of: "
+                                       + ", ".join(DECISION_SCOPES))
+        if scope == "org" and user.get("role") not in ("admin", "instance_admin"):
+            # org-scope rows reach EVERY member's prompts and registry view —
+            # creating/confirming one is an admin action (ENGINE.md §16)
+            raise HTTPException(status_code=403,
+                                detail="org-scope decisions are admin-only")
+    if text is not None:
+        if not text.strip():
+            raise HTTPException(status_code=400, detail="text must be non-empty")
+        if len(text) > 4000:
+            raise HTTPException(status_code=400, detail="text is capped at 4000 chars")
+    if title is not None and len(title) > 200:
+        raise HTTPException(status_code=400, detail="title is capped at 200 chars")
+    if links is not None:
+        if not all(isinstance(l, str) for l in links):
+            raise HTTPException(status_code=400,
+                                detail="links must be a list of strings")
+        # stored links render as clickable anchors in every member's (and
+        # admin's) registry view — whitelist web URLs so a javascript: value
+        # can never reach an href (same posture as the dashboard's linkify)
+        for l in links:
+            u = l.strip().lower()
+            if not (u.startswith("https://") or u.startswith("http://")):
+                raise HTTPException(status_code=400,
+                                    detail="links must be http(s):// URLs")
+
+
+def _decision_public(d: dict) -> dict:
+    try:
+        links = json.loads(d.get("links") or "[]")
+    except (ValueError, TypeError):
+        links = []
+    return d | {"links": links}
+
+
+def _decision_scoped(decision_id: int, user: dict) -> dict:
+    """The decision row iff the user may see it — the visibility predicate is
+    EXACTLY the prompt-admission predicate: own-workspace rows plus
+    scope='org' rows; anything else (incl. workspace_id NULL rows for
+    members) is a 404, no existence leaks."""
+    row = app.state.store.decision_get(decision_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="unknown decision")
+    if user.get("role") not in ("admin", "instance_admin") and row.get("scope") != "org" \
+            and not _ws_svc().user_can_access(user, row.get("workspace_id")):
+        raise HTTPException(status_code=404, detail="unknown decision")
+    return row
+
+
+@app.post("/api/decisions")
+async def decisions_create(body: DecisionCreateBody,
+                           user: dict = Depends(require_user)):
+    store: JobStore = app.state.store
+    _validate_decision_fields(body.scope, body.text, body.title, body.links, user)
+    ws_id = None
+    if body.workspace_id is not None:
+        ws = store.workspace_get(body.workspace_id)
+        if ws is None or not _ws_svc().user_can_access(user, ws["id"]):
+            raise HTTPException(status_code=400, detail="unknown workspace")
+        ws_id = ws["id"]
+    elif (body.project or "").strip():
+        ws = _ws_svc().for_project(body.project.strip())
+        if ws is None or not _ws_svc().user_can_access(user, ws["id"]):
+            raise HTTPException(status_code=400,
+                                detail=f"unknown project '{body.project}'")
+        ws_id = ws["id"]
+    if body.scope != "org" and ws_id is None:
+        raise HTTPException(status_code=400,
+                            detail="provide a workspace_id or project "
+                                   "(only org-scope decisions may omit both)")
+    # RBAC v2: a viewer may see the workspace (user_can_access) but not write
+    # product memory into it (org-scope is already admin-gated above).
+    _require_workspace_write(ws_id, user)
+    did = store.decision_add(
+        "manual", body.text.strip(), scope=body.scope,
+        title=(body.title or "").strip(), project=(body.project or "").strip(),
+        workspace_id=ws_id, links=body.links or [],
+        decided_by=f"dashboard:{user['username']}")
+    return _decision_public(store.decision_get(did))
+
+
+@app.get("/api/decisions")
+async def decisions_list(q: str = "", scope: str = "", status: str = "",
+                         project: str = "", source: str = "",
+                         limit: int = 100, offset: int = 0,
+                         user: dict = Depends(require_user)):
+    """The registry view. Members see their workspaces' rows PLUS every
+    org-scope row (org rows reach every member's prompts, so every member may
+    read — and ask an admin to supersede — them). Default status view
+    excludes candidates (inbox material) and dismissed (remembered
+    rejections)."""
+    if scope and scope not in DECISION_SCOPES:
+        raise HTTPException(status_code=400, detail="unknown scope")
+    if status and status not in ("active", "superseded", "candidate", "dismissed"):
+        raise HTTPException(status_code=400, detail="unknown status")
+    store: JobStore = app.state.store
+    ws_ids = None if user.get("role") in ("admin", "instance_admin") \
+        else sorted(store.workspace_ids_for_user(user["id"]))
+    rows = store.decisions_query(
+        q=q, scope=scope, status=status, project=project, source=source,
+        workspace_ids=ws_ids, limit=max(1, min(500, limit)),
+        offset=max(0, offset))
+    return {"decisions": [_decision_public(d) for d in rows]}
+
+
+@app.patch("/api/decisions/{decision_id}")
+async def decisions_patch(decision_id: int, body: DecisionPatchBody,
+                          user: dict = Depends(require_user)):
+    store: JobStore = app.state.store
+    row = _decision_scoped(decision_id, user)
+    if row.get("scope") == "org" and user.get("role") not in ("admin", "instance_admin"):
+        raise HTTPException(status_code=403,
+                            detail="org-scope decisions are admin-only")
+    _require_workspace_write(row.get("workspace_id"), user)
+    action = body.action.strip().lower()
+    if action == "supersede":
+        ok = store.decision_set_status(decision_id, ["active"], "superseded",
+                                       f"dashboard:{user['username']}")
+    elif action == "reactivate":
+        ok = store.decision_set_status(decision_id, ["superseded"], "active",
+                                       f"dashboard:{user['username']}")
+    else:
+        raise HTTPException(status_code=400,
+                            detail="action must be 'supersede' or 'reactivate'")
+    if not ok:
+        raise HTTPException(status_code=409,
+                            detail="decision changed state concurrently")
+    return _decision_public(store.decision_get(decision_id))
+
+
+@app.post("/api/decisions/{decision_id}/confirm")
+async def decisions_confirm(decision_id: int, body: DecisionConfirmBody,
+                            user: dict = Depends(require_user)):
+    """Confirm a Slack candidate into the registry (Epic D3). The human may
+    edit scope/title/text while confirming — validated with EXACTLY the same
+    rules as POST /api/decisions (org scope stays admin-only). Confirmation
+    stamps decided_by with the ratifying HUMAN; the original Slack author is
+    preserved in origin_author (written at ingest) — auditable either way.
+    CAS candidate→active; 409 on a lost race. The FTS insert rides the same
+    transaction (decision_set_status)."""
+    store: JobStore = app.state.store
+    row = _decision_scoped(decision_id, user)
+    if row.get("status") != "candidate":
+        raise HTTPException(status_code=409, detail="not a candidate")
+    # RBAC v2: confirmation is the human-ratification step that admits an
+    # untrusted Slack candidate into the injected registry — a viewer must not
+    # satisfy it (org-scope stays admin-only via _validate_decision_fields).
+    _require_workspace_write(row.get("workspace_id"), user)
+    _validate_decision_fields(body.scope, body.text, body.title, None, user)
+    edits = {}
+    if body.scope is not None:
+        edits["scope"] = body.scope
+    if body.title is not None:
+        edits["title"] = body.title.strip()
+    if body.text is not None:
+        edits["text"] = body.text.strip()
+    ok = store.decision_set_status(
+        decision_id, ["candidate"], "active",
+        f"dashboard:{user['username']}",
+        decided_by=f"dashboard:{user['username']}", **edits)
+    if not ok:
+        raise HTTPException(status_code=409,
+                            detail="candidate changed state concurrently")
+    return _decision_public(store.decision_get(decision_id))
+
+
+@app.post("/api/decisions/{decision_id}/dismiss")
+async def decisions_dismiss(decision_id: int, user: dict = Depends(require_user)):
+    """Dismiss a candidate. The row is KEPT (status='dismissed') so its
+    (source, ref) key survives — a re-scan can never re-propose it. An
+    ordinary work mutation recorded on the row itself (updated_by/updated_at);
+    it grants no authority, so no admin_events row."""
+    store: JobStore = app.state.store
+    row = _decision_scoped(decision_id, user)
+    if row.get("status") != "candidate":
+        raise HTTPException(status_code=409, detail="not a candidate")
+    if row.get("scope") == "org" and user.get("role") not in ("admin", "instance_admin"):
+        raise HTTPException(status_code=403,
+                            detail="org-scope decisions are admin-only")
+    _require_workspace_write(row.get("workspace_id"), user)
+    ok = store.decision_set_status(decision_id, ["candidate"], "dismissed",
+                                   f"dashboard:{user['username']}")
+    if not ok:
+        raise HTTPException(status_code=409,
+                            detail="candidate changed state concurrently")
+    return _decision_public(store.decision_get(decision_id))
+
+
+# ---------- graduated autonomy (Epic C, docs/ENGINE.md §15) ----------
+
+
+class AutonomyPinBody(BaseModel):
+    stage: int
+    pin: str | None = None  # 'always_gate' | 'always_auto' | null = clear
+
+
+class AutonomyClawbackBody(BaseModel):
+    stage: int
+    project: str | None = None  # null = every repo in the workspace
+
+
+def _pin_map(store: JobStore, workspace_id: int) -> dict:
+    return {str(s): {"pin": p["pin"], "set_by": p["set_by"], "set_at": p["set_at"]}
+            for s, p in store.autonomy_pins_for(workspace_id).items()}
+
+
+@app.get("/api/autonomy")
+async def autonomy_state(user: dict = Depends(require_user)):
+    """The trust-ladder surface: per accessible workspace the stage×repo score
+    matrix (inputs JSON-decoded for the UI), the pin map, and the last 50
+    autonomy events. Membership-scoped like /api/workspaces."""
+    store: JobStore = app.state.store
+    svc = _ws_svc()
+    out = {"enabled": settings.autonomy_enabled,
+           "auto_level": autonomy.effective_auto_level(settings),
+           "workspaces": []}
+    for ws in svc.user_workspaces(user):
+        cells = []
+        for r in store.autonomy_scores_for(ws["id"]):
+            try:
+                inputs = json.loads(r.get("inputs") or "{}")
+            except (ValueError, TypeError):
+                inputs = {}
+            cells.append({
+                "project": r["project"], "stage": r["stage"], "level": r["level"],
+                "score": r["score"], "sample_runs": r["sample_runs"],
+                # display semantics (ENGINE.md §15): the flag shows only while
+                # the cell sits at 0 — clawback_at itself is never cleared
+                "clawed_back": bool(r.get("clawback_at")) and r["level"] == 0,
+                "computed_at": r["computed_at"], "inputs": inputs,
+            })
+        out["workspaces"].append({
+            "id": ws["id"], "slug": ws["slug"], "name": ws["name"],
+            "repos": [r["slug"] for r in store.workspace_repos_for(ws["id"])],
+            "pins": _pin_map(store, ws["id"]),
+            "cells": cells,
+            "events": store.autonomy_events_recent([ws["id"]], 50),
+        })
+    return out
+
+
+@app.put("/api/workspaces/{workspace_id}/autonomy/pins")
+async def autonomy_pin_put(workspace_id: int, body: AutonomyPinBody,
+                           admin: dict = Depends(require_admin)):
+    """Set or clear a per-workspace per-stage pin (admin — pins are config
+    mutations, matching workspace PATCH). Pins always win over computed
+    levels and never expire; every change is audited."""
+    store: JobStore = app.state.store
+    if store.workspace_get(workspace_id) is None:
+        raise HTTPException(status_code=404, detail="unknown workspace")
+    if not 0 <= body.stage <= 9:
+        raise HTTPException(status_code=400, detail="stage must be 0–9")
+    pin = (body.pin or "").strip() or None
+    actor = f"dashboard:{admin['username']}"
+    if pin is None:
+        if body.stage in store.autonomy_pins_for(workspace_id):
+            store.autonomy_pin_clear(workspace_id, body.stage)
+            store.autonomy_event_add("pin_clear", workspace_id=workspace_id,
+                                     stage=body.stage,
+                                     detail=f"P{body.stage} pin cleared", actor=actor)
+    else:
+        if pin not in ("always_gate", "always_auto"):
+            raise HTTPException(status_code=400,
+                                detail="pin must be 'always_gate', 'always_auto' or null")
+        if pin == "always_auto" and body.stage == 9:
+            raise HTTPException(status_code=400,
+                                detail="P9 never auto-advances — its proceed is the "
+                                       "terminal transition")
+        store.autonomy_pin_set(workspace_id, body.stage, pin, actor)
+        store.autonomy_event_add("pin_set", workspace_id=workspace_id, stage=body.stage,
+                                 detail=f"P{body.stage} pinned {pin}", actor=actor)
+    return {"workspace_id": workspace_id, "pins": _pin_map(store, workspace_id)}
+
+
+@app.post("/api/workspaces/{workspace_id}/autonomy/clawback")
+async def autonomy_clawback_post(workspace_id: int, body: AutonomyClawbackBody,
+                                 user: dict = Depends(require_user)):
+    """One-click brake. Members of the workspace may pull it (clawback only
+    REDUCES autonomy); admins anywhere. 404 on no access — membership-style,
+    no existence leaks. project=null claws back every slug that ever held a
+    cell here plus the current repo set (stale/moved slugs included)."""
+    store: JobStore = app.state.store
+    ws = store.workspace_get(workspace_id)
+    if ws is None or not _ws_svc().user_can_access(user, workspace_id):
+        raise HTTPException(status_code=404, detail="unknown workspace")
+    if not 0 <= body.stage <= 9:
+        raise HTTPException(status_code=400, detail="stage must be 0–9")
+    project = (body.project or "").strip() or None
+    if project is not None:
+        own = {r["slug"] for r in store.workspace_repos_for(workspace_id)}
+        if project not in own:
+            raise HTTPException(status_code=400,
+                                detail=f"project '{project}' is not a repo slug in "
+                                       "this workspace")
+    clawed = autonomy.clawback(store, settings, workspace_id, body.stage, project,
+                               actor=f"dashboard:{user['username']}")
+    return {"clawed": clawed}
+
+
+@app.post("/api/autonomy/recompute", dependencies=[Depends(require_admin)])
+async def autonomy_recompute():
+    """Run the autonomy scorer inline (operator/test convenience — nobody
+    waits for the nightly pass). Same thread-offload as the loop; the two
+    serialize trivially through SQLite's single writer today."""
+    if not settings.autonomy_enabled:
+        raise HTTPException(status_code=400, detail="autonomy is disabled (AUTONOMY_ENABLED)")
+    res = await asyncio.to_thread(
+        autonomy.compute, app.state.store, settings)
+    return res
+
+
+# ---------- proactive routines (Epic I1, docs/ENGINE.md §17) ----------
+
+
+class RoutinePutBody(BaseModel):
+    enabled: bool | None = None
+    schedule: str | None = None
+    config: dict | None = None
+
+
+def _routine_public(store: JobStore, r: dict, runs: int = 20) -> dict:
+    try:
+        config = json.loads(r.get("config") or "{}")
+        if not isinstance(config, dict):
+            config = {}
+    except (ValueError, TypeError):
+        config = {}
+    return {k: r.get(k) for k in ("id", "workspace_id", "kind", "name",
+                                  "schedule", "enabled", "last_run_at",
+                                  "last_status", "last_result")} | {
+        "enabled": bool(r.get("enabled")),
+        "config": config,
+        "builtin": r.get("workspace_id") is None,
+        "runs": store.routine_runs_recent(r["id"], runs),
+    }
+
+
+@app.get("/api/routines")
+async def routines_list(user: dict = Depends(require_user)):
+    """Membership-scoped routine table + run history (last 20 per routine).
+    Instance (builtin) rows are admin-only."""
+    store: JobStore = app.state.store
+    svc = _ws_svc()
+    out = []
+    for r in store.routines_all():
+        if r.get("workspace_id") is None:
+            if user.get("role") not in ("admin", "instance_admin"):
+                continue
+        elif not svc.user_can_access(user, r["workspace_id"]):
+            continue
+        out.append(_routine_public(store, r))
+    return {"routines": out, "enabled": settings.routines_enabled}
+
+
+@app.put("/api/routines/{routine_id}")
+async def routine_put(routine_id: int, body: RoutinePutBody,
+                      admin: dict = Depends(require_admin)):
+    """Edit a routine (admin). Schedules validate fail-closed (400, nothing
+    changes); the reaper row is non-disableable and its schedule is locked;
+    every change is audited in admin_events."""
+    store: JobStore = app.state.store
+    row = store.routine_get(routine_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="unknown routine")
+    if row["kind"] == "reaper":
+        if body.enabled is False:
+            raise HTTPException(status_code=400,
+                                detail="the reaper is a safety loop and cannot "
+                                       "be disabled")
+        if body.schedule is not None:
+            raise HTTPException(status_code=400,
+                                detail="the reaper's schedule is fixed")
+    fields: dict = {}
+    if body.schedule is not None:
+        spec = body.schedule.strip()
+        if spec:
+            try:
+                sched = routines.parse_schedule(spec)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+            if sched.kind in ("daily", "weekly") and row.get("last_run_at") is None:
+                # daily/weekly rows anchor next_due on last_run_at — a
+                # never-run row must be stamped or it can never come due
+                # (same rationale as routines.anchor_fresh_rows)
+                fields["last_run_at"] = time.time()
+        elif row.get("workspace_id") is not None:
+            raise HTTPException(status_code=400,
+                                detail="workspace routines need an explicit "
+                                       "schedule ('' is builtin-only)")
+        fields["schedule"] = spec
+    if body.enabled is not None:
+        fields["enabled"] = int(body.enabled)
+    if body.config is not None:
+        if not isinstance(body.config, dict):
+            raise HTTPException(status_code=400, detail="config must be an object")
+        fields["config"] = json.dumps(body.config)
+    if fields:
+        store.routine_set(routine_id, **fields)
+        diff = {k: (row.get(k), fields[k]) for k in fields}
+        store.admin_event_add(
+            "routine_config", target=str(routine_id),
+            detail=json.dumps({"kind": row["kind"], "changed": diff},
+                              default=str)[:1000],
+            actor=f"dashboard:{admin['username']}")
+    return _routine_public(store, store.routine_get(routine_id))
+
+
+@app.post("/api/routines/{routine_id}/run")
+async def routine_run_now(routine_id: int,
+                          admin: dict = Depends(require_admin)):
+    """Arm an immediate fire THROUGH the scheduler task (never inline in the
+    HTTP request — a sweep does paginated Sentry HTTP). Returns immediately.
+    A forced fire is a real mutation (the claim stamps last_run_at; a forced
+    sweep enqueues pipelines and spends run budget), so an accepted arm is
+    audited in admin_events — routine_runs rows carry no actor and a forced
+    firing would otherwise be indistinguishable from a scheduled one."""
+    store: JobStore = app.state.store
+    row = store.routine_get(routine_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="unknown routine")
+    accepted = app.state.scheduler.request_run(routine_id)
+    if not accepted:
+        raise HTTPException(status_code=400,
+                            detail="routine is disabled or its kind is not "
+                                   "registered on this build")
+    store.admin_event_add(
+        "routine_run_now", target=str(routine_id),
+        detail=json.dumps({"kind": row["kind"],
+                           "workspace_id": row.get("workspace_id")}),
+        actor=f"dashboard:{admin['username']}")
+    return {"requested": True, "routine_id": routine_id}
 
 
 class TriggerBody(BaseModel):
@@ -420,6 +1694,12 @@ class TriggerBody(BaseModel):
 @app.post("/api/trigger")
 async def trigger(body: TriggerBody, user: dict = Depends(require_user)):
     """Manual fix trigger: Sentry issue id / short id / URL in, ClickUp ticket out."""
+    # guard BEFORE any Sentry API call (short-id resolution fires early too):
+    # an unconfigured integration is a clean 400, never a masked 404
+    if not settings.sentry_enabled:
+        raise HTTPException(
+            status_code=400,
+            detail="Sentry integration is not configured (SENTRY_ORG / SENTRY_AUTH_TOKEN)")
     worker: Worker = app.state.worker
     ref = body.issue.strip()
 
@@ -440,7 +1720,7 @@ async def trigger(body: TriggerBody, user: dict = Depends(require_user)):
 
     title = issue.get("title", "unknown")
     project = (issue.get("project") or {}).get("slug", "")
-    if user["role"] != "admin":
+    if user["role"] not in ("admin", "instance_admin"):
         _require_project_access(project, user)
     decision = worker.intake(issue_id, source="manual", forced=True, title=title, project=project)
     if "queued" not in decision:
@@ -485,8 +1765,8 @@ async def projects(user: dict = Depends(require_user)):
 
 # ---------- project context (docs/ENGINE.md §10) ----------
 # What the engine works ON — repos, canonical project, product name, business
-# context. Env/code defaults (the Gumo repos) apply until an operator saves
-# overrides here; overrides persist in the DB and survive restarts.
+# context. Env/code defaults (neutral out of the box) apply until an operator
+# saves overrides here; overrides persist in the DB and survive restarts.
 
 
 class ContextBody(BaseModel):
@@ -518,10 +1798,15 @@ def _live_unmapped_warning(store: JobStore) -> str:
 
 
 def _context_payload(warning: str = "") -> dict:
+    from .config import RUNTIME_CONTEXT_KEYS
+    # only project-context keys are "overridden" — internal app_config markers
+    # (setup_done, audit_legacy_copied, …) are not context overrides.
+    overridden = sorted(k for k in app.state.store.config_all()
+                        if k in RUNTIME_CONTEXT_KEYS)
     return {
         "context": settings.project_context(),
         "defaults": _default_settings.project_context(),
-        "overridden": sorted(app.state.store.config_all().keys()),
+        "overridden": overridden,
         "warning": warning,
     }
 
@@ -590,9 +1875,14 @@ class SubmitBody(BaseModel):
     clickup: str | None = None  # ClickUp task URL or id — adopt an existing ticket
     title: str | None = None    # ... or create a new ticket from title + summary
     summary: str | None = None
-    owner: str | None = None       # features: ClickUp user id for gate notifications
+    owner: str | None = None       # DEPRECATED alias for dev_dri (applied when dev_dri empty)
+    founder_dri: str | None = None  # features: ClickUp user id or username (Epic A2)
+    dev_dri: str | None = None      # features: same encoding
     related_to: str | None = None  # features: sibling pipeline job id(s), comma-separated
     gate_mode: str | None = None   # features: 'full' (default) | 'light' (checkpoints + guards)
+    success_metric: str | None = None    # features (Epic B1): what should move
+    metric_target: str | None = None     # features: target value (free text; numeric when possible)
+    metric_window_days: int | None = None  # features: 1-365; empty = instance default at spawn
 
 
 async def _prepare_ticket(worker: Worker, body: SubmitBody, prefix: str,
@@ -659,7 +1949,7 @@ async def _prepare_ticket(worker: Worker, body: SubmitBody, prefix: str,
 async def submit_task(body: SubmitBody, user: dict = Depends(require_user)):
     """Manually reported request (bug fix / change request) — 2-phase HITL flow."""
     worker: Worker = app.state.worker
-    if user["role"] != "admin":
+    if user["role"] not in ("admin", "instance_admin"):
         _require_project_access(body.project.strip(), user)
     t = await _prepare_ticket(worker, body, "task", f"**Manual request via the {ENGINE_NAME} dashboard**")
     decision = worker.intake_task(
@@ -682,15 +1972,27 @@ async def submit_task(body: SubmitBody, user: dict = Depends(require_user)):
 async def submit_feature(body: SubmitBody, user: dict = Depends(require_user)):
     """Feature pipeline: P0-P9 with a human gate after every stage (docs/ENGINE.md)."""
     worker: Worker = app.state.worker
-    if user["role"] != "admin":
+    if user["role"] not in ("admin", "instance_admin"):
         _require_project_access(body.project.strip(), user)
+    # Epic B1: validate BEFORE any side effect (ticket creation/adoption) —
+    # a bad window is a 400 with nothing queued and nothing created
+    if body.metric_window_days is not None and not 1 <= body.metric_window_days <= 365:
+        raise HTTPException(status_code=400,
+                            detail="metric_window_days must be between 1 and 365")
     t = await _prepare_ticket(worker, body, "feat", f"**Feature pipeline via {ENGINE_NAME}**")
     decision = worker.intake_feature(
         t["job_id"], title=t["title"], project=t["project"], request=t["request"],
         clickup_task_id=t["task_id"], clickup_task_url=t["task_url"],
-        cu_list_id=t["list_id"], owner=(body.owner or "").strip(),
+        cu_list_id=t["list_id"],
+        founder_dri=(body.founder_dri or "").strip(),
+        # legacy `owner` = deprecated alias for dev_dri (applied only when
+        # dev_dri is empty); the stored owner column stays a computed alias
+        dev_dri=(body.dev_dri or "").strip() or (body.owner or "").strip(),
         related_jobs=(body.related_to or "").strip(),
         gate_mode=(body.gate_mode or "").strip().lower(),
+        success_metric=(body.success_metric or "").strip(),
+        metric_target=(body.metric_target or "").strip(),
+        metric_window_days=body.metric_window_days,
     )
     if "queued" not in decision:
         raise HTTPException(status_code=409, detail=decision)
@@ -708,22 +2010,37 @@ async def submit_feature(body: SubmitBody, user: dict = Depends(require_user)):
 class AnswerBody(BaseModel):
     action: str  # proceed | redo | skip
     answer: str = ""
+    override: bool = False  # Epic A3: explicit, audited admin bypass (dashboard-only)
 
 
 @app.post("/api/jobs/{job_id}/answer")
 async def answer_job(job_id: str, body: AnswerBody, user: dict = Depends(require_user)):
     """Answer a parked gate from the dashboard. The decision is recorded on the
-    ClickUp ticket; a lost race against a ClickUp comment answer returns 409."""
+    ClickUp ticket; a lost race against a ClickUp comment answer returns 409;
+    a role-exclusive gate answered by a non-owner returns 403 (Epic A3) unless
+    an admin explicitly sets override (audited in gate_events)."""
     action = body.action.strip().lower()
     if action not in ("proceed", "redo", "skip"):
         raise HTTPException(status_code=400, detail="action must be 'proceed', 'redo' or 'skip'")
-    _job_scoped(job_id, user)
+    job = _job_scoped(job_id, user)
+    # Epic E3 (RBAC v2): answering a gate is a write. A viewer is read-only, and
+    # a repo-restricted member may not answer gates for a repo outside their
+    # allow-list. Instance/workspace admins pass (can_answer_gate -> True). The
+    # role-EXCLUSIVE DRI gate is enforced separately inside worker.answer_job.
+    if not rbac.can_answer_gate(app.state.store, user, job.get("workspace_id"),
+                                job.get("project") or ""):
+        raise HTTPException(status_code=403,
+                            detail="read-only (viewer) — gate answers require write access")
     worker: Worker = app.state.worker
     try:
         status = await worker.answer_job(job_id, action, body.answer.strip(),
-                                         via=f"dashboard:{user['username']}")
+                                         via=f"dashboard:{user['username']}",
+                                         actor=user,
+                                         override=body.override and user["role"] in ("admin", "instance_admin"))
     except KeyError:
         raise HTTPException(status_code=404, detail=f"unknown job '{job_id}'")
+    except GateForbidden as e:  # BEFORE ValueError: 403, never a masked 409
+        raise HTTPException(status_code=403, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e))
     except GateConflict:
@@ -879,6 +2196,34 @@ async def session_snapshot(job_id: str, user: dict = Depends(require_user)):
                   "truncated": len(bodies.get(n) or "") > SESSION_ARTIFACT_MAX}
                  for n in names]
     live = job["status"] == "running" or worker.engine.stage_broker.active(job_id)
+    # graduated autonomy (Epic C3): the per-stage trust dial for this job's
+    # workspace+project — pins + earned levels across stages 0–9
+    autonomy_block = None
+    if feature:
+        ws_id = job.get("workspace_id")
+        levels = {}
+        pins = {}
+        if ws_id is not None:
+            pins = {str(s): p["pin"]
+                    for s, p in store.autonomy_pins_for(int(ws_id)).items()}
+            for r in store.autonomy_scores_for(int(ws_id)):
+                if r["project"] == (job.get("project") or ""):
+                    levels[str(r["stage"])] = {
+                        "level": r["level"], "score": r["score"],
+                        "sample_runs": r["sample_runs"],
+                        "clawed_back": bool(r.get("clawback_at")) and r["level"] == 0,
+                    }
+        autonomy_block = {"enabled": settings.autonomy_enabled,
+                         "auto_level": autonomy.effective_auto_level(settings),
+                         "pins": pins, "levels": levels}
+    # gate ownership (Epic A3): computed server-side with the acting user so
+    # the UI can disable the answer buttons for non-owners (server enforces)
+    g_owner = roles.gate_owner(store, settings, _ws_svc().for_job(job), job)
+    gate_owner = None
+    if g_owner is not None:
+        gate_owner = {"role": g_owner.role, "display": g_owner.display,
+                      "clickup_id": g_owner.clickup_id, "enforce": g_owner.enforce,
+                      "is_you": roles.actor_is_owner(g_owner, user)}
     return {
         "job": {
             "issue_id": job_id, "title": job.get("title") or job_id,
@@ -886,18 +2231,31 @@ async def session_snapshot(job_id: str, user: dict = Depends(require_user)):
             "stage": stage, "stage_name": stage_name(stage) if feature else "",
             "phase": job.get("phase"), "score": job.get("score"),
             "gate_mode": job.get("gate_mode") or "full", "owner": job.get("owner") or "",
+            "founder_dri": job.get("founder_dri") or "",
+            "dev_dri": job.get("dev_dri") or "",
             "pr_url": job.get("pr_url") or "", "clickup_task_url": job.get("clickup_task_url") or "",
             "issue_url": job.get("issue_url") or "",
             "question": job.get("question") or "", "gate_kind": job.get("gate_kind") or "",
             "evidence": job.get("evidence") or "", "analysis": job.get("analysis") or "",
             "detail": (job.get("detail") or "")[:2000],
             "updated_at": job.get("updated_at"),
+            # outcome loop (Epic B): the metric goal + watch window on the pane
+            "success_metric": job.get("success_metric") or "",
+            "metric_target": job.get("metric_target") or "",
+            "metric_window_days": job.get("metric_window_days"),
+            "metric_event": job.get("metric_event") or "",
+            "watch_deadline": job.get("watch_deadline"),
         },
         "runs": store.stage_runs_for(job_id) if feature else [],
         # recorded run transcripts (§13): the index the Activity accordion is
         # built from — bodies are fetched per run on expand
         "transcripts": transcripts.list_for_job(settings, job_id),
         "guidance": store.guidance_for(job_id),
+        # graduated autonomy (Epic C3): pins + per-stage levels (features only)
+        "autonomy": autonomy_block,
+        # Epic A: gate ownership + the refusal/override/escalation timeline
+        "gate_owner": gate_owner,
+        "gate_events": store.gate_events_for(job_id),
         "artifacts": artifacts,
         # every PR this packet opened, with lifecycle state (draft -> ready ->
         # in_review -> changes_requested -> approved -> merged/closed)
@@ -910,6 +2268,11 @@ async def session_snapshot(job_id: str, user: dict = Depends(require_user)):
         "chat_limit": store.chat_count(job_id, stage, max(1, int(job.get("stage_attempts") or 1)))
                       >= settings.chat_max_turns_per_gate,
         "chat_available": kind in ("feature", "sentry", "task"),
+        # outcome loop (Epic B5): the verdict card — the watch's own ledger row
+        # + readings, or the feature's outcome once its watch finished
+        "outcome": (store.outcome_for(job_id) if kind == "watch"
+                    else (store.outcome_for_feature(job_id) if feature else None)),
+        "readings": store.readings_for(job_id) if kind == "watch" else [],
         "live": live,
         # steering rides the feature stage-resume machinery — feature-only
         "steer_available": feature and job["status"] == "running",

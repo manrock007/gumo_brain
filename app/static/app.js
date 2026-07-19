@@ -1,9 +1,10 @@
 const STAGE_NAMES = ['Intake', 'PRD', 'Recon', 'Design', 'Plan', 'Build 1', 'Build 2+', 'Test', 'Review', 'Ship'];
-const KIND_LABEL = { sentry: 'sentry', task: 'request', feature: 'feature', memory: 'memory' };
+const KIND_LABEL = { sentry: 'sentry', task: 'request', feature: 'feature', memory: 'memory', watch: 'watch' };
 const STATUS_LABEL = { received: 'Received', queued: 'Queued', running: 'Running',
   awaiting_input: 'Awaiting you', pr_opened: 'PR opened', no_fix: 'No fix',
-  skipped: 'Skipped', error: 'Error', timeout: 'Timeout' };
-const LIVE = ['received', 'queued', 'running', 'awaiting_input'];
+  skipped: 'Skipped', error: 'Error', timeout: 'Timeout',
+  watching: 'Watching', done: 'Done' };
+const LIVE = ['received', 'queued', 'running', 'awaiting_input', 'watching'];
 const NL = String.fromCharCode(10);
 
 // session-wide state, declared BEFORE anything that can run during initial
@@ -21,6 +22,14 @@ const URL_RE = new RegExp('https://[^ <>)' + String.fromCharCode(9, 10, 13, 34, 
 function linkify(s) {
   // esc() first: matched URLs then contain no <>"' and are attribute-safe
   return esc(s).replace(URL_RE, (u) => `<a href="${u}" target="_blank">${u}</a>`);
+}
+// member-supplied link values are arbitrary strings: only ever build an
+// anchor from a web URL (linkify's posture) — anything else renders as plain
+// text, so a javascript: value can never reach an href
+function safeHref(u) {
+  u = String(u == null ? '' : u).trim();
+  const lo = u.toLowerCase();
+  return (lo.startsWith('https://') || lo.startsWith('http://')) ? u : '';
 }
 
 function fmtMMSS(ms) {
@@ -72,11 +81,18 @@ function rowMini(j) {
 
 function row(j) {
   const stageTxt = j.kind === 'feature' ? ` &middot; P${Number(j.stage) || 0} ${esc(j.stage_name || STAGE_NAMES[Number(j.stage) || 0] || '')}` : ` &middot; ${esc(KIND_LABEL[j.kind] || j.kind)}`;
+  // inbox items (Epic A4) carry ownership + SLA state
+  const overdue = j.overdue ? '<span class="badge overdue">overdue</span>' : '';
+  const owner = j.gate_owner ? ` &middot; ${esc(j.gate_owner.display)}${j.gate_owner.is_you ? ' (you)' : ''}` : '';
+  // trust chip (Epic C3) — jobs-list rows carry autonomy_level/autonomy_pin;
+  // inbox items don't (guarded), and an unpinned L0 renders nothing
+  const trust = j.kind === 'feature' && (j.autonomy_pin || Number(j.autonomy_level) > 0)
+    ? ` <span class="aut-chip aut-l${Number(j.autonomy_level) || 0}" title="${j.autonomy_pin ? 'pinned ' + esc(PIN_LABEL[j.autonomy_pin] || j.autonomy_pin) : 'autonomy level for the current stage'}">${j.autonomy_pin ? PIN_GLYPH[j.autonomy_pin] || '' : 'L' + Number(j.autonomy_level)}</span>` : '';
   return `<div class="row${j.issue_id === sel ? ' sel' : ''}" data-status="${esc(j.status)}" onclick="openItem('${esc(j.issue_id)}')">
     <span class="rail"></span>
     <div class="body">
       <div class="t">${esc(j.title || j.issue_id)}</div>
-      <div class="m"><span class="badge ${esc(j.status)}">${esc(STATUS_LABEL[j.status] || j.status)}</span>${esc(j.project)}${stageTxt}</div>
+      <div class="m"><span class="badge ${esc(j.status)}">${esc(STATUS_LABEL[j.status] || j.status)}</span>${overdue}${esc(j.project)}${stageTxt}${trust}${owner}</div>
       ${j.kind === 'feature' ? rowMini(j) : ''}
     </div>
     <span class="when">${fmtAgo(j.updated_at)}</span>
@@ -84,17 +100,130 @@ function row(j) {
 }
 
 function renderInbox() {
-  let items = jobsCache.slice().sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0));
-  items = items.filter(jobInActiveWs);
-  if (filter === 'active') items = items.filter(j => LIVE.includes(j.status));
-  if (filter === 'await') items = items.filter(j => j.status === 'awaiting_input');
+  let items;
+  if (filter === 'await' && inboxCache && inboxCache.items) {
+    // the server-ordered personal queue: overdue first, then oldest gate first
+    items = inboxCache.items.filter(jobInActiveWs);
+  } else {
+    items = jobsCache.slice().sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0));
+    items = items.filter(jobInActiveWs);
+    if (filter === 'active') items = items.filter(j => LIVE.includes(j.status));
+    if (filter === 'await') items = items.filter(j => j.status === 'awaiting_input');
+  }
   // an unassigned member sees an empty instance by design (fail-closed
   // membership) — say why, instead of a bare "nothing here"
   const empty = (ME && ME.role === 'member' && WORKSPACES && !WORKSPACES.length)
     ? 'no workspace access yet &mdash; ask your CtrlLoop admin to assign you to a workspace'
     : 'nothing here';
-  document.getElementById('inbox-list').innerHTML =
-    items.length ? items.map(row).join('') : `<div class="empty">${empty}</div>`;
+  const strip = candidateStrip() + noticeStrip();
+  document.getElementById('inbox-list').innerHTML = strip
+    + (items.length ? items.map(row).join('') : `<div class="empty">${empty}</div>`);
+}
+
+// Epic I: proactive-routine notices — risk alerts (badge + dismiss),
+// proposals (Adopt / Dismiss), standup digests + planning packs
+// (collapsible markdown cards), routine notes.
+const NOTICE_BADGE = { risk_alert: 'risk', proposal: 'proposal',
+                       standup_digest: 'standup', planning_pack: 'planning',
+                       routine_note: 'note' };
+function noticeStrip() {
+  const notices = (inboxCache && inboxCache.notices) || [];
+  if (!notices.length) return '';
+  const cards = notices.map((n) => {
+    const badge = `<span class="badge">${esc(NOTICE_BADGE[n.kind] || n.kind)}</span>`;
+    const meta = `<span class="hint" style="display:inline">${esc(n.source || '')} &middot; ${fmtAgo(n.created_at)}</span>`;
+    let actions = `<button onclick="dismissNotice(${Number(n.id)})">Dismiss</button>`;
+    if (n.kind === 'proposal') {
+      const opts = (window.PROJECTS_CACHE || []).map((p) => `<option value="${attr(p.slug)}"${(n.refs && n.refs.project) === p.slug ? ' selected' : ''}>${esc(p.slug)}</option>`).join('');
+      actions = `<select id="np-proj-${Number(n.id)}">${opts}</select>
+        <select id="np-as-${Number(n.id)}"><option value="feature" selected>feature</option><option value="task">task</option></select>
+        <button onclick="adoptNotice(${Number(n.id)})">Adopt</button> ${actions}`;
+    }
+    const long = n.kind === 'standup_digest' || n.kind === 'planning_pack'
+      || n.kind === 'proposal';
+    const body = (n.body || '').slice(0, 4000);
+    const bodyHtml = long
+      ? `<details><summary class="hint" style="display:inline">details</summary><pre style="white-space:pre-wrap; margin:4px 0">${esc(body)}</pre></details>`
+      : `<div style="margin:4px 0; white-space:pre-wrap">${esc(body.slice(0, 400))}</div>`;
+    return `<div class="panel" style="margin:6px 0; padding:8px">
+      <div>${badge} <strong>${esc(n.title || '')}</strong> ${meta}</div>
+      ${bodyHtml}
+      <div class="u-row">${actions}</div>
+    </div>`;
+  }).join('');
+  return `<div class="section-label" style="margin:8px 10px 0">Notices</div>${cards}`;
+}
+
+async function dismissNotice(id) {
+  try {
+    const r = await fetch('api/inbox/notices/' + id + '/dismiss', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({}),
+    });
+    const data = await r.json();
+    if (!r.ok) uiMsg('Error: ' + (data.detail || r.status));
+    lastInbox = ''; refreshInbox();
+  } catch (e) { uiMsg('Error: ' + e); }
+}
+
+async function adoptNotice(id) {
+  const project = (document.getElementById('np-proj-' + id) || {}).value || '';
+  const as = (document.getElementById('np-as-' + id) || {}).value || 'feature';
+  try {
+    const r = await fetch('api/inbox/notices/' + id + '/adopt', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ as, project }),
+    });
+    const data = await r.json();
+    if (!r.ok) { uiMsg('Error: ' + (data.detail || r.status)); return; }
+    lastInbox = ''; refreshInbox(); refresh(true);
+    if (data.job_id) openItem(data.job_id);
+  } catch (e) { uiMsg('Error: ' + e); }
+}
+
+// Epic D3: parked Slack decision candidates — confirm (scope picker) / dismiss
+function candidateStrip() {
+  const cands = (inboxCache && inboxCache.candidates) || [];
+  if (!cands.length) return '';
+  const rows = cands.map((c) => `
+    <div class="panel" style="margin:6px 0; padding:8px">
+      <div><strong>${esc(c.title || 'decision candidate')}</strong>
+        <span class="hint" style="display:inline">&mdash; ${esc(c.origin_author || c.decided_by || '')} &middot; ${fmtAgo(c.created_at)}</span></div>
+      <div style="margin:4px 0">${esc((c.text || '').slice(0, 300))}</div>
+      <div class="u-row">
+        <select id="cand-scope-${Number(c.id)}">
+          <option value="product" selected>product</option>
+          <option value="repo">repo</option>
+          <option value="org">org (admin)</option>
+        </select>
+        <button onclick="confirmCandidate(${Number(c.id)})">Confirm</button>
+        <button onclick="dismissCandidate(${Number(c.id)})">Dismiss</button>
+        ${(c.links || []).map((u) => safeHref(u) ? `<a href="${attr(safeHref(u))}" target="_blank" rel="noopener">thread</a>` : esc(u)).join(' ')}
+      </div>
+    </div>`).join('');
+  return `<div class="section-label" style="margin:8px 10px 0">Decision candidates (from Slack)</div>${rows}`;
+}
+
+async function confirmCandidate(id) {
+  const scope = (document.getElementById('cand-scope-' + id) || {}).value || 'product';
+  try {
+    const r = await fetch('api/decisions/' + id + '/confirm', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ scope }),
+    });
+    const data = await r.json();
+    if (!r.ok) uiMsg('Error: ' + (data.detail || r.status));
+    lastInbox = ''; refreshInbox(); loadDecisions();
+  } catch (e) { uiMsg('Error: ' + e); }
+}
+
+async function dismissCandidate(id) {
+  try {
+    const r = await fetch('api/decisions/' + id + '/dismiss', { method: 'POST' });
+    const data = await r.json();
+    if (!r.ok) uiMsg('Error: ' + (data.detail || r.status));
+    lastInbox = ''; refreshInbox();
+  } catch (e) { uiMsg('Error: ' + e); }
 }
 
 let lastJobs = '';
@@ -106,6 +235,30 @@ async function refresh(force) {
     const sig = JSON.stringify(jobs);
     if (force || sig !== lastJobs) { lastJobs = sig; jobsCache = jobs; renderInbox(); }
   } catch (e) { document.getElementById('msg').textContent = 'refresh failed: ' + e; }
+  refreshInbox();
+}
+
+// ---------- per-person queue (Epic A4: api/inbox) ----------
+
+let inboxCache = null;
+let lastInbox = '';
+async function refreshInbox() {
+  try {
+    const r = await fetch('api/inbox');
+    if (!r.ok) return;
+    const data = await r.json();
+    const sig = JSON.stringify(data);
+    if (sig === lastInbox) return;
+    lastInbox = sig; inboxCache = data;
+    // notices join the badge (Epic I0)
+    const n = ((data.counts && data.counts.mine) || 0)
+      + ((data.counts && data.counts.notices) || 0);
+    const b = document.getElementById('await-badge');
+    if (b) { b.textContent = String(n); b.style.display = n ? '' : 'none'; }
+    const chip = document.getElementById('me-chip');
+    if (chip) chip.classList.toggle('has-due', n > 0);
+    if (filter === 'await') renderInbox();
+  } catch (e) { /* advisory — the jobs list still renders */ }
 }
 
 // ---------- selection / routing ----------
@@ -241,11 +394,19 @@ function stageCards(data) {
   }
   const stages = Object.keys(by).map(Number).sort((a, b) => a - b);
   const cur = Number(j.stage) || 0;
+  const aut = data.autonomy && data.autonomy.enabled ? data.autonomy : null;
   let h = '';
   for (const stg of stages) {
     const s = by[stg];
     const isLive = stg === cur && (j.status === 'running' || data.live);
     const a = arts[stg];
+    // per-stage trust dial (Epic C3): pin glyph when pinned, else L0–L3
+    let dial = '';
+    if (aut) {
+      const pin = aut.pins && aut.pins[String(stg)];
+      if (pin) dial = `<span class="aut-chip aut-pinned" title="pinned ${PIN_LABEL[pin]}">${PIN_GLYPH[pin]}</span>`;
+      else if (stg < 9) dial = autLevelChip((aut.levels && aut.levels[String(stg)]) || null);
+    }
     const meta = isLive
       ? `running &middot; ${fmtMMSS(s.dur)} &middot; $${s.cost.toFixed(2)}`
       : `${s.n > 1 ? s.n + '&times; &middot; ' : ''}${fmtMMSS(s.dur)} &middot; $${s.cost.toFixed(2)}${s.status ? ' &middot; ' + esc(s.status) : ''}`;
@@ -253,7 +414,7 @@ function stageCards(data) {
       ? `<div class="inner" id="live-slot"></div>`
       : `<div class="inner">${a ? `<div class="art">${esc(a.content || '(empty)')}${a.truncated ? '… (truncated)' : ''}</div>` : '<div class="lead" style="margin-top:8px">no artifact for this stage</div>'}${transcriptAccordions(data, stg)}</div>`;
     h += `<details class="stage${isLive ? ' live' : ''}" data-key="st-${stg}"${isLive ? ' open' : ''}>
-      <summary><span class="sx">P${stg}</span><span class="snm">${esc(STAGE_NAMES[stg] || '')}</span>
+      <summary><span class="sx">P${stg}</span><span class="snm">${esc(STAGE_NAMES[stg] || '')}</span>${dial}
       ${!isLive && s.status === 'done' ? '<span class="tick">&#10003;</span>' : ''}<span class="sm">${meta}</span></summary>
       ${inner}</details>`;
   }
@@ -311,33 +472,81 @@ function gatePacket(data) {
   const feature = j.kind === 'feature';
   if (j.status !== 'awaiting_input' && j.status !== 'error' && j.status !== 'timeout') return '';
   const id = esc(j.issue_id);
+  // role-exclusive gates (Epic A3): the server enforces; the UI mirrors it —
+  // non-owners see disabled buttons, admins get an explicit audited override
+  const owner = data.gate_owner;
+  const locked = !!(feature && owner && owner.enforce && !owner.is_you);
+  const isAdmin = ME && (ME.role === 'admin' || ME.role === 'instance_admin');
+  const dis = locked ? ` disabled title="Owned by ${esc(owner.display)} — only they (or an admin override) can answer"` : '';
+  const ownerLine = feature && owner && owner.enforce
+    ? `<div class="g-owner">Owned by <b>${esc(owner.display)}</b> &middot; ${esc(owner.role)} gate${owner.is_you ? ' &mdash; you' : ''}</div>` : '';
+  const ovrBox = locked && isAdmin
+    ? `<label class="ovr"><input type="checkbox" id="ovr-${id}" onchange="armOverride(this.checked)"> answer anyway (admin override &mdash; audited)</label>` : '';
   if (j.status !== 'awaiting_input') {
     // re-kick (redo) exists only for feature pipelines
     if (!feature) return `<div class="gate"><div class="g-h">${esc(j.status)}</div>
       <div class="q">${esc((j.detail || '(no detail)').slice(0, 600))}</div></div>`;
     return `<div class="gate"><div class="g-h">Stage ${j.status} — re-kick</div>
-      <div class="answer"><div class="btns">
-      <button class="redo" onclick="answer('${id}','redo',this)">Re-kick (redo)</button></div></div></div>`;
+      ${ownerLine}<div class="answer"><div class="btns">
+      <button class="redo" onclick="answer('${id}','redo',this)"${dis}>Re-kick (redo)</button></div>${ovrBox}</div></div>`;
   }
+  const watch = j.kind === 'watch';
   const isAsk = feature && j.gate_kind === 'ask';
   const goLabel = isAsk ? 'Answer' : 'Proceed';
   const head = isAsk ? 'The engine asks — resumes in place'
-    : (feature ? 'Gate — P' + j.stage + ' ' + esc(j.stage_name || '') : 'Needs your input');
-  const btns = feature
-    ? `<button class="go" onclick="answer('${id}','proceed',this)">${goLabel}</button>
-       <button class="redo" onclick="answer('${id}','redo',this)">Redo</button>
-       <button class="no" onclick="answer('${id}','skip',this)">Skip</button>`
+    : (feature ? 'Gate — P' + j.stage + ' ' + esc(j.stage_name || '')
+      : (watch ? 'Iterate gate — outcome verdict' : 'Needs your input'));
+  const btns = (feature || watch)
+    ? `<button class="go" onclick="answer('${id}','proceed',this)"${dis}>${goLabel}</button>
+       <button class="redo" onclick="answer('${id}','redo',this)"${dis}>Redo</button>
+       <button class="no" onclick="answer('${id}','skip',this)"${dis}>Skip</button>`
     : `<button class="go" onclick="answer('${id}','proceed',this)">Proceed</button>
        <button class="no" onclick="answer('${id}','skip',this)">Skip</button>`;
   const hint = feature
     ? `<div class="hint">Redo re-runs this stage with your notes as corrections &mdash; optionally prefix 'P3 ' to redo an earlier stage.</div>`
-    : '';
+    : (watch
+      ? `<div class="hint">Proceed = log the learning &amp; close &middot; Redo &lt;days&gt; = watch again &middot; Skip = close without a learning.</div>`
+      : '');
   return `<div class="gate"><div class="g-h">${head}</div>
+    ${ownerLine}
     <div class="q">${esc(j.question || (j.detail || '(see analysis)').slice(0, 500))}</div>
     ${j.evidence ? `<details class="sub" data-key="g-ev"><summary>evidence</summary><pre>${linkify(j.evidence)}</pre></details>` : ''}
     ${j.analysis ? `<details class="sub" data-key="g-an"><summary>full analysis</summary><pre>${esc(j.analysis)}</pre></details>` : ''}
     <div class="answer"><textarea id="ans-${id}" data-draft="gb-draft-${id}" placeholder="Your answer / guidance&hellip;"></textarea>
-    ${hint}<div class="btns">${btns}</div></div></div>`;
+    ${hint}<div class="btns">${btns}</div>${ovrBox}</div></div>`;
+}
+
+// arm/disarm the gate buttons when the admin toggles the override checkbox
+function armOverride(on) {
+  for (const b of document.querySelectorAll('#d-thread .gate .btns button')) b.disabled = !on;
+}
+
+function verdictCard(data) {
+  // outcome loop (Epic B5): the measured verdict on watch + feature panes
+  const o = data.outcome;
+  const j = data.job;
+  if (!o && !(j.kind === 'watch' || j.success_metric || j.metric_event)) return '';
+  let inner = '';
+  if (o) {
+    inner = `<span class="vchip v-${esc(o.verdict || 'unmeasured')}">${esc(o.verdict || 'unmeasured')}</span>
+      <span class="vc-m">${esc(o.metric || '(no metric)')}${o.target ? ' &middot; target ' + esc(o.target) : ''}
+      &middot; observed ${o.observed == null ? '&mdash;' : esc(String(o.observed))}
+      ${o.baseline == null ? '' : '&middot; baseline ' + esc(String(o.baseline))}
+      &middot; ${esc(String(o.window_days || '?'))}d window</span>`
+      + (o.learning ? `<div class="vc-l">Learning: ${esc(o.learning)}</div>` : '');
+  } else {
+    const dl = j.watch_deadline ? new Date(j.watch_deadline * 1000).toLocaleDateString() : '';
+    inner = `<span class="vc-m">Metric: ${esc(j.success_metric || j.metric_event || '(none)')}`
+      + (j.metric_target ? ' &middot; target ' + esc(j.metric_target) : '')
+      + (j.metric_window_days ? ' &middot; ' + esc(String(j.metric_window_days)) + 'd window' : '')
+      + (j.kind === 'watch' && dl ? ' &middot; verdict due ' + esc(dl) : '') + '</span>';
+  }
+  const reads = (data.readings || []).filter((r) => r.window_day != null);
+  const readRow = reads.length
+    ? `<div class="vc-r">${reads.slice(-14).map((r) =>
+        `<span title="day ${esc(String(r.window_day))}">d${esc(String(r.window_day))}: ${r.observed == null ? '?' : esc(String(r.observed))}</span>`).join(' ')}</div>`
+    : '';
+  return `<div class="daydiv">&mdash; outcome &mdash;</div><div class="stage"><div class="inner vcard" style="border-top:0">${inner}${readRow}</div></div>`;
 }
 
 function renderDetail(data) {
@@ -349,7 +558,19 @@ function renderDetail(data) {
   if (j.pr_url) links += `<a href="${esc(j.pr_url)}" target="_blank">PR</a>`;
   let sub;
   if (feature) {
-    sub = `P${j.stage} ${esc(j.stage_name || '')} &middot; ${esc(j.project)} &middot; ${esc(j.gate_mode)} gates`
+    // trust chip (Epic C3): the current stage's pin or earned level
+    const aut = data.autonomy;
+    let trust = '';
+    if (aut && aut.enabled) {
+      const pin = aut.pins && aut.pins[String(j.stage)];
+      if (pin) trust = ' &middot; pinned: ' + (PIN_LABEL[pin] || pin);
+      else {
+        const lv = aut.levels && aut.levels[String(j.stage)];
+        trust = ' &middot; trust L' + (lv ? lv.level : 0)
+          + (lv && lv.clawed_back ? ' (clawed back)' : '');
+      }
+    }
+    sub = `P${j.stage} ${esc(j.stage_name || '')} &middot; ${esc(j.project)} &middot; ${esc(j.gate_mode)} gates${trust}`
       + `<span style="margin-left:auto"><details class="sub" style="margin:0" data-key="d-stats"><summary>stats</summary></details></span>`;
   } else {
     const score = j.score != null ? ` &middot; score ${esc(String(j.score))}` : '';
@@ -375,7 +596,7 @@ function renderDetail(data) {
     ? '<div class="daydiv">&mdash; conversation &mdash;</div>'
       + (convoThread(data) || '<div class="lead">no messages yet &mdash; ask the engine anything about this work</div>')
     : '';
-  document.getElementById('d-thread').innerHTML = pipeline + activity + prSection(data) + convo + gatePacket(data);
+  document.getElementById('d-thread').innerHTML = pipeline + activity + prSection(data) + verdictCard(data) + convo + gatePacket(data);
   restoreThread(st);
   wireTranscripts(j.issue_id);
 
@@ -677,11 +898,12 @@ async function answer(id, action, btn) {
   const box = document.getElementById('ans-' + id);
   const text = box ? box.value.trim() : '';
   if (action === 'skip' && !confirm('Abort this job? (feature branches are left intact)')) return;
+  const ovr = document.getElementById('ovr-' + id);
   btn.disabled = true; msg.textContent = 'Recording decision…';
   try {
     const r = await fetch('api/jobs/' + encodeURIComponent(id) + '/answer', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({action, answer: text}),
+      body: JSON.stringify({action, answer: text, override: !!(ovr && ovr.checked)}),
     });
     const data = await r.json();
     if (r.ok) {
@@ -729,7 +951,7 @@ function renderMemory(mem) {
     const fetched = m.fetched_at ? new Date(m.fetched_at * 1000).toLocaleString() : '&mdash;';
     const dis = pendingBoot.has(p) ? ' disabled' : '';
     return `<tr><td>${esc(p)}</td><td>${exists}</td><td>${stale}</td><td>${fetched}</td>
-      <td><button onclick="bootstrap('${esc(p)}',this)"${dis} title="Bootstrap .gumo memory via a draft PR">Bootstrap</button></td></tr>`;
+      <td><button onclick="bootstrap('${esc(p)}',this)"${dis} title="Bootstrap engine memory via a draft PR">Bootstrap</button></td></tr>`;
   }).join('');
   document.getElementById('brain-body').innerHTML = rows
     ? `<table><tr><th>project</th><th>memory</th><th>staleness</th><th>fetched</th><th></th></tr>${rows}</table>`
@@ -749,6 +971,256 @@ async function bootstrap(project, btn) {
   } catch (e) { msg.textContent = 'Error: ' + e; }
   pendingBoot.delete(project);
   if (lastMemData) renderMemory(lastMemData); else btn.disabled = false;
+}
+
+// ---------- outcome ledger (api/outcomes, Epic B5) ----------
+
+async function loadOutcomes() {
+  try {
+    const r = await fetch('api/outcomes');
+    if (!r.ok) return;
+    renderOutcomes(await r.json());
+  } catch (e) { /* keep the previous view */ }
+}
+
+function renderOutcomes(data) {
+  const el = document.getElementById('outcomes-body');
+  if (!el) return;
+  const v = data.verdicts || {};
+  const chips = ['moved', 'flat', 'regressed', 'unmeasured'].map(
+    (k) => `<span class="vchip v-${k}">${esc(k)} ${Number(v[k] || 0)}</span>`).join(' ');
+  const rows = (data.outcomes || []).map((o) => {
+    const when = o.decided_at || o.created_at;
+    return `<tr>
+      <td><a href="#/job/${esc(o.feature_id)}">${esc(o.feature_id || '?')}</a></td>
+      <td>${esc(o.metric || '')}</td>
+      <td>${esc(o.target || '')}</td>
+      <td>${o.observed == null ? '&mdash;' : esc(String(o.observed))}</td>
+      <td><span class="vchip v-${esc(o.verdict || 'unmeasured')}">${esc(o.verdict || 'unmeasured')}</span></td>
+      <td>${esc((o.learning || '').slice(0, 120))}</td>
+      <td>${esc(o.decided_by || '')}${when ? ' &middot; ' + fmtAgo(when) : ''}</td>
+    </tr>`;
+  }).join('');
+  el.innerHTML = `<div class="vchips" style="margin-top:10px">${chips}</div>`
+    + (rows
+      ? `<table><tr><th>feature</th><th>metric</th><th>target</th><th>observed</th>
+         <th>verdict</th><th>learning</th><th>decided</th></tr>${rows}</table>`
+      : '<div class="empty">no measured outcomes yet &mdash; ship a feature with a success metric</div>');
+}
+
+// ---------- decision registry (api/decisions, Epic D2) ----------
+
+let decFilters = { q: '', scope: '', status: '', source: '' };
+
+async function loadDecisions() {
+  try {
+    const p = new URLSearchParams();
+    Object.entries(decFilters).forEach(([k, v]) => { if (v) p.set(k, v); });
+    const r = await fetch('api/decisions?' + p.toString());
+    if (!r.ok) return;
+    renderDecisions(await r.json());
+  } catch (e) { /* keep the previous view */ }
+}
+
+function decSetFilter(key, value) { decFilters[key] = value; loadDecisions(); }
+
+function renderDecisions(data) {
+  const el = document.getElementById('decisions-body');
+  if (!el) return;
+  const opts = (list, cur) => ['', ...list].map((v) =>
+    `<option value="${attr(v)}"${v === cur ? ' selected' : ''}>${v || 'any'}</option>`).join('');
+  const controls = `<div class="u-row" style="margin:10px 0">
+    <input id="dec-q" placeholder="search decisions&hellip;" value="${attr(decFilters.q)}"
+      onchange="decSetFilter('q', this.value)">
+    <select onchange="decSetFilter('scope', this.value)">${opts(['job', 'repo', 'product', 'org'], decFilters.scope)}</select>
+    <select onchange="decSetFilter('status', this.value)">${opts(['active', 'superseded', 'dismissed'], decFilters.status)}</select>
+    <select onchange="decSetFilter('source', this.value)">${opts(['gate', 'manual', 'slack'], decFilters.source)}</select>
+  </div>`;
+  const rows = (data.decisions || []).map((d) => {
+    const links = (d.links || []).map((u, i) => {
+      const h = safeHref(u);
+      return h ? `<a href="${attr(h)}" target="_blank" rel="noopener">link${i ? i + 1 : ''}</a>` : esc(u);
+    }).join(' ');
+    const act = d.status === 'active'
+      ? `<button onclick="patchDecision(${Number(d.id)}, 'supersede')">Supersede</button>`
+      : (d.status === 'superseded'
+        ? `<button onclick="patchDecision(${Number(d.id)}, 'reactivate')">Reactivate</button>` : '');
+    return `<tr>
+      <td>${esc(d.scope)}${d.job_id ? ' &middot; <a href="#/job/' + esc(d.job_id) + '">' + esc(d.job_id) + '</a>' : ''}</td>
+      <td><strong>${esc(d.title || '')}</strong> ${esc((d.text || '').slice(0, 200))}</td>
+      <td>${esc(d.status)}</td>
+      <td>${esc(d.decided_by || '')} &middot; ${fmtAgo(d.updated_at || d.created_at)} ${links}</td>
+      <td>${act}</td>
+    </tr>`;
+  }).join('');
+  el.innerHTML = controls
+    + (rows
+      ? `<table><tr><th>scope</th><th>decision</th><th>status</th><th>decided</th><th></th></tr>${rows}</table>`
+      : '<div class="empty">no decisions recorded yet &mdash; substantive gate answers register automatically</div>')
+    + `<form onsubmit="return addDecision(event)"><div class="u-row" style="margin-top:10px">
+        <select id="dec-new-scope"><option value="repo">repo</option><option value="product">product</option>
+          <option value="job">job</option><option value="org">org (admin)</option></select>
+        <input id="dec-new-project" placeholder="project slug (routes the workspace)">
+        <input id="dec-new-title" placeholder="title (optional)">
+        <input id="dec-new-text" placeholder="the decision + rationale" required>
+        <button id="dec-new-go">Record decision</button>
+      </div></form>`;
+}
+
+async function addDecision(ev) {
+  ev.preventDefault();
+  try {
+    const r = await fetch('api/decisions', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        scope: document.getElementById('dec-new-scope').value,
+        project: document.getElementById('dec-new-project').value.trim() || null,
+        title: document.getElementById('dec-new-title').value.trim(),
+        text: document.getElementById('dec-new-text').value.trim(),
+      }),
+    });
+    const data = await r.json();
+    if (!r.ok) { uiMsg('Error: ' + (data.detail || r.status)); return false; }
+    loadDecisions();
+  } catch (e) { uiMsg('Error: ' + e); }
+  return false;
+}
+
+async function patchDecision(id, action) {
+  try {
+    const r = await fetch('api/decisions/' + id, {
+      method: 'PATCH', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ action }),
+    });
+    const data = await r.json();
+    if (!r.ok) uiMsg('Error: ' + (data.detail || r.status));
+    loadDecisions();
+  } catch (e) { uiMsg('Error: ' + e); }
+}
+
+// ---------- autonomy (api/autonomy, Epic C) ----------
+
+let autonomyData = null;
+let lastAutonomy = '';
+
+async function loadAutonomy() {
+  try {
+    const r = await fetch('api/autonomy');
+    if (!r.ok) return;
+    const data = await r.json();
+    const sig = JSON.stringify(data);
+    if (sig === lastAutonomy) return;
+    lastAutonomy = sig; autonomyData = data;
+    renderAutonomy();
+  } catch (e) { /* keep the previous view */ }
+}
+
+const PIN_GLYPH = { always_gate: '&#128274;', always_auto: '&#9889;' };
+const PIN_LABEL = { always_gate: 'always gate', always_auto: 'always auto' };
+
+function autLevelChip(cell) {
+  if (!cell) return '<span class="aut-chip aut-l0" title="no track record yet">L0</span>';
+  const inp = cell.inputs || {};
+  const tip = 'score ' + Number(cell.score || 0).toFixed(2) + ' · ' + (cell.sample_runs || 0) + ' runs'
+    + (inp.clean_streak != null ? ' · streak ' + inp.clean_streak : '')
+    + (inp.clean_rate != null ? ' · clean ' + Math.round(inp.clean_rate * 100) + '%' : '')
+    + (inp.redo_rate != null ? ' · redo ' + Math.round(inp.redo_rate * 100) + '%' : '')
+    + (cell.clawed_back ? ' · CLAWED BACK — re-earning from zero' : '');
+  return `<span class="aut-chip aut-l${Number(cell.level) || 0}${cell.clawed_back ? ' aut-clawed' : ''}" title="${attr(tip)}">L${Number(cell.level) || 0}</span>`;
+}
+
+function renderAutonomy() {
+  const el = document.getElementById('autonomy-body');
+  if (!el || !autonomyData) return;
+  const d = autonomyData;
+  if (!d.enabled) {
+    el.innerHTML = '<div class="empty">autonomy is disabled on this instance (AUTONOMY_ENABLED=false)</div>';
+    return;
+  }
+  const isAdmin = ME && (ME.role === 'admin' || ME.role === 'instance_admin');
+  const optin = d.auto_level
+    ? 'Computed levels auto-advance at L' + d.auto_level + '+ (AUTONOMY_AUTO_LEVEL).'
+    : 'Computed levels are advisory for now &mdash; AUTONOMY_AUTO_LEVEL=0; set 1&ndash;3 to let earned trust auto-advance.';
+  let h = `<div class="hint" style="margin-top:10px">Trust is earned per repo &times; stage from the receipts (clean rate, redos targeting the stage, gate latency, review rounds). L0 = always gate &middot; L3 = full auto-advance. ${optin} Pins always win in both directions; the safety guards (mid-run edit, mirror down, redo-first-run, missing PR, real questions) always apply, and P9 always parks.</div>`;
+  for (const ws of d.workspaces || []) {
+    const cells = {};
+    const projects = new Set(ws.repos || []);
+    for (const c of ws.cells || []) { cells[c.project + '|' + c.stage] = c; projects.add(c.project); }
+    const plist = Array.from(projects).sort();
+    let head = '<tr><th>repo</th>';
+    for (let s = 0; s <= 9; s++) {
+      const pin = (ws.pins && ws.pins[String(s)]) ? ws.pins[String(s)].pin : '';
+      const glyph = pin ? `<span class="aut-pin-g" title="pinned ${PIN_LABEL[pin]} by ${attr((ws.pins[String(s)] || {}).set_by || '')}">${PIN_GLYPH[pin]}</span>` : '';
+      const pinCtl = isAdmin
+        ? `<select class="aut-pin" onchange="pinStage(${ws.id},${s},this.value,this)" title="Pin P${s} — always wins over the computed level">`
+          + `<option value=""${pin ? '' : ' selected'}>&mdash;</option>`
+          + `<option value="always_gate"${pin === 'always_gate' ? ' selected' : ''}>gate</option>`
+          + (s === 9 ? '' : `<option value="always_auto"${pin === 'always_auto' ? ' selected' : ''}>auto</option>`)
+          + '</select>'
+        : '';
+      const clawAll = s === 9 ? '' : `<button class="aut-claw" onclick="clawback(${ws.id},${s},null,this)" title="Claw back P${s} for every repo — levels drop to 0, audited">&#8595;0</button>`;
+      head += `<th><span class="aut-st">P${s}</span>${glyph}<div class="aut-ctl">${pinCtl}${clawAll}</div></th>`;
+    }
+    head += '</tr>';
+    let rows = '';
+    for (const p of plist) {
+      let tds = '';
+      for (let s = 0; s <= 9; s++) {
+        if (s === 9) {
+          tds += '<td><span class="aut-chip aut-term" title="P9 always parks — its approval is the terminal transition">&#9646;</span></td>';
+          continue;
+        }
+        const c = cells[p + '|' + s];
+        const claw = c && c.level > 0
+          ? `<button class="aut-claw" onclick="clawback(${ws.id},${s},'${esc(p)}',this)" title="Claw back ${attr(p)} P${s} to L0 (re-earns from fresh runs)">&#8595;</button>` : '';
+        tds += `<td>${autLevelChip(c)}${claw}</td>`;
+      }
+      rows += `<tr><td class="aut-repo">${esc(p)}</td>${tds}</tr>`;
+    }
+    const events = (ws.events || []).map((e) =>
+      `<li><span class="aut-ev-k">${esc(e.kind)}</span> ${esc(e.detail || '')}`
+      + `${e.actor ? ' &middot; ' + esc(e.actor) : ''} &middot; ${fmtAgo(e.at)}</li>`).join('');
+    h += `<div class="aut-ws">${(d.workspaces || []).length > 1 ? `<h3>${esc(ws.name)}</h3>` : ''}
+      <div class="aut-matrix"><table>${head}${rows || '<tr><td class="empty" colspan="11">no repos yet</td></tr>'}</table></div>
+      ${events ? `<ol class="aut-log" id="autonomy-log">${events}</ol>` : ''}</div>`;
+  }
+  el.innerHTML = h;
+}
+
+async function pinStage(wsId, stage, pin, ctl) {
+  const msg = document.getElementById('msg');
+  ctl.disabled = true;
+  try {
+    const r = await fetch('api/workspaces/' + wsId + '/autonomy/pins', {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ stage: stage, pin: pin || null }),
+    });
+    const data = await r.json();
+    if (r.ok) {
+      msg.textContent = pin ? 'P' + stage + ' pinned ' + (PIN_LABEL[pin] || pin) + '.'
+                            : 'P' + stage + ' pin cleared.';
+      lastAutonomy = ''; loadAutonomy();
+    } else msg.textContent = 'Error: ' + (data.detail || r.status);
+  } catch (e) { msg.textContent = 'Error: ' + e; }
+  ctl.disabled = false;
+}
+
+async function clawback(wsId, stage, project, btn) {
+  const what = project ? "'" + project + "' P" + stage
+                       : 'P' + stage + ' for EVERY repo in this workspace';
+  if (!confirm('Claw back ' + what + '? The level drops to 0 and must be re-earned from fresh runs (audited).')) return;
+  const msg = document.getElementById('msg');
+  btn.disabled = true;
+  try {
+    const r = await fetch('api/workspaces/' + wsId + '/autonomy/clawback', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ stage: stage, project: project }),
+    });
+    const data = await r.json();
+    if (r.ok) { msg.textContent = 'Clawed back ' + data.clawed + ' cell(s).'; lastAutonomy = ''; loadAutonomy(); }
+    else msg.textContent = 'Error: ' + (data.detail || r.status);
+  } catch (e) { msg.textContent = 'Error: ' + e; }
+  btn.disabled = false;
 }
 
 // ---------- project context (api/context) ----------
@@ -793,7 +1265,10 @@ function renderContext() {
       <div><label>Default product name</label><input id="ctx-name" value="${attr(c.product_name)}"></div>
     </div>
     <label>Business context (stacked above each workspace's context in every prompt)</label>
-    <textarea id="ctx-biz">${esc(c.business_context)}</textarea>
+    <textarea id="ctx-biz" placeholder="&lt;product&gt; is &lt;one-line description&gt; for &lt;who it's for&gt;, built across these repositories:
+- &lt;slug&gt; (&lt;owner/repo&gt;) — &lt;what this repo is: backend/API, web client, …&gt;
+How the pieces relate (e.g. clients consume the backend's API; cross-repo features ship server-first).
+Anything every automated run should know about the business or the codebase conventions.">${esc(c.business_context)}</textarea>
     <div style="display:flex; gap:8px; margin-top:12px">
       <button type="button" class="save" onclick="saveContext(this)">Save context</button>
       <button type="button" onclick="resetContext(this)">Reset to defaults</button>
@@ -925,10 +1400,22 @@ async function submitFeature(ev) {
     clickup: document.getElementById('feat-clickup').value.trim(),
     title: document.getElementById('feat-title').value.trim(),
     summary: document.getElementById('feat-summary').value.trim(),
-    owner: document.getElementById('feat-owner').value.trim(),
+    founder_dri: document.getElementById('feat-founder-dri').value.trim(),
+    dev_dri: document.getElementById('feat-dev-dri').value.trim(),
     gate_mode: document.getElementById('feat-gatemode').value,
     related_to: document.getElementById('feat-related').value.trim(),
+    success_metric: document.getElementById('feat-metric').value.trim(),
+    metric_target: document.getElementById('feat-target').value.trim(),
   };
+  const windowRaw = document.getElementById('feat-window').value.trim();
+  if (windowRaw) {
+    const w = Number(windowRaw);
+    if (!Number.isInteger(w) || w < 1 || w > 365) {
+      msg.textContent = 'Measurement window must be a whole number of days, 1-365.';
+      return false;
+    }
+    body.metric_window_days = w;
+  }
   if (!body.project) { msg.textContent = 'Pick a project first.'; return false; }
   if (!body.clickup && !body.title) { msg.textContent = 'Give a ClickUp URL or a title.'; return false; }
   btn.disabled = true; msg.textContent = 'Creating ticket + starting P0 Intake…';
@@ -942,7 +1429,9 @@ async function submitFeature(ev) {
       ? `Pipeline started for <b>${esc(data.title)}</b>` + (data.clickup_task_url ? ` &mdash; <a href="${esc(data.clickup_task_url)}" target="_blank">ClickUp ticket</a>` : '')
       : 'Error: ' + esc(data.detail || r.status);
     if (r.ok) {
-      for (const id of ['feat-clickup', 'feat-title', 'feat-summary', 'feat-owner', 'feat-related'])
+      for (const id of ['feat-clickup', 'feat-title', 'feat-summary',
+                        'feat-founder-dri', 'feat-dev-dri', 'feat-related',
+                        'feat-metric', 'feat-target', 'feat-window'])
         document.getElementById(id).value = '';
       refresh(true);
     }
@@ -962,9 +1451,82 @@ document.addEventListener('keydown', (e) => {
 });
 window.addEventListener('hashchange', routeHash);
 
-loadProjects(); refresh(true); refreshMemory(true); loadContext(); routeHash();
+// ---------- proactive routines (Epic I1: the Routines panel) ----------
+
+let lastRoutines = '';
+async function loadRoutines() {
+  const box = document.getElementById('routines-body');
+  if (!box) return;
+  try {
+    const r = await fetch('api/routines');
+    if (!r.ok) return;
+    const data = await r.json();
+    const sig = JSON.stringify(data);
+    if (sig === lastRoutines) return;
+    lastRoutines = sig;
+    const isAdmin = ME && (ME.role === 'admin' || ME.role === 'instance_admin');
+    if (!data.routines.length) { box.innerHTML = '<div class="empty">no routines visible</div>'; return; }
+    const wsName = (id) => {
+      if (id == null) return 'instance';
+      const w = (WORKSPACES || []).find((x) => x.id === id);
+      return w ? w.slug : ('ws ' + id);
+    };
+    const rows = data.routines.map((rt) => {
+      const sched = rt.schedule || (rt.builtin ? '(from settings)' : '');
+      const status = rt.last_status
+        ? `<span class="badge">${esc(rt.last_status)}</span>` : '';
+      const last = rt.last_run_at ? fmtAgo(rt.last_run_at) : 'never';
+      const runs = (rt.runs || []).slice(0, 8).map((run) => {
+        const dur = run.ended_at ? Math.round(run.ended_at - run.started_at) + 's' : 'running';
+        return `<div class="hint">${fmtAgo(run.started_at)} &middot; ${esc(run.status || '?')} &middot; ${dur}${run.items_emitted ? ' · ' + run.items_emitted + ' item(s)' : ''}${run.detail ? ' — ' + esc(String(run.detail).slice(0, 120)) : ''}</div>`;
+      }).join('') || '<div class="hint">no runs yet</div>';
+      const controls = isAdmin ? `
+        ${rt.kind === 'reaper' ? '<span class="hint" style="display:inline">non-disableable</span>'
+          : `<button onclick="toggleRoutine(${rt.id}, ${rt.enabled ? 'false' : 'true'})">${rt.enabled ? 'Disable' : 'Enable'}</button>`}
+        <button onclick="runRoutineNow(${rt.id})">Run now</button>` : '';
+      return `<div class="panel" style="margin:6px 0; padding:8px">
+        <div><strong>${esc(rt.kind)}</strong>
+          <span class="hint" style="display:inline">${esc(wsName(rt.workspace_id))}
+          &middot; ${esc(sched)} &middot; last run ${last}</span>
+          ${status}${rt.enabled ? '' : ' <span class="badge">disabled</span>'}</div>
+        <div class="u-row">${controls}</div>
+        <details><summary class="hint" style="display:inline">run history</summary>${runs}</details>
+      </div>`;
+    }).join('');
+    const flag = data.enabled ? ''
+      : '<div class="hint">ROUTINES_ENABLED=false — workspace routines are paused (builtin loops keep running)</div>';
+    box.innerHTML = flag + rows;
+  } catch (e) { /* advisory panel */ }
+}
+
+async function toggleRoutine(id, enable) {
+  try {
+    const r = await fetch('api/routines/' + id, {
+      method: 'PUT', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ enabled: enable === true || enable === 'true' }),
+    });
+    const data = await r.json();
+    if (!r.ok) uiMsg('Error: ' + (data.detail || r.status));
+    lastRoutines = ''; loadRoutines();
+  } catch (e) { uiMsg('Error: ' + e); }
+}
+
+async function runRoutineNow(id) {
+  try {
+    const r = await fetch('api/routines/' + id + '/run', { method: 'POST' });
+    const data = await r.json();
+    if (!r.ok) uiMsg('Error: ' + (data.detail || r.status));
+    else uiMsg('Routine armed — it fires on the scheduler’s next tick.');
+    setTimeout(() => { lastRoutines = ''; loadRoutines(); }, 3000);
+  } catch (e) { uiMsg('Error: ' + e); }
+}
+
+loadProjects(); refresh(true); refreshMemory(true); loadContext(); loadOutcomes(); loadDecisions(); loadAutonomy(); loadRoutines(); routeHash();
 setInterval(() => refresh(false), 10000);
 setInterval(() => refreshMemory(false), 60000);
+setInterval(() => loadOutcomes(), 60000);
+setInterval(() => loadAutonomy(), 60000);
+setInterval(() => loadRoutines(), 60000);
 
 // ---------- auth: who am I, sign-out, expired-session redirect ----------
 
@@ -975,7 +1537,7 @@ async function loadMe() {
     if (!r.ok) return;
     ME = await r.json();
     document.getElementById('me-chip').textContent = ME.username + ' · ' + ME.role;
-    if (ME.role === 'admin') {
+    if (ME.role === 'admin' || ME.role === 'instance_admin') {
       document.getElementById('nav-settings').style.display = '';
       document.getElementById('sp-users').style.display = '';
       document.getElementById('sp-workspaces').style.display = '';
@@ -1002,7 +1564,7 @@ const SETUP_STEPS = [
   ['github_token', 'Provide a GitHub token',
    'Set GITHUB_TOKEN in the deploy environment and restart — the engine clones and pushes with it.'],
   ['memory', 'Bootstrap product memory',
-   'In the Project memory panel, Bootstrap reads a repo and opens its .gumo memory PR.'],
+   'In the Project memory panel, Bootstrap reads a repo and opens its engine-memory PR.'],
   ['team', 'Invite your team',
    'Settings → Users: add members with temporary passwords, then assign them to workspaces.'],
 ];
@@ -1056,7 +1618,7 @@ function openSettings() {
   document.getElementById('shell').style.display = 'none';
   document.getElementById('settings-pane').style.display = '';
   document.getElementById('sp-title').textContent = forced ? 'Set your password' : 'Settings';
-  if (ME && ME.role === 'admin') { loadUsers(); renderWorkspacesAdmin(); }
+  if (ME && (ME.role === 'admin' || ME.role === 'instance_admin')) { loadUsers(); renderWorkspacesAdmin(); }
 }
 function openAccount() {
   openSettings();
@@ -1084,7 +1646,7 @@ function closeSettings() {
   if (ME && ME.must_change_pw) return;
   document.getElementById('settings-pane').style.display = 'none';
   document.getElementById('shell').style.display = '';
-  if (ME && ME.role === 'admin') loadSetup();  // refresh ticks after settings work
+  if (ME && (ME.role === 'admin' || ME.role === 'instance_admin')) loadSetup();  // refresh ticks after settings work
 }
 
 async function loadUsers() {
@@ -1097,19 +1659,56 @@ async function loadUsers() {
       const flags = [u.disabled ? 'disabled' : '', u.must_change_pw ? 'temp pw' : '']
         .filter(Boolean).join(' · ');
       const self = ME && u.username === ME.username;
+      const cu = u.clickup_user_id
+        ? esc(u.clickup_user_id) : '<span class="hint" style="margin:0">not linked</span>';
       // no self-reset: the admin reset ARMS the temp-pw flag (it hands out a
       // new temporary credential) — resetting yourself just loops the forced
       // change forever. Your own password changes live in Account below.
-      return `<tr><td>${name}</td><td>${esc(u.role)}</td><td>${esc(flags)}</td><td>
+      // Epic D1: people profile summary (role · areas · authority tags)
+      const areas = (u.areas || []).map((a) => `${a.kind}:${a.value}`).join(', ');
+      const prof = [u.person_role || '', areas,
+                    (u.authority || []).join(' / ')].filter(Boolean).join(' · ')
+        || '<span class="hint" style="margin:0">no profile</span>';
+      return `<tr><td>${name}</td><td>${esc(u.role)}</td><td>${cu}</td><td>${prof.startsWith('<') ? prof : esc(prof)}</td><td>${esc(flags)}</td><td>
+        <button onclick="editProfile('${esc(u.username)}')">Profile</button>
+        <button onclick="linkClickUp('${esc(u.username)}')">${u.clickup_user_id ? 'Edit' : 'Link'} ClickUp id</button>
         ${self ? '<span class="hint" style="margin:0">you &mdash; change your password in Account below</span>'
                : `<button onclick="resetUserPw('${esc(u.username)}')">Reset password</button>
         <button onclick="toggleUser('${esc(u.username)}', ${u.disabled ? 'false' : 'true'})">${u.disabled ? 'Enable' : 'Disable'}</button>
-        <button onclick="setUserRole('${esc(u.username)}', '${u.role === 'admin' ? 'member' : 'admin'}')">Make ${u.role === 'admin' ? 'member' : 'admin'}</button>`}
+        <button onclick="setUserRole('${esc(u.username)}', '${(u.role === 'admin' || u.role === 'instance_admin') ? 'member' : 'instance_admin'}')">Make ${(u.role === 'admin' || u.role === 'instance_admin') ? 'member' : 'admin'}</button>`}
       </td></tr>`;
     }).join('');
     document.getElementById('users-list').innerHTML =
-      `<table><tr><th>user</th><th>role</th><th>flags</th><th></th></tr>${rows}</table>`;
+      `<table><tr><th>user</th><th>role</th><th>ClickUp id</th><th>profile</th><th>flags</th><th></th></tr>${rows}</table>`;
+    USERS_CACHE = users;
   } catch (e) {}
+}
+
+let USERS_CACHE = [];
+
+function editProfile(username) {
+  // Epic D1 people profile: person role, ownership areas, authority tags.
+  // Profiles fill EMPTY DRI slots at intake and render the prompt's
+  // ownership block — they never override explicit DRIs or gate enforcement.
+  const u = USERS_CACHE.find((x) => x.username === username) || {};
+  const role = prompt('Person role for ' + username
+    + ' (founder / product / dev / design; empty = none):', u.person_role || '');
+  if (role === null) return;
+  const areasCur = (u.areas || []).map((a) => `${a.kind}:${a.value}`).join(', ');
+  const areasIn = prompt('Ownership areas — comma-separated kind:value entries '
+    + '(kinds: workspace, repo, area; e.g. "workspace:default, repo:web"):', areasCur);
+  if (areasIn === null) return;
+  const areas = areasIn.split(',').map((s) => s.trim()).filter(Boolean).map((s) => {
+    const i = s.indexOf(':');
+    return { kind: i > 0 ? s.slice(0, i).trim() : 'area',
+             value: i > 0 ? s.slice(i + 1).trim() : s };
+  });
+  const authIn = prompt('Decision-authority tags (comma-separated, e.g. '
+    + '"pricing, api design"):', (u.authority || []).join(', '));
+  if (authIn === null) return;
+  const authority = authIn.split(',').map((s) => s.trim()).filter(Boolean);
+  patchUser(username, { person_role: role.trim(), areas, authority },
+            'Profile updated for ' + username + '.');
 }
 
 async function patchUser(username, body, okMsg) {
@@ -1121,6 +1720,16 @@ async function patchUser(username, body, okMsg) {
     uiMsg(r.ok ? okMsg : 'Error: ' + (data.detail || r.status));
     if (r.ok) loadUsers();
   } catch (e) { uiMsg('Error: ' + e); }
+}
+
+function linkClickUp(username) {
+  // Epic A1: ClickUp identity ↔ CtrlLoop user — gate verbs by comment are
+  // attributed (and refused when strictness demands a mapped commenter)
+  const cu = prompt('ClickUp user id for ' + username
+    + ' (numeric — see the member profile in ClickUp; empty clears the link):');
+  if (cu === null) return;
+  patchUser(username, { clickup_user_id: cu.trim() },
+            'ClickUp link updated for ' + username + '.');
 }
 
 function resetUserPw(username) {
@@ -1209,7 +1818,7 @@ async function loadWorkspaces() {
         `<option value="${w.id}" ${w.id === activeWs ? 'selected' : ''}>${esc(w.name)}</option>`).join('');
     sw.style.display = '';
     scopeProjectPickers();
-    if (ME && ME.role === 'admin') renderWorkspacesAdmin();
+    if (ME && (ME.role === 'admin' || ME.role === 'instance_admin')) renderWorkspacesAdmin();
   } catch (e) {}
 }
 
@@ -1245,7 +1854,7 @@ async function renderWorkspacesAdmin() {
       <h3>${esc(w.name)} <span class="chip">${esc(w.slug)}</span></h3>
       <div class="ws-inline">
         <div><label>Product name</label><input class="w-product" value="${attr(w.product_name)}"></div>
-        <div><label>Canonical project (hosts .gumo/product/)</label><input class="w-canon" value="${attr(w.canonical_project)}"></div>
+        <div><label>Canonical project (hosts product-scope memory)</label><input class="w-canon" value="${attr(w.canonical_project)}"></div>
       </div>
       <label>Repositories (slug &rarr; repo &middot; base &middot; setup &middot; test)</label>
       <div class="ws-repos">${repos}</div>
@@ -1255,6 +1864,10 @@ async function renderWorkspacesAdmin() {
       <div class="ws-inline" style="margin-top:8px">
         <div><label>ClickUp list id (optional)</label><input class="w-culist" value="${attr(w.clickup_list_id)}"></div>
         <div><label>Slack webhook URL (gate nudges, optional)</label><input class="w-slack" value="${attr(w.slack_webhook_url)}"></div>
+      </div>
+      <div class="ws-inline" style="margin-top:8px">
+        <div><label>Slack ingest channels (comma-separated channel ids; needs SLACK_INGEST_ENABLED + bot token)</label>
+          <input class="w-slackch" value="${attr((w.slack_channels || []).join(', '))}"></div>
       </div>
       <div class="ws-flags">
         <label style="display:inline-flex;gap:5px;align-items:center">
@@ -1296,6 +1909,8 @@ async function saveWorkspace(id, btn) {
         product_name: v('w-product'), canonical_project: v('w-canon'),
         workspace_context: card.querySelector('.w-ctx').value,
         clickup_list_id: v('w-culist'), slack_webhook_url: v('w-slack'),
+        slack_channels: v('w-slackch')
+          ? v('w-slackch').split(',').map((s) => s.trim()).filter(Boolean) : '',
         clickup_enabled: card.querySelector('.w-cuon').checked, repos,
       }),
     });

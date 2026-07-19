@@ -1,8 +1,9 @@
 # CtrlLoop — feature pipeline, shared artifacts, product memory
 
 > Formerly "the Gumo Engine" / gumo_brain. The engine identity (CtrlLoop) is
-> distinct from the configured product identity (§10); Gumo remains the
-> default project context.
+> distinct from the configured product identity (§10); all code defaults are
+> neutral — Gumo is one customer whose values live in its instance's config
+> (worked example in OPERATIONS.md).
 
 > Status: AS-BUILT SPEC (v2 of gumo_brain). Reviewed by a 5-lens design critique
 > (sync protocol, memory, state machine, operator UX, prompt/token economics);
@@ -39,18 +40,23 @@ Atomic cross-repo pipelines are deferred.
 | `sentry`  | webhook / sweep / manual         | grade → fix (HITL only if COMPLEX) |
 | `task`    | dashboard (title or ClickUp URL) | analyse → gate → implement         |
 | `feature` | dashboard (title or ClickUp URL) | **P0–P9 pipeline, gate after every stage** |
-| `memory`  | dashboard, per project           | bootstrap `.gumo/memory/` → draft PR |
+| `memory`  | dashboard, per project           | bootstrap `<ns>/memory/` → draft PR |
+| `watch`   | spawned on a terminal feature's PR merge | metric reads → verdict → **Iterate gate** (§2b) — never a Claude run |
 
 ## 2. The stage ladder (P0–P9)
 
-One headless Claude run per stage, on the feature branch `brain/feat-<job>`.
+One headless Claude run per stage, on the feature branch
+`<branch_prefix>/feat-<job>` (BRANCH_PREFIX, default `ctrlloop`; each job
+records its branch at first use, so in-flight pipelines survive prefix
+changes — pre-rename jobs are backfilled with their historical `brain/…`
+branches).
 P0–P4 are **document stages** (artifact only, produced in the run output and
 written/committed by the ENGINE — the run gets read-only tools). P5–P8 are
 **code stages** (full toolset). Every stage ends parked at a gate.
 
 | stage | name       | artifact         | contract (summary) |
 |-------|------------|------------------|--------------------|
-| P0 | Intake      | `P0-intake.md`  | Restate request, ambiguities as questions, draft acceptance criteria. Memory only — read-only tools, instructed to stay within `.gumo/**`; if memory is absent, runs in **declared degraded mode** (may read code, must say so in the artifact header). |
+| P0 | Intake      | `P0-intake.md`  | Restate request, ambiguities as questions, draft acceptance criteria. Memory only — read-only tools, instructed to stay within `<ns>/**`; if memory is absent, runs in **declared degraded mode** (may read code, must say so in the artifact header). |
 | P1 | PRD         | `P1-prd.md`     | User stories, scope IN/OUT, numbered acceptance criteria, non-goals. Same tool scoping as P0. |
 | P2 | Recon       | `P2-recon.md`   | Read the code. Current behaviour, touched modules, constraints, risks. No solutioneering. |
 | P3 | Design      | `P3-design.md`  | Technical design. Data-model decisions explicit, each with options + trade-offs + recommendation. |
@@ -70,6 +76,17 @@ after it is the payload):
   (≥1; minimum "1. Approve and continue to P<n+1>?").
 - `STAGE_FAIL:` + why (blocked, missing info).
 
+**P0/P1 success-metric requirement (Epic B1, fail-closed).** The P0 and P1
+artifact contracts demand a `## Success metric` section (restating the goal
+set at intake — metric, target, window — and HOW it will be measured). A
+P0/P1 `STAGE_DONE` whose payload lacks that heading does NOT close `done`:
+the run closes `missing_metric` and parks flagged, after the artifact commit
+and checkpoint push (the payload is on the branch and the gate), before any
+light-mode auto-advance. `/redo` regenerates; a `/proceed` on the flagged
+park is a **deliberate human override** of the metric requirement — the
+pipeline continues without a stated metric and the outcome watch will be
+skipped at merge unless a metric lands later (P9 protocol lines).
+
 A standalone `PR_URL: <url>` line is honored *in addition* (P5, P9) — a bare
 URL elsewhere in output never changes state. Anything unparseable **fails
 closed**: the job parks with the raw output flagged unparsed; nothing
@@ -85,7 +102,8 @@ artifact subtask**; the poller scans both):
 
 **Redo semantics for code stages (P5+):** the engine records
 `stage_base_sha` (branch HEAD before each stage run). Redo preserves the
-current head as `refs/gumo/<job>/P<n>-attempt-<k>`, hard-resets the branch to
+current head as `refs/ctrlloop/<job>/P<n>-attempt-<k>` (write-only archival
+refs — no read path, so no legacy fallback), hard-resets the branch to
 `stage_base_sha`, and re-runs. `stage_attempts` soft-caps at 3 (warns on the
 gate, never blocks). Redo of an earlier stage stamps downstream artifact
 mirrors with a SUPERSEDED banner.
@@ -96,17 +114,66 @@ advance is an atomic compare-and-set (`UPDATE jobs … WHERE status =
 <channel>" (HTTP 409). The worker re-validates status at dequeue and discards
 stale entries. Every decision (stage, action, verbatim text, channel,
 timestamp, artifact blob SHA answered against) is appended to `guidance_log`
-and mirrored to `.gumo/features/<job>/guidance.md` on the branch at next
+and mirrored to `<ns>/features/<job>/guidance.md` on the branch at next
 stage start.
 
 **Gate evidence (P5–P8).** Gate cards/comments include harness-captured
 evidence, never self-reported: `git diff --stat` vs `stage_base_sha`, files
 changed, and a GitHub compare link (enabled by per-stage push).
 
-**Gate notifications.** Features have an `owner` (set at submit). At every
-gate the engine assigns the owner on the ClickUp task and posts the gate
-comment — ClickUp's native push/email does the nudging. (Optional Slack
-webhook is the documented follow-up.)
+**Gate ownership & notifications (Epic A).** Features carry **two DRIs** —
+`founder_dri` + `dev_dri` (ClickUp person id or CtrlLoop username; set at
+submit, or read from the workspace's people fields at ClickUp adoption via
+`clickup_dri_field_map`; an EMPTY slot may be filled at intake from the
+people profiles — Epic D1, §16 — explicit submissions always win). Every stage has an **owning role** resolved from
+the stage→role map (default ladder: P0/P1 → founder, P2–P8 → dev, P9 →
+founder; overridable per workspace via `stage_role_map`, instance-wide via
+`STAGE_ROLE_MAP`). The gate owner = the owning role's DRI, falling back to
+the other DRI when the slot is empty. At every park the engine assigns the
+owner on the ClickUp task, names them in the gate comment ("Owned by <name>
+(<role> gate)") and in the Slack nudge — ClickUp's native push/email does
+the nudging.
+
+**Role-exclusive enforcement** happens at the single answer choke point
+(both channels), before the CAS: a `proceed`/`redo`/`skip` — ask-gates and
+redo-from-error included — from anyone who is not the owner is refused
+(dashboard: HTTP 403 with "this is a <role> gate, owned by <name>"; ClickUp:
+one explanatory reply per comment, deduped through `gate_events`).
+Non-owners keep gate chat, steering visibility and plain comments. The only
+bypass is an **explicit, audited admin override** from the dashboard (a
+checkbox; recorded in `gate_events` only after the transition actually won
+its CAS) — ClickUp offers no override path. Enforcement keys EXCLUSIVELY on
+the explicit DRI columns: a job with neither DRI recorded (solo installs;
+pre-upgrade jobs whose legacy `owner` column is set) is **inert** — anyone
+may answer, exactly as before Epic A; the legacy `owner` still drives
+assignment/display. NOTE the fail-closed corollary: with
+`require_attributed_answers=off` but DRIs recorded, an *unmapped* ClickUp
+commenter can never be the owner — their verbs are refused with the
+ownership reply ("link your ClickUp account or answer on the dashboard");
+A3 effectively implies A1 over the ClickUp channel.
+
+**Gate SLA & escalation.** Effective SLA = workspace `gate_sla_hours` (NULL
+= inherit `GATE_SLA_HOURS`, default 24; 0 disables). A sweep (every
+`SLA_CHECK_INTERVAL_SECONDS`) escalates overdue gates of DRI'd features:
+≥1.0×SLA re-assigns + nudges the owner; ≥1.5×SLA notifies the OTHER DRI —
+visibility, never authority; ≥2.0×SLA records a standup flag. Each step is
+keyed on the gated run's `stage_runs.id` in `gate_events` (fires once per
+gate attempt; a `/redo` re-park re-arms the ladder; events are written
+BEFORE any send, so a crash under-notifies, never double-fires). Jobs
+without explicit DRIs and v1 items never escalate (the inbox `overdue` flag
+covers them). Everything here is visibility only — no job state changes.
+
+**Per-person queues.** `GET /api/inbox` is the "Awaiting you" surface:
+gates the authed user owns + unassigned gates (plus feature error/timeout
+parks, which are answerable), membership-scoped, sorted overdue-first then
+oldest-gate-first, with `counts.mine` as the badge number.
+
+**Auto-advance resolution (Epic C, §15).** A clean `STAGE_DONE` resolves its
+gate through one order — **workspace pin > per-job `gate_mode='light'` >
+computed autonomy level (opt-in) > default full gating** — and the safety
+guards apply unconditionally on top under every mode. See §15 for the trust
+ladder; light mode's own contract (auto-advance only at P2/P4–P8, boilerplate
+question, all guards) is unchanged.
 
 **Gate-park ordering (crash-safe).** The DB transition to `awaiting_input`
 (with the current comment marker) commits BEFORE the gate comment is posted;
@@ -114,13 +181,106 @@ the poller ignores engine-authored comments (fixed prefix). On restart, parked
 jobs re-scan comments after the stored marker, so answers posted during an
 outage are honored.
 
+## 2b. The outcome loop (Epic B)
+
+Close Review + Accountability: a metric goal goes in at intake, a **measured
+verdict** comes out after ship. The whole loop is HTTP + SQLite — a watch job
+never invokes Claude (a fail-closed branch in the worker returns any queued
+watch to the loop untouched).
+
+**Metric at intake (B1).** `POST /api/features` accepts `success_metric`,
+`metric_target`, `metric_window_days` (validated 1–365, atomically — a bad
+window is a 400 with nothing queued). ClickUp `[feature]` adoption reads
+`metric:` / `target:` / `window:` description lines (bold-tolerant, stripped
+from the request like the `project:` line) with the ticket's `Success metric`
+custom field as fallback. Stage prompts restate the goal in every header.
+
+**Harvest (B1/B2).** Runs may emit `SUCCESS_METRIC:` / `METRIC_TARGET:` /
+`METRIC_WINDOW_DAYS:` / `METRIC_EVENT:` protocol lines (P9's contract names
+them; P8 verifies the instrumentation exists in the diff). They land on the
+job row — NOT gated by the ClickUp field sync (the row is the record, the
+mirror is visibility). **Human intake wins**: the first three fill only when
+empty; `metric_event` is engine-owned and always takes the latest emission.
+
+**Analytics adapter (B3, seam H4).** `app/analytics.py`: an
+`AnalyticsProvider` interface (`query_metric(metric, window_days, event, end)
+-> {status, series, total, detail}`), a Mixpanel driver (per-workspace
+credentials: `analytics_provider` + `analytics_config` — the config is a
+SECRET AT REST, stored on the workspace row and never returned by any API;
+the dashboard sees only `analytics_configured`), and a Null driver for
+instances without analytics. Resolution: workspace row > instance env
+(`ANALYTICS_PROVIDER`/`ANALYTICS_CONFIG`) > null. Unknown provider names and
+malformed config fail closed to the null driver (verdicts become
+`unmeasured`, never a guess); provider errors (401s etc.) surface as visible
+detail on the watch job.
+
+**Post-ship watcher (B4).** When a tracked PR merges AND the feature is
+terminal at `pr_opened`, the shepherd spawns `watch-<feature id>` — a single-
+transaction insert born `kind='watch'`, `status='watching'` (invisible to the
+queue/reaper/requeue by construction), copying the metric fields, workspace,
+ticket, and BOTH DRIs (the founder DRI as owner). Merge detection covers the
+mainline flow: the shepherd's scan includes `approved`, `stalled` and `draft`
+PRs for merge/close detection ONLY (the review loop is never resumed for
+them) — an approved PR the human merges on GitHub still flips to `merged`
+and spawns the watch. A PR merged mid-pipeline spawns nothing;
+the P9-approval path re-checks and spawns then. A feature with no metric and
+no event gets ONE "watch skipped" ticket note (deduped per feature via
+`gate_events`). Spawn does not flip the ticket status (the Stage field just
+went Complete); status changes happen only at park/close.
+
+The watch loop (every `WATCH_INTERVAL_SECONDS`) reads the metric ~daily
+(throttled to one read per ~22h per job) into the INSERT-only
+`metric_readings` table, each row stamped with its window's
+`watch_started_at` so a `/redo` never mixes windows. At `watch_deadline`
+(persisted at spawn — restarts never re-derive it) the finisher takes a final
+read, queries a same-length pre-ship baseline (persisted on first finish —
+a redo re-finish reuses the ORIGINAL baseline; when none is persisted, e.g.
+the first finish's query errored, the re-query ends at the ORIGINAL
+merge-time spawn — the watch row's `created_at` — never at the current
+window's `/redo`-refreshed start, which would be post-ship data), computes
+the verdict via the
+transparent formula in `app/outcome.py` (direction-aware: decrease-goal
+targets like "under 300ms" judge inverted; ambiguous directions never assert
+a regression; no data → `unmeasured`, fail closed), UPSERTs the `outcomes`
+ledger row (verdict fields only — it can never clobber a recorded learning),
+and parks a founder-owned **Iterate gate**: single CAS
+`watching → awaiting_input` first, ClickUp comment/status/assignee strictly
+after (best-effort). The Iterate gate is **role-enforced exactly like feature
+gates** (§2): the founder DRI owns it (the dev DRI is the fallback owner when
+the founder slot is empty — both DRIs are copied onto the watch row at
+spawn), a non-owner's verb is refused on both channels, the only bypass is
+the audited dashboard admin override, and a watch without explicit DRIs is
+inert (solo mode, exactly as for features). Verbs on the gate:
+
+- `/proceed <learning>` → learning + decider recorded on the ledger row,
+  watch closes `done`; with `OUTCOME_MEMORY_PRS=true` a background MECHANICAL
+  task (no model run) writes a changelog entry (+ ADR when a learning exists)
+  under the repo's engine namespace on a `<prefix>/outcome-<feature>` branch
+  and opens a draft PR — git stays truth: memory changes only via a
+  human-merged PR; the DB row is the record regardless.
+- `/redo <days>` → the watch re-arms with a fresh window (days optional,
+  clamped 1–365 — out-of-range is refused with the reason, never silently
+  accepted). The ledger row stays; the re-finish overwrites verdict fields.
+- `/skip` → closes `skipped` (also valid mid-window to cancel a watch); the
+  verdict stands, no learning.
+
+NOTE: a parked Iterate gate sits in `awaiting_input` and therefore counts
+toward `runs_today`'s daily-cap denominator exactly like feature gates —
+accepted and documented (watch jobs consume no Claude runs themselves).
+
+**Ledger (B5).** `GET /api/outcomes` — membership-scoped rows + the verdict
+distribution; the dashboard's "Outcomes" panel renders it, and the job detail
+pane shows a verdict card (watch and feature views). Status vocabulary:
+`watching` (active watch) and `done` (watch closed with a recorded outcome).
+
 ## 3. Shared artifacts — the sync protocol
 
 **Git is the source of truth; ClickUp is the human editing surface; the brain
 is the sync layer. Human edits always survive. Fail closed on anything
 ambiguous.**
 
-- Artifacts live on the feature branch under `.gumo/features/<job>/`.
+- Artifacts live on the feature branch under `<ns>/features/<job>/`
+  (the engine namespace dir, §4/§10).
   The ENGINE commits and **pushes the branch to origin at the end of every
   stage run** — including timeout/fail/unparsed — so no work exists only in a
   disposable workspace. For stage > 0, `prepare_workspace` checks out
@@ -162,13 +322,19 @@ update is always last.
 ## 4. Product memory
 
 **Markdown in git, updated through the same PRs the engine ships, split into
-two scopes** (per-repo product.md triplication would drift — critic-confirmed):
+two scopes** (per-repo product.md triplication would drift — critic-confirmed).
+Both live under the **engine namespace dir** `<ns>` = `.ctrlloop/` — repos
+initialized before the rename keep their legacy `.gumo/` tree working, and
+ONE precedence rule governs every resolution helper (working-tree reads,
+base-pinned `git show` reads, freshness): **legacy wins when present**, so a
+repo is never split-brained across two trees. Migrate with a single
+`git mv .gumo .ctrlloop` PR (MIGRATION-CTRLLOOP.md).
 
-- **Repo scope** — `.gumo/memory/` in each repo: `architecture.md`, `map.md`,
+- **Repo scope** — `<ns>/memory/` in each repo: `architecture.md`, `map.md`,
   `conventions.md`, plus `decisions/` and `changelog/` **directories** (one
   file per entry, `<date>-<slug>.md` — append-only files guarantee merge
   conflicts; per-entry files can't conflict, and "recent N" is trivial).
-- **Product scope** — `.gumo/product/` in the configured canonical repo (§10):
+- **Product scope** — `<ns>/product/` in the configured canonical repo (§10):
   `product.md`, product-level decisions/changelog, `contract.md` (endpoints/
   models the clients depend on). Client-repo runs get it inlined from the
   canonical repo's base branch (via the brain's canonical workspace —
@@ -183,7 +349,9 @@ two scopes** (per-repo product.md triplication would drift — critic-confirmed)
   fabricates history from git archaeology.
 - **Read**: context matrix below; memory files are in the clone, so prompts
   inline capped excerpts + full paths (pointers over floods). Prompt assembly
-  always reads from the stage's own clone, never the cache.
+  always reads from the stage's own clone, never the cache. On top of the
+  capped inlines, an FTS retrieval block serves top-k snippets from memory,
+  prior artifacts, decisions and guidance (Epic D4, §16).
 - **Write**: P9 distills; **sentry and task implement prompts also append a
   changelog entry and update touched map/architecture sections** (bulk
   traffic must feed memory or it decays).
@@ -191,7 +359,8 @@ two scopes** (per-repo product.md triplication would drift — critic-confirmed)
   `{commit_sha, fetched_at}`, dashboard-only (plus the base-pinned product
   scope inline for client-repo runs). Never last-writer-wins from branches.
 - **Freshness metric**: commits on origin/<base> since the last commit
-  touching `.gumo/`, shown per repo on the Product brain panel.
+  touching the engine namespace (both `.ctrlloop/` and `.gumo/` pathspecs are
+  passed; whichever exists counts), shown per repo on the Product brain panel.
 
 **Context assembly (binding inputs, not recency):**
 
@@ -214,9 +383,24 @@ guidance > older guidance; superseded guidance is marked.
 ## 5. State machine & storage
 
 - `jobs` gains: `stage`, `stage_attempts`, `mirror_ok`, `cu_list_id`,
-  `owner`, `related_jobs`, `run_started_at`.
+  `owner`, `founder_dri`, `dev_dri` (Epic A2 — `owner` is the legacy
+  computed alias, dev first then founder), `related_jobs`, `run_started_at`.
 - Child tables (INSERT-only or row-per-key — no JSON blob read-modify-write):
   - `guidance_log(job_id, stage, action, text, via, artifact_sha, at)`
+  - `gate_events(job_id, stage, kind, ref, detail, actor, at)` — Epic A's
+    append-only audit substrate AND idempotence store
+    (`UNIQUE(job_id, kind, ref)`): attribution/role refusals (ref = comment
+    id), admin overrides (ref = uuid, recorded only after a won CAS), SLA
+    escalation steps (ref = `run<stage_runs.id>-step<k>`). Deliberately NOT
+    `guidance_log` — refusals and escalations must never render into stage
+    prompts as "human decisions".
+  - `admin_events(kind, target, detail, actor, at)` — append-only audit of
+    admin/config mutations that grant or move authority: user↔ClickUp
+    identity links (`clickup_link` — the mapping decides whose ClickUp
+    comments answer role-owned gates) and workspace security config
+    (`workspace_config`/`workspace_create` — `stage_role_map`,
+    `require_attributed_answers`, …; secret values redacted before write).
+    The minimal substrate until Epic E4's full audit_log folds/exports it.
   - `artifact_state(job_id, artifact, subtask_id, synced_hash, flags)`
   - `stage_state(job_id, stage, base_sha, attempts)`
   - `stage_runs(job_id, stage, attempt, queued_at, started_at, ended_at,
@@ -243,10 +427,18 @@ guidance > older guidance; superseded guidance is marked.
   context. GET returns `{context, defaults, overridden}`; PUT validates
   atomically (400 changes nothing) and applies live; DELETE reverts to the
   env/code defaults.
-- `POST /api/features` — `{project, clickup? | title+summary, owner?,
-  related_to?}`.
-- `POST /api/jobs/{id}/answer` — `{action: proceed|redo|skip, answer}`,
-  CAS-guarded, 409 on lost race.
+- `POST /api/features` — `{project, clickup? | title+summary, founder_dri?,
+  dev_dri?, related_to?, success_metric?, metric_target?,
+  metric_window_days?}` (`owner` = deprecated alias for `dev_dri`;
+  the window validates 1–365 atomically).
+- `GET /api/outcomes` — the outcome ledger (§2b): membership-scoped rows
+  (feature, metric, target, observed, verdict, learning, decider) + the
+  verdict distribution.
+- `POST /api/jobs/{id}/answer` — `{action: proceed|redo|skip, answer,
+  override?}`, CAS-guarded, 409 on lost race, 403 for a non-owner on a
+  role-exclusive gate (`override: true` = the audited admin bypass).
+- `GET /api/inbox` — the per-person queue (§2): owned + unassigned gates,
+  overdue-first, with `counts` for the badge.
 - `GET /api/jobs` — feature rows carry `stage`, `stage_name`, `mirror_ok`.
 - `GET /api/features/{id}/stats` — stage_runs rows.
 - `GET /api/memory/{project}`, `POST /api/memory/{project}/bootstrap`.
@@ -319,8 +511,8 @@ workspace schema belongs to the humans.
 
 Full-parity extras: `PRD Doc`/`Contract Doc` point at the artifact-mirror
 subtasks (the brain's EDITABLE equivalent of the workflow's Drive docs —
-edits there sync back to git) and the folder field at the branch's `.gumo`
-tree; feature adoption reads the `Assigned Dev DRI`/`Assigned Founder DRI`
+edits there sync back to git) and the folder field at the branch's engine
+namespace tree; feature adoption reads the `Assigned Dev DRI`/`Assigned Founder DRI`
 people fields into `owner` (gates assign that person, as the original
 automations did); stage runs may emit `FRICTION: <what> · <improvement>`
 lines that append to `Gumo Workflow Improvements` (human redos append there
@@ -358,7 +550,10 @@ note. Memory-bootstrap PRs are tracked but never kicked off (doc drafts).
 
 **The shepherd** (`shepherd_forever`, every `shepherd_interval_seconds`)
 autonomously drives each tracked `ready`/`in_review`/`changes_requested` PR:
-merged/closed detection first; a 🎉 on the engine's latest `@sentry review`
+merged/closed detection first — and for `approved`/`stalled`/`draft` rows it
+runs merge/close detection ONLY (never resuming the review loop), so a
+human-merged approved PR still reaches `merged` and fires the outcome watch
+(§2b); a 🎉 on the engine's latest `@sentry review`
 trigger = clean pass → `approved` + a ClickUp note on the owning job. Open
 findings (`BUG_PREDICTION` comments the bot has not edited to `*Resolved in*`)
 that lack an engine reply get one verify-first headless fix run on the PR
@@ -395,7 +590,9 @@ all-gated).
 
 ## 9. Deliberate deferrals
 
-- Auto-advance gate tiering (P5→P6, P7→P8 candidates) — after week-one data.
+- ~~Auto-advance gate tiering (P5→P6, P7→P8 candidates) — after week-one
+  data.~~ Shipped as graduated autonomy (§15): earned per-cell levels with
+  workspace pins, computed from exactly that week-one data, continuously.
 - Per-job worktrees + bounded concurrency — after latency data.
 - Scheduled memory-refresh job kind — freshness metric first.
 - Unmerged-PR memory salvage (abandoned-approach ADRs).
@@ -412,7 +609,8 @@ not code** — the same brain serves any software team:
   Any number of repos; drives intake validation, workspace clones, PR bases,
   test instructions and the shepherd's reverse lookup.
 - **Canonical project** — which slug hosts product-scope memory
-  (`.gumo/product/`). Must be a slug in the repo map (fail-closed on save).
+  (`<ns>/product/`). Must be a slug in the repo map (fail-closed on save);
+  empty = no instance-level product scope (repo-scope memory only).
 - **Product name** — the identity used in prompts ("the `<name>` Engine",
   "the `<name>` platform").
 - **Business context** — operator-maintained free text injected into EVERY
@@ -421,15 +619,20 @@ not code** — the same brain serves any software team:
   memory, when present, is more current and takes precedence — the injected
   block itself states this, so it holds for custom contexts too.
 
-Precedence: **DB overrides > env vars > code defaults** (the Gumo repos and a
-structural Gumo description ship as the defaults). Operators edit the context
+Precedence: **DB overrides > env vars > code defaults** (the code defaults
+are NEUTRAL: empty repo map, "your product", empty business context — the
+original Gumo values live in docs/OPERATIONS.md as a worked example).
+Operators edit the context
 in the dashboard's "Project context" panel or via `PUT /api/context`; saved
 values persist in the `app_config` table, apply to the live engine immediately
 (next run picks them up) and survive restarts. `DELETE /api/context` reverts
 to defaults. Validation is atomic and fail-closed: a malformed repo map or a
 canonical slug missing from the map is a 400 and nothing changes; persistence
-is one transaction. The `.gumo/` directory names are engine namespace (like
-`.github/`), not product branding — they stay fixed regardless of context.
+is one transaction. The engine directory names are engine namespace (like
+`.github/`), not product branding — they never follow the product context.
+The namespace is the constant `.ctrlloop/` with a read+write legacy fallback:
+a repo already carrying `.gumo/` keeps using it (legacy wins when both exist,
+deterministically), until a `git mv .gumo .ctrlloop` PR migrates it.
 
 Edits and running work: jobs keep their recorded project slug. If the new map
 still contains the slug, they continue under the new mapping; if a slug was
@@ -465,6 +668,17 @@ themselves. Password changes revoke all of the user's sessions.
 **Attribution**: every gate decision, steer, and chat turn records the acting
 user (`guidance_log.via = "dashboard:<username>"`, `gate_chat.author`), and
 ClickUp gate comments carry it — "who approved P3" is always answerable.
+The ClickUp channel is no longer anonymous (Epic A1): each user may carry a
+`clickup_user_id` (admin-linked in Settings → Users; one ClickUp identity
+per user, enforced by a partial UNIQUE index), and gate verbs by comment
+resolve their commenter — `via` becomes `clickup:<username>` for mapped
+commenters and `clickup:<cu-name>#<cu-id>` otherwise, so even permissive
+modes record WHO. Strictness is `require_attributed_answers` (workspace
+value > instance `REQUIRE_ATTRIBUTED_ANSWERS`): `on` refuses verbs from
+unmapped commenters with one explanatory reply per comment (deduped via
+`gate_events`, so a refused comment can never wedge a stream), `off` never
+refuses, and the default `auto` turns strict as soon as ANY enabled user has
+a mapping. Applies to feature AND v1 (sentry/task) verbs alike.
 
 The UI is served from `app/static/` (index behind auth with the product-name
 substitution, login page + assets public; all paths relative so reverse-proxy
@@ -482,7 +696,7 @@ stays deterministic, and `settings.repo_for_project` keeps working: the
 service rebuilds the merged map into live Settings after every edit.
 
 - **Context hierarchy in prompts**: business context (instance, §10) +
-  workspace context + repo memory (`.gumo/`, in the clone). Product name and
+  workspace context + repo memory (`<ns>/`, in the clone). Product name and
   canonical repo resolve per workspace. The instance context API now owns
   ONLY the business layer; repo topology edits there are refused with a
   pointer to the workspace API.
@@ -540,3 +754,559 @@ context reset (`DELETE /api/context`) preserves the flag — upgrades and
 resets never resurrect onboarding. Members are never shown instance
 onboarding; an unassigned member instead gets an inbox hint naming the
 fix ("ask your admin for workspace access").
+
+## 15. Graduated autonomy — the trust ladder (Epic C)
+
+Trust is **earned from the receipts, per (workspace, repo, stage) cell**,
+never asserted. A nightly scorer (`autonomy_forever`, cadence
+`AUTONOMY_RECOMPUTE_HOURS`, plus the admin-only
+`POST /api/autonomy/recompute`) reads the rolling `AUTONOMY_WINDOW_DAYS`
+window of `stage_runs` and derives a level 0–3 per cell, persisted in
+`autonomy_scores` **with the exact inputs the formula saw** (`inputs` JSON —
+the transparency requirement).
+
+**The formula** (`app/autonomy.py`, weights/thresholds are module constants):
+
+```
+score = 0.40 · clean_rate          runs closing 'done' / counted runs
+      + 0.30 · (1 − redo_rate)     human redos TARGETING this stage / answered gates
+      + 0.15 · latency_factor      clamp01(1 − median(gate answer wait) / 2·SLA)
+      + 0.15 · rounds_factor       code stages: clamp01(1 − avg shepherd rounds / cap)
+
+level:  ≥ 0.90 → 3   ≥ 0.75 → 2   ≥ 0.55 → 1   else 0
+```
+
+with the fail-closed edges spelled out: open runs (`result_status=''`),
+`interrupted` and `skipped_single_group` are excluded from every
+denominator; latency uses only runs with BOTH `gate_posted_at` AND
+`gate_answered_at` and an empty sample is neutral (factor 1.0); zero
+answered gates means `redo_rate = 0` (full credit on that term); doc stages
+take a neutral rounds factor. Overrides: a sample under `AUTONOMY_MIN_RUNS`
+stays level 0; **level 3 additionally requires a clean streak ≥ the same
+minimum AND at least one human-answered gate in the window** — a cell that
+only ever auto-advances can never hold full trust on autopilot (only
+STAGE_FAIL/guard parks, a human redo, or clawback would otherwise demote
+it). A cell whose runs age out of the window decays to level 0 on the next
+pass. Redo attribution reads `guidance_log` (which records the TARGET
+stage), never `stage_runs.gate_action` — a `/redo P2` answered at the P4
+gate penalizes P2, not the innocent parked stage.
+
+**Resolution order at a clean STAGE_DONE** (`autonomy.resolve_gate`, one
+function, locked):
+
+1. **Workspace pin** (`autonomy_pins`, per stage): `always_gate` |
+   `always_auto` — pins always win in both directions and never expire.
+   Admin-set (`PUT /api/workspaces/{id}/autonomy/pins`), audited.
+2. **Per-job `gate_mode='light'`** — unchanged, including its
+   P2/P4–P8-only restriction. Light mode's "P0/P1/P3/P9 always park"
+   promise is now "…unless a workspace `always_auto` pin or a
+   level ≥ `AUTONOMY_AUTO_LEVEL` cell fires for that stage (P9 excepted —
+   always terminal-gated)".
+3. **Computed level ≥ `AUTONOMY_AUTO_LEVEL`** — **opt-in, default OFF**
+   (`0` = computed levels never auto-advance; values outside 1..3 disable
+   the rule rather than clamping — never toward permissiveness).
+4. Default **full gating**.
+
+**Invariants.** The safety guards are unconditional at every level and
+under every pin: a conflicted mid-run human edit, `mirror_ok=0`, the first
+clean run after an explicit `/redo` of the stage, P5 without a captured PR,
+and any non-boilerplate question all force a park; STAGE_FAIL / STAGE_ASK /
+unparsed always park. "Level 3 = full auto-advance" means "auto-advance any
+clean, guard-passing STAGE_DONE" — never "skip the guards". **P9 never
+auto-advances**: its proceed is the terminal transition owned by the worker;
+`always_auto` pins on stage 9 are refused at the API and ignored by the
+resolver. A job with no stamped `workspace_id` skips pin and level
+resolution entirely (fail closed) — only the workspace-independent light
+mode path can still fire for it. `AUTONOMY_ENABLED=false` restores pure
+legacy behavior (light mode only, pins ignored); it is env-only and read
+once — flipping it needs a restart.
+
+**Clawback** (`POST /api/workspaces/{id}/autonomy/clawback`, workspace
+members may pull the brake — it only reduces autonomy): drops the cell(s)
+to level 0 and stamps `clawback_at`; the scorer counts only runs started
+AFTER the stamp, so trust re-earns from zero. The stamp is never cleared —
+the dashboard shows the "clawed back" flag only while the cell sits at
+level 0. A workspace-wide clawback (project omitted) derives its slug list
+inside the DB transaction from every project that ever held a score row
+UNION the current repo set, so slugs since removed or moved keep their
+stale cells clawable. A recompute pass that started before a clawback
+landed can never resurrect the cell (conditional upsert; theoretical under
+today's single-process SQLite, load-bearing under Epic F2 Postgres).
+
+**Audit substrate.** Every mutation — `pin_set` / `pin_clear` / `clawback`
+/ `level_change` / each `auto_advance` — is an INSERT-only
+`autonomy_events` row with the acting principal (`dashboard:<username>` or
+`engine`). Epic E4 folds/exports these; nothing here waits for it.
+Auto-advances also carry their resolution reason into the guidance entry
+and the ClickUp gate comment ("auto-advanced (pin: always_auto)" /
+"…(autonomy level 3, 14 clean runs)").
+
+**Surface.** `GET /api/autonomy` — per accessible workspace the stage×repo
+matrix (level, score, sample, decoded inputs), the pin map, and the last 50
+events; `GET /api/jobs` feature rows carry `autonomy_level`/`autonomy_pin`
+for their current stage; the session snapshot carries a per-stage
+`autonomy` block powering the trust dial on the stage cards. Dashboard:
+the "Autonomy" panel (matrix + pins + clawback + event log), a trust chip
+on the feature header, and per-stage L0–L3 dials.
+
+**Recorded edges** (deliberate): a feature re-intake may change
+`jobs.project` while keeping old `stage_runs` — historical runs then join
+to the NEW project slug (acceptable: same repo lineage in practice). A repo
+slug moved to another workspace leaves in-flight jobs resolving pins/levels
+against their STAMPED `workspace_id` — the stamp is the record; the new
+workspace's pins apply to newly-intaken jobs. The auto-advance transition
+itself stays `set_fields`/`set_status` (no CAS) inside the serial worker
+while `status='running'` — correct today because `answer_job` requires
+`awaiting_input`; re-verify under Epic F2 with multiple workers (BUILD-PLAN:
+"All CAS transitions re-verified under Postgres semantics").
+
+## 16. Organizational context (Epic D)
+
+### People & ownership model (D1)
+
+`people` is a **profile layer over `users`** (1:1, admin-edited via
+`PATCH /api/users/{u}`), never a parallel identity: person role
+(founder/product/dev/design), ownership areas
+(`{kind: workspace|repo|area, value}` — `area` entries are free-text
+display-only tags), and decision-authority tags. Every profile mutation is
+validated fail-closed (a bad payload changes nothing) and audited in
+`admin_events` (`people_profile`) only when something actually changed —
+areas and authority GRANT routing/decision authority.
+
+Two consumers:
+
+- **Intake DRI defaults** (`PEOPLE_ROUTING_DEFAULTS`, default on, inert
+  until profiles exist): at feature intake an EMPTY DRI slot fills from the
+  profiles iff EXACTLY ONE enabled user matches — role maps to the slot
+  (founder→founder, dev→dev; product/design map to neither), the profile's
+  areas cover the job's workspace or repo slug (an empty areas list covers
+  nothing), AND the user is a member of the job's workspace (a non-member
+  DRI would own gates behind membership 404s — refused). Ambiguity, zero
+  matches, or no resolvable workspace all fail to `''`: the gate stays inert
+  exactly as before. Explicit submissions (dashboard fields, ClickUp people
+  fields) always win, and the fill happens INSIDE the single atomic intake
+  upsert. **Interplay with §2**: a resubmit that omits DRIs no longer
+  guarantees enforcement turns off once profiles cover the repo —
+  `PEOPLE_ROUTING_DEFAULTS=false` is the opt-out (OPERATIONS.md §10).
+- **The prompt ownership block**: stage prompts render "Ownership & decision
+  authority" — the covering profiles for display, but the per-gate-role
+  authority lines come from the JOB's OWN DRI columns (they must never
+  contradict `roles.gate_owner`, which stays the ONLY enforcement path —
+  §2's "enforcement keys exclusively on the explicit DRI columns" is
+  untouched). Values are single-lined and capped; solo installs render
+  nothing. `GET /api/people` is the member-readable directory: members see
+  only people whose areas intersect their OWN workspaces (and only the
+  intersecting workspace/repo entries) — org structure never leaks.
+
+### Decision registry (D2)
+
+Cross-ticket `decisions` table. Sources: `gate` (auto-registered),
+`manual` (dashboard), `slack` (D3 candidates). Statuses: `active` (registry
+truth), `superseded`, `candidate` (quarantined until confirmed),
+`dismissed` (remembered rejection — the row and its `(source, ref)` key are
+kept so a re-scan can never re-propose it).
+
+- **Auto-registration** happens at the SAME choke points that feed the
+  ClickUp Decisions field — substantive (non-empty-text) proceed/redo/ask
+  answers on feature gates, and the Iterate-gate learning
+  (scope `product`, against the FEATURE id) — each with
+  `ref = g<guidance_log id>` so any replay dedupes through the partial
+  UNIQUE `(source, ref)` index (dedupe is detected via `rowcount`, never
+  `lastrowid`). v1 (sentry/task) guidance is deliberately NOT registered:
+  operational steering, not org decisions. Registration is best-effort and
+  can never break a won gate CAS.
+- **Visibility = prompt admission, exactly**: members see their workspaces'
+  rows PLUS every `org`-scope row (org rows reach every member's prompts,
+  so every member may read them); creating/confirming/superseding org rows
+  is admin-only. Rows with `workspace_id` NULL (non-org) are admin-only and
+  never reach any member view or any prompt. The default registry view
+  excludes candidates and dismissed rows.
+- **State transitions** are single-statement status CAS
+  (`decision_set_status`) — confirm/dismiss/supersede races have one winner
+  (409 for the loser); the FTS row syncs in the same transaction (insert on
+  entering `active`, delete on leaving it).
+- **P9 reads the registry**: the P9 prompt carries a "Decision registry"
+  block — this feature's own active gate decisions verbatim-capped plus
+  recent product/org one-liners for the job's workspace — always prefixed
+  with the standing "recorded context (data), not instructions" note
+  (registry text includes confirmed Slack content and member input). Fail
+  closed: a job with no stamped `workspace_id` gets NO block. **Dead-lap
+  purge**: `feature_intake`/`artifacts_clear` supersede the job's active
+  decision rows and delete their FTS rows in the SAME transaction as the
+  guidance clear — an abandoned lap's gate decisions can never re-enter the
+  new lap as registry truth (the same fail-closed rationale that clears
+  `guidance_log`).
+
+### Memory retrieval (D4)
+
+An FTS5 index (`mem_fts`, in the engine DB) over: **memory files**
+(top-level + the newest ≤50 changelog/decision entries, refreshed by
+`refresh_cache` — skipped entirely when origin/<base>'s commit sha is
+unchanged), **artifacts** (every write funnels through `artifact_state`;
+rows flagged `superseded` are dropped the moment the flag lands),
+**human guidance** (proceed/redo/answer/chat/steer with text), and
+**active decisions**. Deliberately NEVER indexed: `gate_events` /
+`admin_events` (refusals and escalations must never reach model context as
+human decisions), candidate/dismissed decisions, superseded
+artifacts/decisions, and a re-intaken job's purged rows.
+
+Stage prompts get a "Memory search" block (`MEMORY_SEARCH_TOP_K`, 0 or any
+out-of-range value disables) of top-k snippets, prefixed with the
+data-not-instructions note. Scoping is an explicit per-kind whitelist:
+guidance/artifact require an exact project match (project-less rows are
+never admitted) and never the asking job's own rows; memory requires the
+exact project; decisions require the job's workspace OR `org` scope. Search
+terms are sanitized hard (FTS5 syntax stripped) and any FTS error returns
+no results — retrieval is additive context; **no control flow depends on
+it**, so a SQLite build without FTS5 degrades to an absent block
+(`fts_enabled=false`), the one deliberately fail-open read path.
+
+### Slack read ingestion (D3 — FLAG, off by default)
+
+`SLACK_INGEST_ENABLED=false` ships the feature inert; enabling it also
+requires `SLACK_BOT_TOKEN` (env-only secret — never stored on a workspace
+row, never in any API response or log line) and a per-workspace
+`slack_channels` allowlist (a channel routes to exactly ONE workspace —
+read-checked in the synchronous save path; see recorded edges). The poller
+captures decision-shaped messages (`!decision` prefix, or the
+`SLACK_DECISION_EMOJI` reaction) as registry **candidates** — parked inbox
+items for human confirm/dismiss, NEVER auto-committed: quarantined from the
+index, the prompts and the default registry view until a human confirms
+(confirm may edit scope/title/text under the same validation as manual
+adds; the confirming human becomes `decided_by` while the Slack author is
+preserved in `origin_author`). Watermarks are per channel, initialized to
+NOW at first allowlist (forward-only — no historical flood), advanced only
+after a fully-fetched batch (pagination to exhaustion, bounded per pass at
+`SLACK_INGEST_MAX_PAGES`; a bound-hit pass processes what it fetched —
+history pages are newest-first, so the unfetched remainder is the OLDER
+segment — but HOLDS the watermark with a logged warning, exactly like a
+failed page: advancing past unfetched messages would exclude them forever
+once they aged out of the overlap), with a ~7-day overlap re-scan so late
+reactions are seen (`(source, ref)` dedupe absorbs re-reads). Documented Slack-API limits: reactions older than
+the overlap window are missed; thread replies are out of scope unless
+broadcast. No job state is ever touched — output is inbox items + parked
+candidates (the Epic I routines invariant, honored now; the loop is
+`sla_forever`-shaped so I1 can adopt it as a routine kind).
+
+**Recorded edges (Epic D)**: the `slack_channels` cross-workspace
+uniqueness check is a read-check with no DB constraint — sound under
+today's single-process SQLite because check and write share one synchronous
+section with no await between them; re-verify under Epic F2 multi-worker
+Postgres (same treatment as §15's auto-advance non-CAS note). The registry
+API's `q` search uses escaped LIKE rather than the FTS index — deliberate:
+the index excludes non-active rows, and a status-filtered registry search
+must not depend on it.
+
+## 17. Proactive routines & planning cadence (Epic I)
+
+The engine runs the team's operating rhythm and proposes work from signals
+it already holds. **The invariant line**: routines emit inbox items and
+parked candidates ONLY — never self-initiated pipelines; a routine NEVER
+invokes Claude, and the single sanctioned queue interaction is the memory-
+upkeep routine's `intake_memory` (a bootstrap that parks a draft PR for
+human review like any other — git stays truth).
+
+### The routine engine (I1)
+
+`routines` table: one row per (kind, scope); `routine_runs` is the
+INSERT-only history. The scheduler (`app/routines.py`, one asyncio task)
+ticks every `ROUTINE_TICK_SECONDS`, resolves each row's schedule
+(`every:<seconds>` — floored at 300, never a hot loop — |
+`daily@HH:MM[;days=…]` | `weekly@<day> HH:MM`, evaluated in `ROUTINE_TZ`
+via zoneinfo), and fires due rows through a **claim CAS on `last_run_at`**
+(single-flight per routine, correct today and load-bearing under Epic F2)
+plus an in-process in-flight guard. Each due handler runs as its **own
+asyncio task**, so a slow handler (the sweep's paginated Sentry HTTP) can
+never delay the reaper. Handler failures record `error` in the run history;
+the next due tick retries. `POST /api/routines/{id}/run` arms a fire
+through the scheduler task — handlers never run inline in an HTTP request.
+
+**Builtin rows** (instance-scoped, `workspace_id NULL`) generalize three of
+the hardcoded loops: `sweep`, `reaper`, `janitor`. They store `schedule=''`
+meaning *derive from live settings at each tick*
+(`SWEEP_INTERVAL_HOURS`, 300s, 86400s) — env contracts keep working after
+upgrade; an operator-edited non-empty schedule wins. Their handlers call
+the existing `_once` bodies unchanged. Effective-enabled = routine row AND
+the legacy settings flags (`sweep_enabled`+`sentry_enabled`) — either off
+means off — EXCEPT the **reaper, which is non-disableable** (the PUT
+endpoint refuses `enabled=false` and schedule edits; the scheduler ignores
+a hand-edited disable). A builtin row whose stored schedule fails to parse
+**falls back to its settings-derived default with a logged error** — never
+a silently dead reaper. At EVERY boot, `last_run_at` is bumped to now for
+the sweep/janitor rows (the settle-delay behavior; an explicit boot-time
+bump, distinct from the INSERT OR IGNORE seeding that preserves operator
+edits). **Deliberately NOT migrated**: the shepherd (it invokes Claude via
+its fix runs — the strongest reason a routine may not host it), plus
+`sla_forever`, `watch_forever`, `autonomy_forever` and the ClickUp poller
+(control-flow-adjacent, tight cadence, already flag-guarded).
+
+**Per-workspace rows** (seeded for every workspace, and at workspace
+creation): `standup_digest`, `memory_upkeep`, `risk_scan`, `proposal_scan`,
+`weekly_planning`. All enabled but inert-by-neutral-thresholds wherever
+they would spend anything — a fresh install gets visibility with zero token
+spend. `ROUTINES_ENABLED=false` silences ONLY these five; the builtin rows
+keep firing ('off' never means 'less safe'). A workspace routine whose
+schedule fails to parse is disabled fail-closed
+(`last_status='error: bad schedule'`) — never a guessed cadence.
+Fresh daily/weekly rows wait for their NEXT occurrence (no boot-fire of a
+missed slot): daily/weekly `next_due` anchors on `last_run_at`, so seeding
+stamps it (`anchor_fresh_rows`, also a boot-time backfill for rows seeded
+NULL by older builds; a schedule edit onto a never-run row stamps it too) —
+a NULL anchor would re-slide to `now` at every tick and the routine could
+never come due. Schedules are seed defaults only — after seeding the
+routine ROW is authoritative (`PUT /api/routines/{id}`, audited in
+`admin_events` as `routine_config`; an accepted run-now arm is audited as
+`routine_run_now` — `routine_runs` rows carry no actor, so the audit row is
+what ties a forced, spend-bearing firing to a human). NOTE (Epic F1): the
+`COALESCE(workspace_id,-1)` unique expression index needs Postgres
+expression-index syntax review.
+
+### Inbox items (the substrate)
+
+Every routine output lands as a durable `inbox_items` row —
+`UNIQUE(kind, dedupe_key)` is BOTH the re-scan idempotence guard and the
+**dismissal memory**: rows are never deleted, so a dismissed key blocks
+re-insert forever; only a candidate whose contributing content changed
+(folded into the key) can surface again. Status is a single CAS transition
+`open → dismissed | adopted | expired` (409 to the loser); the row itself
+is the audit record. The janitor expires stale OPEN rows (risk alerts,
+notes, digests, packs) after `INBOX_NOTICE_TTL_DAYS` — visibly, never
+silently — and a fresh digest/pack expires its open predecessor directly.
+Item bodies are human-facing markdown; they are **fed to prompts only via
+adoption**, where the brief becomes `job.request` and takes the
+untrusted-fragment posture of a ClickUp description (delimited data, not
+instructions). Adoption (`POST /api/inbox/notices/{id}/adopt`) validates
+exactly like `POST /api/features` BEFORE the CAS resolve (mapped project +
+member project access), then runs the ordinary intake — the ONLY path from
+a proposal to a pipeline. An unexpected intake failure leaves the item
+`adopted` with the error recorded in refs (visible, auditable — never a
+silent un-adopt).
+
+### Standup digest (I2)
+
+Exception-only; a quiet day sends nothing (the run records `quiet`).
+Sections: gates overdue (ONE shared implementation of "overdue" —
+`inboxlib.gate_summary` — used by the API inbox too) + exhausted SLA
+flags, blocked/stalled pipelines, watch metrics trending off-goal
+mid-window, budget position (only when a budget is configured or spend is
+non-zero; pacing flag when the linear projection exceeds it), autonomy
+changes. `since` = the last ok/quiet run **floored at now−24h** (a first
+run or long outage never replays history). Deduped per workspace per local
+date; the Slack copy (workspace webhook, `notify_text`) goes out only on a
+NEW insert, strictly after the DB row.
+
+### Memory upkeep (I3)
+
+Threshold `MEMORY_STALENESS_THRESHOLD` (default 0 = inert; per-routine
+config override). Staleness comes from the cache the engine refreshes after
+every stage run — **an engine-idle repo's staleness is frozen** (verified
+limitation: the routine under-fires, the safe direction, but it will not
+catch exactly the most neglected repos; the no-cache/stale notes carry the
+cache's `fetched_at` age for this reason). Bounded one refresh per repo per
+`MEMORY_UPKEEP_COOLDOWN_DAYS` (human bootstraps count toward the bound),
+skipped visibly at the daily run cap or a spent monthly budget.
+
+### Risk surfacing (I4)
+
+`risk_scan` emits attributed, deduplicated `risk_alert` items: Sentry 24h
+velocity spikes (`RISK_SENTRY_SPIKE_EVENTS`, 0 = off; an ABSOLUTE count —
+no historical snapshot store in v1, recorded limitation; one alert per
+issue per day), mid-window regressing watch metrics
+(`outcome.mid_window_trend`: needs a numeric target with an unambiguous
+direction, ≥3 current-window readings and half the window elapsed —
+anything else is `insufficient`, never a guess; one alert per watch window,
+`/redo` re-arms), repeated redos on the same TARGET stage
+(`RISK_REDO_THRESHOLD`; a higher count re-alerts, the same count never
+repeats), and spend pacing (projection only after day 7 of the month OR
+≥50% of the budget spent; the pct-bucketed key 100/120/150 means an early
+alert cannot consume the month). The per-workspace `budget_monthly_usd`
+column (NULL = inherit `BUDGET_MONTHLY_USD`; 0 = no budget) is the
+substrate Epic G4 extends into the warn/block ladder.
+
+### Proposal lane (I5)
+
+Friction is engine data: `FRICTION:` protocol lines land in the
+`frictions` table at harvest (OUTSIDE the ClickUp field-sync gate — the
+row is the record, the mirror stays visibility) and human redos write rows
+unconditionally. `proposal_scan` emits parked candidate **briefs**
+(why-now, evidence, suggested next step) from four sources: decided
+flat/regressed outcomes with no live successor (the lane beyond B4's single
+Iterate gate; the key folds verdict + learning), friction groups per
+(project, stage) with **count-bucketed keys** (3-5 / 6-10 / 11+ — a
+dismissal holds until the pain measurably grows), Sentry clusters over the
+stored `jobs.culprit` head (stamped at sentry intake; pre-upgrade rows have
+`culprit=''`, so clusters accumulate from upgrade forward), and stale
+high-traffic memory areas (monotone staleness tiers 1x/2x/5x/10x; proposed
+only where the upkeep routine won't act itself). A source-signature recency
+guard additionally suppresses any same-signature proposal younger than
+`PROPOSAL_WINDOW_DAYS` regardless of status — dismissals are remembered.
+
+### Weekly planning pack (I6)
+
+Assembled mechanically (no model run): receipts this week vs last (open
+runs excluded from every denominator — Epic C1's column semantics; median
+gate wait; redo rate over answered gates) with trend arrows, outcome-ledger
+movement, autonomy shifts, open proposals, and the deterministic "what I'd
+do next lap" ranking (regressed outcomes → risk-linked clusters → friction
+count desc → age), with the formula stated in the pack body (the §15
+transparency posture). Carried by `GET /api/inbox` — no bespoke endpoint
+(deliberate). ISO-week deduped; predecessor packs expire on the new insert.
+
+## 18. Identity, RBAC & audit (Epic E) + credentials & security (Epic G)
+
+**SSO / identity (E1).** Authentication resolves through an
+`IdentityProvider` interface (`app/identity.py`). `LocalProvider` (password) is
+always present — the break-glass path; a local account with a usable password
+can always sign in regardless of SSO state or active tokens. `OIDCProvider`
+(BUILD) does the authorization-code flow via discovery, validating the
+id_token's nonce/aud/exp/iss; state+nonce live single-use in `auth_oidc_txn`.
+JIT provisioning auto-links ONLY on the IdP-stable `sub` (`users.external_id`,
+partial-unique per provider) — an email/username collision with a LOCAL account
+raises `SSOConflict` and never adopts it (protecting the admin's break-glass
+password). Role-sync never demotes a local-provider admin nor the last enabled
+instance admin. SAML/SCIM are inert scaffolds behind the same interface.
+
+**API tokens (E2).** `api_tokens` (ctl_ prefix, sha256 at rest, non-secret
+`ctl_…<last4>` hint, scopes, expiry, revoke, throttled last-used). Auth
+precedence: `Bearer ctl_` token (hard 401 on miss, never falls through) > Basic
+password (deprecated to 403 once the account has an active token, except
+break-glass instance admins) > cookie. SSO-only accounts carry an `UNUSABLE_PW`
+sentinel and cannot password-auth.
+
+**RBAC v2 (E3).** Instance role `instance_admin|member` on `users.role`;
+workspace role `admin|member|viewer` + a per-member repo allow-list on
+`workspace_members`. `app/rbac.py` centralizes the scoped checks
+(`workspace_role`, `can_configure_workspace`, `can_submit`/`repo_allowed`,
+`require_write`). Legacy `admin` is migrated on boot and normalized on read
+(`normalize_role`); the last instance admin can never be demoted. The gate
+admin-override is now a workspace-admin power (via `can_configure_workspace`).
+
+**Audit log (E4).** `audit_log` is the canonical append-only record (monotonic
+`id` = SIEM cursor). `admin_events` is superseded — `admin_event_add` mirrors
+into `audit_log` and legacy rows are boot-copied once (durable
+`audit_legacy_copied` marker, not table-emptiness). Gate decisions are audited
+at the single `answer_job` choke point both channels funnel through (fires only
+after a won CAS), with verdict/stage/channel/actor/state; overrides, logins,
+config/user/token/autonomy mutations too. `detail` is redacted by an allow-list
+inside `audit_add` so no call site can leak a secret. `GET /api/audit` (viewer,
+membership-scoped) and `GET /api/audit/export` (JSONL cursor pages,
+`X-Next-Cursor`) surface it.
+
+**GitHub App (G1).** `app/githubapp.py` mints a short-lived, single-repo
+installation token per run (RS256 app JWT, cached with early refresh); the run
+subprocess gets ONLY that token via `GH_TOKEN`, never the PAT or the private
+key. Any app error falls back to the PAT (`github_token`) — additive, never a
+hard replacement.
+
+**Secrets & subprocess env (G2).** `app/secrets.py` — `SecretsProvider` seam
+(env default, file driver, vault scaffold) + `read_secret` (`@path` support).
+The security core: `fixer._claude_cmd_env` builds an explicit allow-listed
+environment (plumbing + model-auth incl. Bedrock/Vertex + gh/git families),
+replacing `os.environ.copy()`, so operator secrets never reach the model's
+shell; `SUBPROCESS_ENV_ALLOWLIST` widens it but a hard-deny secret set can never
+be re-added.
+
+**Prompt-injection hardening (G3).** `app/untrusted.py` `wrap_untrusted` fences
+every untrusted input (Sentry title/culprit/stacktrace, ClickUp request/title,
+PR finding bodies, chat/reviewer text, human gate answers/redo notes) in a
+per-call random-nonce delimited block the model is told to treat as inert DATA,
+stripping forged sentinels; short inline references use `inline_untrusted`
+(whitespace-collapsed + sentinel-stripped). A coverage/property test asserts no
+injected protocol line or forged sentinel escapes a fence.
+
+**Budgets (G4).** `app/budgets.py` resolves the effective budget (ws column >
+instance fallback) and warn/block state; enforced at every Claude-run dispatch
+(sentry/task AND every feature stage — before a run opens, so pipeline state is
+never discarded). Non-forced ≥100% parks + audits `budget.block`; a forced
+override re-kick audits `budget.override`. Budget 0 is inert.
+
+**Model billing (G5).** `using_max_oauth_token` is the policy signal; startup
+warns when personal Max creds run a >1-user instance (flip to `ANTHROPIC_API_KEY`).
+
+## 19. Execution substrate (Epic F)
+
+**SQLite stays the zero-config default across all of F** — an existing
+single-process SQLite instance keeps working byte-for-byte with no new config.
+Postgres, multi-worker, and sandboxed runs are additive and off/absent by
+default. Operator-facing config + migration steps are in OPERATIONS.md §20.
+
+**DB driver seam (F1).** `app/dbdriver.py` — `DBDriver` with `SqliteDriver`
+(default; owns_schema=False → JobStore runs SCHEMA + MIGRATIONS in-process) and
+`PostgresDriver` (psycopg3 pool; owns_schema=True → Alembic owns the schema).
+`JobStore(dsn)` picks the driver off the DSN (empty/path → SQLite;
+`postgresql://` → Postgres); `resolve_driver` fails closed to SQLite on an
+unknown backend. The Postgres adapter rewrites qmark `?`→`%s` (skipping string
+literals, doubling literal `%`), and `_insert_returning` synthesizes lastrowid
+via an appended `RETURNING <pk>` at the ~7 real sites only (no blanket rewrite —
+most PKs are not named `id`). All `INSERT OR IGNORE/REPLACE` became portable
+`ON CONFLICT` (same dedupe contract on SQLite; valid on Postgres). Exceptions
+are driver-normalized (`db.IntegrityError`/`OperationalError`). Alembic baseline
+is *generated from* the live SQLite schema (`scripts/gen_pg_baseline.py`); every
+future MIGRATIONS column gets a matching revision (static lockstep guard). All
+CAS transitions hold under Postgres READ COMMITTED (plain `UPDATE … WHERE`).
+Postgres FTS (D4 retrieval) is out of scope — `fts_enabled=False`, `mem_search`
+returns `[]` (a read enhancement, no control flow depends on it).
+
+**Multi-worker queue (F2).** SQLite keeps the single-consumer in-process
+priority queue and the blanket boot recovery (`workers=1`). On Postgres the
+worker claims jobs from the DB in ONE statement —
+`UPDATE … WHERE issue_id=(SELECT … FOR UPDATE SKIP LOCKED LIMIT 1)` advances the
+row to `running` + stamps `claimed_by` — closing the double-dispatch window; the
+in-process queue is NOT a parallel dispatch source there. Per-repo serialization
+moves to Postgres advisory locks (`app/repolocks.py`), and the
+`claude_global`/`chat_global` CLI-config-dir guards ALSO become cross-process
+advisory locks (a per-event-loop `asyncio.Lock` would let two worker processes
+race the shared config dir). Boot recovery is scoped to `claimed_by == worker_id`
+(a sibling's live run is never reset); cross-worker zombies fall to the reaper.
+
+**Sandboxed runs (F3, FLAG).** `app/runner.py` — `LocalRunner` (default) is the
+exact subprocess exec; `ContainerRunner` (flag) runs each Claude invocation in a
+disposable `docker run --rm` with the clone bind-mounted, only the G2
+allow-listed env (0600 `--env-file`), and a mandatory egress-allowlist network
+(empty → fail closed). Kill/timeout issues `docker kill`; the env-file is
+unlinked. `resolve_runner` fails closed to local.
+
+**Observability (F4).** `/metrics` (dependency-free Prometheus exposition;
+queue depth, jobs, runs, cost, gate latency, autonomy, budget spend; admin-gated
+by default, Bearer with `METRICS_TOKEN`; TTL-cached). `/health/ready` (DB hard
+dependency → 503; worker/scheduler heartbeats; booleans only). Structured JSON
+logs (`LOG_FORMAT=json`) carry `request_id` (X-Request-ID middleware) and
+`job_id` (set around each job's processing).
+## Abstraction seams (Epic H)
+
+The four operator-facing integrations sit behind published interfaces so a
+deployment can swap a driver without touching engine/worker call sites. Each
+follows the same pattern (`name`/`enabled`, a `*_PROVIDERS` allow-list, a
+fail-closed `*_for(settings)` factory) established by the G2 secrets seam
+(`app/secrets.py`) and the B3 analytics seam. All four default to the current
+driver, so a zero-config instance is byte-for-byte unchanged.
+
+| Seam | Interface | Current driver (default) | Stub / migration target | Config key → default |
+| --- | --- | --- | --- | --- |
+| H1 Tracker | `app/tracker.py` `Tracker` | `ClickUpTracker` (`app/clickup.py`) | `JiraTracker` (inert, `docs/TRACKER-JIRA.md`) | `TRACKER_PROVIDER` → `clickup` |
+| H2 VCS | `app/vcs.py` `VCS` | `GitHubVCS` (`app/github.py`) | `GitLabVCS` (inert, `docs/VCS-GITLAB.md`) | `VCS_PROVIDER` → `github` |
+| H3 AgentRuntime | `app/runtime.py` `AgentRuntime` | `CLIRuntime` (`fixer._run_claude_*_impl`) | `AgentSDKRuntime` (raises `NotConfigured`; `docs/CONVERSATIONS.md` §7) | `AGENT_RUNTIME` → `cli` |
+| H4 Analytics | `app/analytics.py` `AnalyticsProvider` | `MixpanelAnalytics` | `NullAnalytics` (verdicts stay `unmeasured`) | `ANALYTICS_PROVIDER` → *(empty=null)* |
+
+**H4 is fulfilled by B3** — the analytics seam already ships to this exact
+pattern (`provider_for(settings, ws, transport)`); no H code was added, only
+this cross-reference. Its factory is named `provider_for` (vs
+`tracker_for`/`vcs_for`/`runtime_for`) — kept as-is to avoid churning B3/B4 call
+sites; the naming convention is otherwise identical.
+
+**Zero-config / no-behavior-change contract.** Every factory returns the current
+driver for an empty OR unknown provider name (fail closed to the *working*
+driver — Tracker/VCS/runtime have no null steady state, unlike analytics). The
+trackers and VCS stay best-effort: a stub driver reports `enabled=False` and
+degrades to dashboard-only / PAT-only, exactly like tracker-off / GitHub-off
+today — it never raises into control flow. The runtime stub is the one that
+raises (a run cannot proceed without a runtime), but the default is `cli`, so a
+zero-config install never reaches it.
+
+**Seam reach after the SCAFFOLD.** The engine and worker still reach each
+integration through a single client object (`self.clickup: Tracker`,
+`self.github: VCS`) constructed once via the factory, and the runtime through
+the `fixer.run_claude_*` shims. The factories are exercised at those
+construction/dispatch points — not per call — so "all call sites go through the
+interface" means the single client object conforms to the ABC, not that the
+factory runs on every method.

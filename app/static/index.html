@@ -12,7 +12,7 @@
   <div class="brand" onclick="goHome()" title="Dashboard">
     <span class="logo">cl</span>
     <span class="brand-name">CtrlLoop</span>
-    <span class="brand-sub">the Gumo Engine</span>
+    <span class="brand-sub">the {{product_name}} Engine</span>
   </div>
   <div class="topbar-meta">
     <select class="ws-switch" id="ws-switch" onchange="setWorkspace(this.value)" title="Workspace"></select>
@@ -41,7 +41,7 @@
       <div class="filters">
         <button class="fchip on" data-f="all" onclick="setFilter('all')">All</button>
         <button class="fchip" data-f="active" onclick="setFilter('active')">Active</button>
-        <button class="fchip" data-f="await" onclick="setFilter('await')">Awaiting you</button>
+        <button class="fchip" data-f="await" onclick="setFilter('await')">Awaiting you <span class="fbadge" id="await-badge" style="display:none"></span></button>
       </div>
     </div>
     <div id="inbox-list"><div class="empty">loading&hellip;</div></div>
@@ -55,7 +55,7 @@
         <div class="panel">
           <h2>Fix a Sentry issue</h2>
           <form onsubmit="return trigger(event)">
-            <input id="ref" placeholder="Sentry issue id, short id (GUMO-1A) or URL" required>
+            <input id="ref" placeholder="Sentry issue id, short id (PROJ-1A) or URL" required>
             <button id="go">Fix it</button>
           </form>
         </div>
@@ -79,7 +79,11 @@
             <div class="hint">&hellip;or describe the feature and a ClickUp ticket is created:</div>
             <input id="feat-title" placeholder="Title">
             <textarea id="feat-summary" placeholder="What should be built? Goal, users, constraints, links&hellip;"></textarea>
-            <input id="feat-owner" placeholder="Owner — ClickUp user id (optional, gets gate notifications)">
+            <input id="feat-metric" placeholder="Success metric — what should move (optional)">
+            <input id="feat-target" placeholder="Target value (optional, e.g. '>= 15%' or 'under 300ms')">
+            <input id="feat-window" placeholder="Measurement window, days (default 14)">
+            <input id="feat-founder-dri" placeholder="Founder DRI — ClickUp user id or CtrlLoop username (owns P0/P1/P9 gates)">
+            <input id="feat-dev-dri" placeholder="Dev DRI — ClickUp user id or CtrlLoop username (owns P2–P8 gates)">
             <select id="feat-gatemode">
               <option value="full" selected>full &mdash; pause at every stage (default)</option>
               <option value="light">light &mdash; pause at P0/P1/P3/P9 + questions</option>
@@ -93,6 +97,22 @@
       <details class="brain">
         <summary>Product brain <span class="hint" style="display:inline">&mdash; per-repo memory freshness</span></summary>
         <div id="brain-body"><div class="empty">loading&hellip;</div></div>
+      </details>
+      <details class="brain" id="outcomes-panel" style="margin-top:14px">
+        <summary>Outcomes <span class="hint" style="display:inline">&mdash; measured verdicts per shipped feature</span></summary>
+        <div id="outcomes-body"><div class="empty">loading&hellip;</div></div>
+      </details>
+      <details class="brain" id="decisions-panel" style="margin-top:14px">
+        <summary>Decisions <span class="hint" style="display:inline">&mdash; the cross-ticket decision registry</span></summary>
+        <div id="decisions-body"><div class="empty">loading&hellip;</div></div>
+      </details>
+      <details class="brain" id="autonomy-panel" style="margin-top:14px">
+        <summary>Autonomy <span class="hint" style="display:inline">&mdash; earned trust per stage &times; repo, pins &amp; clawback</span></summary>
+        <div id="autonomy-body"><div class="empty">loading&hellip;</div></div>
+      </details>
+      <details class="brain" id="routines-panel" style="margin-top:14px">
+        <summary>Routines <span class="hint" style="display:inline">&mdash; the engine's operating rhythm (standup, risk scan, proposals, planning)</span></summary>
+        <div id="routines-body"><div class="empty">loading&hellip;</div></div>
       </details>
       <details class="brain ctx" style="margin-top:14px">
         <summary>Project context <span class="hint" style="display:inline">&mdash; the repos + business context the engine works on</span></summary>
