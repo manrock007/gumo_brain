@@ -972,12 +972,40 @@ class JobStore:
                     (time.time(), r["issue_id"]))
         return recovered
 
-    def release_claim(self, issue_id: str):
+    def release_claim(self, issue_id: str, worker_id: str | None = None):
         """Clear a job's claim (best-effort; used when a claimed job finishes or
-        is handed back so a later reaper/recovery doesn't treat it as owned)."""
+        is handed back so a later reaper/recovery doesn't treat it as owned).
+
+        Epic F2: when worker_id is given, the clear is guarded by
+        ``AND claimed_by = worker_id`` (like recover_worker_claims). This matters
+        when a re-queue-DURING-run path (Epic C2 auto-advance / P6 auto-skip /
+        transient-retry) flips the row to a claimable 'queued' state while this
+        worker is still finishing its post-run I/O: a sibling can legitimately
+        claim the row in that window, and an UNGUARDED release would then wipe
+        the SIBLING's ownership (claimed_by=''), defeating its fast per-worker
+        boot recovery. The guard makes release a no-op once someone else owns it.
+        worker_id=None keeps the unconditional clear the reaper needs to drop a
+        DEAD worker's claim (that claim is by definition not ours)."""
         with self._conn() as c:
-            c.execute("UPDATE jobs SET claimed_by='', claimed_at=NULL WHERE issue_id=?",
-                      (issue_id,))
+            if worker_id is None:
+                c.execute(
+                    "UPDATE jobs SET claimed_by='', claimed_at=NULL WHERE issue_id=?",
+                    (issue_id,))
+            else:
+                c.execute(
+                    "UPDATE jobs SET claimed_by='', claimed_at=NULL "
+                    "WHERE issue_id=? AND claimed_by=?",
+                    (issue_id, worker_id))
+
+    def queued_count(self) -> int:
+        """Claimable backlog depth (received/queued). The /health gauge reads
+        this on multi-worker, where the in-process queue is bypassed and its
+        qsize() would report 0 — the DB row count is the real backlog."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT COUNT(*) AS n FROM jobs WHERE status IN ('received','queued')"
+            ).fetchone()
+            return row["n"] if row else 0
 
     def stale_running(self, older_than_seconds: float) -> list[dict]:
         cutoff = time.time() - older_than_seconds

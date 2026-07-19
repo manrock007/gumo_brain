@@ -24,6 +24,7 @@ from . import analytics, audit, autonomy, budgets, logconfig, outcome, people, r
 from .clickup import ClickUp  # noqa: F401 — re-exported for tests/back-compat
 from .tracker import tracker_for
 from .config import ENGINE_NAME, Settings
+from . import db
 from .db import JobStore
 from .engine import ENGINE_COMMENT_PREFIXES, GATE_PREFIX, Engine, RepoLocks
 from .fixer import (
@@ -146,6 +147,13 @@ class Worker:
         self._bg_tasks: set = set()
 
     def _enqueue(self, job_id: str, priority: int):
+        # Epic F2 multi-worker: dispatch is DB-authoritative (claim_next_job);
+        # _next_job never drains this in-process PriorityQueue on that path, so
+        # every push here would be an orphan — an unbounded, ever-growing leak
+        # for the process lifetime (and a meaningless /health backlog gauge). The
+        # 'queued'/'received' DB row IS the work item; skip the push entirely.
+        if self.settings.multi_worker:
+            return
         self.queue.put_nowait((priority, next(self._seq), job_id, time.time()))
 
     def _priority_for(self, job: dict) -> int:
@@ -399,7 +407,11 @@ class Worker:
                 )
             finally:
                 if self.settings.multi_worker:
-                    self.store.release_claim(job_id)  # done: drop ownership
+                    # guard on worker_id: a re-queue-during-run path (C2
+                    # auto-advance / P6 skip / transient retry) may have already
+                    # handed this row to a sibling that re-claimed it while we
+                    # finished post-run I/O — never wipe the sibling's ownership.
+                    self.store.release_claim(job_id, self.worker_id)  # drop OUR claim
 
     async def _recover_interrupted(self):
         """Boot-time crash recovery: at startup NO run this worker owns can
@@ -1193,29 +1205,42 @@ class Worker:
         days = job.get("metric_window_days") or self.settings.metric_window_days_default
         days = max(1, min(365, int(days)))
         now = time.time()
-        self.store.watch_insert(
-            watch_id,
-            title=f"watch: {job.get('title') or job_id}"[:300],
-            project=job.get("project") or "",
-            workspace_id=job.get("workspace_id"),
-            related_jobs=job_id,
-            success_metric=metric,
-            metric_target=(job.get("metric_target") or "").strip(),
-            metric_event=event,
-            metric_window_days=days,
-            watch_started_at=now,
-            watch_deadline=now + days * 86400,
-            # founder-owned Iterate gate: BOTH DRI columns are copied so
-            # roles.gate_owner enforces it exactly like feature gates
-            # (founder slot wins, dev is the fallback owner; legacy `owner`
-            # stays display/assignment only)
-            owner=(job.get("founder_dri") or "").strip() or (job.get("owner") or "").strip(),
-            founder_dri=(job.get("founder_dri") or "").strip(),
-            dev_dri=(job.get("dev_dri") or "").strip(),
-            clickup_task_id=task_id,
-            clickup_task_url=job.get("clickup_task_url") or "",
-            cu_list_id=job.get("cu_list_id") or "",
-        )
+        try:
+            self.store.watch_insert(
+                watch_id,
+                title=f"watch: {job.get('title') or job_id}"[:300],
+                project=job.get("project") or "",
+                workspace_id=job.get("workspace_id"),
+                related_jobs=job_id,
+                success_metric=metric,
+                metric_target=(job.get("metric_target") or "").strip(),
+                metric_event=event,
+                metric_window_days=days,
+                watch_started_at=now,
+                watch_deadline=now + days * 86400,
+                # founder-owned Iterate gate: BOTH DRI columns are copied so
+                # roles.gate_owner enforces it exactly like feature gates
+                # (founder slot wins, dev is the fallback owner; legacy `owner`
+                # stays display/assignment only)
+                owner=(job.get("founder_dri") or "").strip() or (job.get("owner") or "").strip(),
+                founder_dri=(job.get("founder_dri") or "").strip(),
+                dev_dri=(job.get("dev_dri") or "").strip(),
+                clickup_task_id=task_id,
+                clickup_task_url=job.get("clickup_task_url") or "",
+                cu_list_id=job.get("cu_list_id") or "",
+            )
+        except db.IntegrityError:
+            # Epic F2 multi-worker: get(watch_id)==None above, then a concurrent
+            # process inserted the same watch-<id> row before we did — the two
+            # shepherds racing each other, or a shepherd racing the P9-approval
+            # spawn path (worker.py answer_job). The row lands exactly ONCE; this
+            # is the idempotent no-op this method promises, NOT an error. Swallow
+            # so the loser never 500s an already-committed P9 gate (whose CAS,
+            # guidance, decision and ClickUp side effects all succeeded) — the
+            # winner posts the watch-started comment.
+            log.info("watch %s already spawned by a concurrent worker — skipping",
+                     watch_id)
+            return
         # deliberately NO clickup.set_status here: the shepherd just slid the
         # Stage field to Complete — the ticket status flips only at park/close
         await self.clickup.comment(
@@ -2098,10 +2123,29 @@ class Worker:
                 self.store.pr_set(pr["url"], last_checked=time.time())
 
     async def _shepherd_pr(self, pr: dict):
-        gh = self.engine.github
         repo, number, url = pr["repo"], pr["number"], pr["url"]
         if not repo or not number:
             return
+        # Epic F2 multi-worker: shepherd_forever runs in EVERY worker process
+        # (main.lifespan starts it unconditionally) and PRs carry no dispatch
+        # claim, so without this two processes would each run a full paid Claude
+        # fix on the SAME finding, post duplicate thread replies, and fire two
+        # '@sentry review' triggers per real round — a double-spend + a violation
+        # of the single-writer invariant on pr state/review_rounds. Serialize per
+        # PR across processes (a cross-process advisory lock on Postgres, an
+        # in-process asyncio lock on SQLite) and RE-READ the row inside the lock:
+        # a worker that blocked here while a sibling drove the whole round then
+        # sees the fresh state + the sibling's replies (unreplied collapses to
+        # empty) instead of acting on the snapshot it read before blocking.
+        async with self.locks.for_repo(f"shepherd-pr:{url}"):
+            fresh = self.store.pr_get(url)
+            if fresh is None:
+                return
+            await self._shepherd_pr_locked(fresh)
+
+    async def _shepherd_pr_locked(self, pr: dict):
+        gh = self.engine.github
+        repo, number, url = pr["repo"], pr["number"], pr["url"]
         info = await gh.get_pr(repo, number)
         if info is None:
             return  # unknown, never 'closed' — try again next pass

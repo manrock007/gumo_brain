@@ -184,7 +184,13 @@ async def _request_id_mw(request: Request, call_next):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "queued": app.state.worker.queue.qsize()}
+    # multi-worker: the in-process queue is bypassed (DB claim is authoritative),
+    # so qsize() is a meaningless 0 — report the real claimable backlog from the
+    # DB instead. Single-worker: the in-process queue IS the backlog.
+    worker = app.state.worker
+    depth = (app.state.store.queued_count()
+             if worker.settings.multi_worker else worker.queue.qsize())
+    return {"status": "ok", "queued": depth}
 
 
 @app.get("/health/ready")
@@ -875,6 +881,24 @@ def _require_project_access(project: str, user: dict):
                    "(viewer) or this repo is not in your allow-list")
 
 
+def _require_workspace_write(workspace_id, user: dict):
+    """RBAC v2 (Epic E3): a mutating action on a workspace-scoped resource
+    requires a WRITE role (admin/member) in that workspace — a viewer is
+    read-only. Instance/workspace admins pass. Epic D/I write endpoints
+    (decisions, inbox dismiss) gate only on membership (user_can_access =
+    visibility); this adds the write-authority check the pipeline surface gets
+    via can_submit, so a viewer can neither inject product memory into pipeline
+    prompts, ratify untrusted Slack candidates, nor permanently suppress
+    proposals. workspace_id None (instance-wide) is left to the endpoint's own
+    admin gate — a non-admin never resolves such a row (user_can_access -> False)."""
+    if workspace_id is None:
+        return
+    if rbac.is_read_only(rbac.workspace_role(app.state.store, user, workspace_id)):
+        raise HTTPException(
+            status_code=403,
+            detail="write access required — this workspace role is read-only (viewer)")
+
+
 @app.get("/api/workspaces")
 async def workspaces_list(user: dict = Depends(require_user)):
     svc = _ws_svc()
@@ -1094,7 +1118,11 @@ async def notice_dismiss(item_id: int, body: NoticeDismissBody,
     """Dismiss a notice. The row is KEPT (dismissal memory): its dedupe key
     blocks any unchanged re-proposal forever. CAS — 409 to the loser."""
     store: JobStore = app.state.store
-    _notice_scoped(item_id, user)
+    item = _notice_scoped(item_id, user)
+    # RBAC v2: dismissal is an irreversible workspace-wide mutation (its dedupe
+    # key blocks any unchanged re-proposal forever). A viewer is read-only —
+    # matching the sibling adopt endpoint, which blocks viewers via can_submit.
+    _require_workspace_write(item.get("workspace_id"), user)
     extra = {"dismiss_reason": body.reason.strip()[:500]} if body.reason.strip() else None
     if not store.inbox_item_resolve(item_id, "dismissed",
                                     f"dashboard:{user['username']}", extra):
@@ -1296,6 +1324,9 @@ async def decisions_create(body: DecisionCreateBody,
         raise HTTPException(status_code=400,
                             detail="provide a workspace_id or project "
                                    "(only org-scope decisions may omit both)")
+    # RBAC v2: a viewer may see the workspace (user_can_access) but not write
+    # product memory into it (org-scope is already admin-gated above).
+    _require_workspace_write(ws_id, user)
     did = store.decision_add(
         "manual", body.text.strip(), scope=body.scope,
         title=(body.title or "").strip(), project=(body.project or "").strip(),
@@ -1336,6 +1367,7 @@ async def decisions_patch(decision_id: int, body: DecisionPatchBody,
     if row.get("scope") == "org" and user.get("role") not in ("admin", "instance_admin"):
         raise HTTPException(status_code=403,
                             detail="org-scope decisions are admin-only")
+    _require_workspace_write(row.get("workspace_id"), user)
     action = body.action.strip().lower()
     if action == "supersede":
         ok = store.decision_set_status(decision_id, ["active"], "superseded",
@@ -1366,6 +1398,10 @@ async def decisions_confirm(decision_id: int, body: DecisionConfirmBody,
     row = _decision_scoped(decision_id, user)
     if row.get("status") != "candidate":
         raise HTTPException(status_code=409, detail="not a candidate")
+    # RBAC v2: confirmation is the human-ratification step that admits an
+    # untrusted Slack candidate into the injected registry — a viewer must not
+    # satisfy it (org-scope stays admin-only via _validate_decision_fields).
+    _require_workspace_write(row.get("workspace_id"), user)
     _validate_decision_fields(body.scope, body.text, body.title, None, user)
     edits = {}
     if body.scope is not None:
@@ -1394,6 +1430,10 @@ async def decisions_dismiss(decision_id: int, user: dict = Depends(require_user)
     row = _decision_scoped(decision_id, user)
     if row.get("status") != "candidate":
         raise HTTPException(status_code=409, detail="not a candidate")
+    if row.get("scope") == "org" and user.get("role") not in ("admin", "instance_admin"):
+        raise HTTPException(status_code=403,
+                            detail="org-scope decisions are admin-only")
+    _require_workspace_write(row.get("workspace_id"), user)
     ok = store.decision_set_status(decision_id, ["candidate"], "dismissed",
                                    f"dashboard:{user['username']}")
     if not ok:
