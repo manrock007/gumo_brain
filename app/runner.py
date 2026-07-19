@@ -22,6 +22,7 @@ fixer's raw + streaming runners are unchanged apart from the spawn indirection.
 import asyncio
 import logging
 import os
+import subprocess
 import tempfile
 import uuid
 
@@ -98,10 +99,15 @@ class _ContainerProcess:
             self._proc.kill()
         except ProcessLookupError:
             pass
+        # Schedule the async container kill on the RUNNING loop (get_event_loop()
+        # raises on 3.12 when no loop is current, silently leaking the container).
+        # If kill() is called off the loop (sync caller / loop already stopped),
+        # get_running_loop() raises — fall back to a BLOCKING docker kill so the
+        # container is still reaped rather than leaked (the method's whole promise).
         try:
-            asyncio.get_event_loop().create_task(self._docker_kill())
+            asyncio.get_running_loop().create_task(self._docker_kill())
         except RuntimeError:
-            pass
+            self._docker_kill_sync()
         self._unlink_env()
 
     async def _docker_kill(self):
@@ -113,6 +119,16 @@ class _ContainerProcess:
             await p.wait()
         except Exception:
             log.warning("docker kill %s failed", self._name)
+
+    def _docker_kill_sync(self):
+        """Blocking container kill for the no-running-loop path — cleanup must
+        happen even when kill() is invoked outside the event loop."""
+        try:
+            subprocess.run([self._docker, "kill", self._name],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=15, check=False)
+        except Exception:
+            log.warning("docker kill %s failed (sync)", self._name)
 
     def _unlink_env(self):
         if self._cleaned:

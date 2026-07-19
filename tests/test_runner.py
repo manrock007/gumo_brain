@@ -118,3 +118,29 @@ def test_container_kill_issues_docker_kill(monkeypatch, tmp_path):
     assert "client-kill" in calls
     assert killed.get("name") == "ctl-run-xyz"
     assert not envf.exists()  # env-file unlinked
+
+
+def test_container_kill_falls_back_to_sync_off_loop(tmp_path):
+    """kill() called with NO running loop (sync caller / loop stopped) must still
+    reap the container via the blocking path — get_running_loop() raises there,
+    and a silent pass would leak the container (Seer 1603282)."""
+    from app import runner as runner_mod
+
+    class _FakeProc:
+        returncode = None
+        stdout = None
+        stderr = None
+
+        def kill(self):
+            pass
+
+    envf = tmp_path / "envf"
+    envf.write_text("A=1")
+    cp = runner_mod._ContainerProcess(_FakeProc(), "ctl-run-off", str(envf), "docker")
+    reaped = {}
+    cp._docker_kill_sync = lambda: reaped.setdefault("name", cp._name)
+
+    cp.kill()  # no running loop here — must take the sync fallback
+
+    assert reaped.get("name") == "ctl-run-off"
+    assert not envf.exists()
