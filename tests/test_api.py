@@ -362,6 +362,21 @@ def test_login_flow_and_roles(client):
     client.post("/api/logout")
 
 
+def test_unauthenticated_401_has_no_basic_challenge(client):
+    """A protected route with no credential 401s WITHOUT `WWW-Authenticate: Basic`
+    — that challenge makes browsers pop the native Basic dialog, whose cached
+    header then out-ranks the cookie and defeats login/logout. Basic auth still
+    works when a client sends it explicitly.
+
+    Uses the `client` fixture directly (it carries no cookie, and its lifespan
+    already bootstrapped the store) — same pattern as test_auth_required."""
+    r = client.get("/api/jobs")  # no cookie, no auth header
+    assert r.status_code == 401
+    assert "www-authenticate" not in {k.lower() for k in r.headers}
+    # explicit Basic still authenticates (automation path unbroken)
+    assert client.get("/api/jobs", headers=AUTH).status_code == 200
+
+
 def test_bad_basic_never_falls_back_to_cookie(client):
     """An explicit Authorization header that fails must fail the request —
     not silently downgrade to whatever session cookie is in the jar — and a

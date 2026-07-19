@@ -290,10 +290,15 @@ def require_user(request: Request) -> dict:
                             detail="no users configured — set CTRLLOOP_ADMIN_PASSWORD and restart")
     user = current_user(request)
     if user is None:
-        # WWW-Authenticate kept so curl -u prompts; the SPA routes API 401s
-        # to the login page itself
-        raise HTTPException(status_code=401, detail="unauthorized",
-                            headers={"WWW-Authenticate": "Basic"})
+        # No `WWW-Authenticate: Basic` challenge on purpose: it makes browsers pop
+        # the NATIVE Basic-auth dialog, and once a user answers it the cached
+        # header authenticates every request AHEAD of the cookie (current_user
+        # precedence) — silently defeating the cookie login/logout flow (and a
+        # reverse proxy that ALSO does Basic auth compounds it). The SPA routes
+        # API 401s to its own login page; automation sends its credential
+        # (ctl_ Bearer token, or `curl -u` Basic preemptively), so neither ever
+        # relied on the challenge.
+        raise HTTPException(status_code=401, detail="unauthorized")
     return user
 
 

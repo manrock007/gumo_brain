@@ -15,7 +15,9 @@ Four job kinds:
 | `memory` | dashboard, per project | bootstrap `.ctrlloop/` product memory → draft PR |
 
 The engine's three core mechanics (full spec: **[docs/ENGINE.md](docs/ENGINE.md)**;
-running an instance — install/backup/upgrade: **[docs/OPERATIONS.md](docs/OPERATIONS.md)**):
+setting one up end to end — SSO/RBAC/Postgres + a test drive:
+**[docs/ADMIN-SETUP.md](docs/ADMIN-SETUP.md)**; the full config reference,
+backup/upgrade: **[docs/OPERATIONS.md](docs/OPERATIONS.md)**):
 
 - **Staged pipeline with gates.** Features run P0 Intake / P1 PRD / P2 Recon /
   P3 Design / P4 Plan / P5–P6 Build / P7 Test / P8 Review / P9 Ship — one headless run
