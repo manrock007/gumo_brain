@@ -1,8 +1,11 @@
 # CtrlLoop operations — install, configure, back up, upgrade
 
-The operator's guide for running a CtrlLoop instance. The product spec lives
-in [ENGINE.md](ENGINE.md); this document is only about keeping an instance
-healthy. Deployment wiring for the original Gumo instance (compose file,
+The operator's **reference** for running a CtrlLoop instance (every env var,
+every default). For a linear, do-this-then-that setup + test-drive **runbook**
+(SQLite quickstart or Postgres + OIDC SSO + RBAC), start with
+[ADMIN-SETUP.md](ADMIN-SETUP.md) and come here for the full knob lists. The
+product spec lives in [ENGINE.md](ENGINE.md); this document is only about
+keeping an instance healthy. Deployment wiring for the original Gumo instance (compose file,
 ECR, nginx) lives in the `gumoiac` repo; the repo-rename checklist is
 [MIGRATION-CTRLLOOP.md](../MIGRATION-CTRLLOOP.md).
 
