@@ -125,6 +125,31 @@ change at first sign-in). Assign each to workspaces. Role details in §6.
 > Enterprise: do §4 (Postgres) and §5 (SSO) **before** inviting people, so
 > accounts land under the right auth and billing from day one.
 
+### 3.5 Locked out? Break-glass password reset
+
+If you forget the admin password (or an account trips the failed-attempt
+lockout), reset it from inside the running container. `admin_user` goes through
+the app's own database layer, so it targets the exact DB the server reads —
+SQLite **or** Postgres — with no risk of writing the wrong file:
+
+```bash
+# see the exact usernames (never prints password hashes)
+docker exec -it gumo-brain python -m scripts.admin_user list
+
+# reset a password and clear any lockout / forced-change / disabled flags
+docker exec -it gumo-brain python -m scripts.admin_user reset-password --user gumo
+
+# if the users table is somehow empty, mint a fresh admin
+docker exec -it gumo-brain python -m scripts.admin_user create-admin --user founder
+```
+
+The command prompts for the new password (no echo, never stored in shell
+history). For automation, pipe it in with `--password-stdin` or set
+`CTRLLOOP_NEW_PASSWORD`. After a reset you can log in immediately — no restart
+needed. (First boot with an **empty** users table auto-bootstraps an admin from
+`CTRLLOOP_ADMIN_PASSWORD` / `DASHBOARD_PASSWORD`; the reset above is for when a
+user already exists but you can't get in.)
+
 ---
 
 ## 4. Enterprise: database & scale
