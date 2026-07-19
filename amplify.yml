@@ -1,0 +1,19 @@
+version: 1
+# Monorepo config: Amplify treats ONLY `landing/` as the app. Combined with
+# AMPLIFY_MONOREPO_APP_ROOT=landing (set on the Amplify app) it builds only when
+# landing/ changes — engine commits never trigger a landing deploy — and only
+# the landing/ folder is ever published. The rest of the repo is never served.
+applications:
+  - appRoot: landing
+    frontend:
+      phases:
+        build:
+          # single self-contained static file — nothing to compile
+          commands:
+            - echo "static landing page — no build step"
+      artifacts:
+        baseDirectory: .
+        files:
+          - '**/*'
+      cache:
+        paths: []
