@@ -57,7 +57,11 @@ def _read_new_password(args) -> str:
     """Prefer an explicit non-interactive source; fall back to a confirmed
     prompt. Never echoes, never accepts an empty password."""
     if args.password_stdin:
-        pw = sys.stdin.readline().rstrip("\n")
+        # Strip only the line terminator (handles \n, \r\n and a lone \r from
+        # CRLF/Windows-piped input). NOT a bare rstrip(): that would also eat an
+        # intentional trailing space in the password, causing the same silent
+        # lockout it's meant to prevent.
+        pw = sys.stdin.readline().rstrip("\r\n")
     elif os.environ.get("CTRLLOOP_NEW_PASSWORD"):
         pw = os.environ["CTRLLOOP_NEW_PASSWORD"]
     else:
