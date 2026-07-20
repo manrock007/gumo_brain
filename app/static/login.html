@@ -21,6 +21,14 @@
   .login-card button:disabled { opacity: .5; }
   .login-err { color: var(--err); font-size: 12.5px; min-height: 18px; margin: 8px 0 0; }
   .login-hint { color: var(--muted); font-size: 11.5px; margin-top: 14px; }
+  .sso-btn { width: 100%; padding: 10px 0; border: 1px solid var(--line); border-radius: var(--r-sm);
+    background: var(--surface-2); color: var(--fg); font: inherit; font-size: 14px; font-weight: 600;
+    cursor: pointer; text-align: center; text-decoration: none; display: block; }
+  .sso-btn:hover { border-color: var(--accent); }
+  .login-or { display: flex; align-items: center; gap: 10px; color: var(--muted);
+    font-size: 11px; text-transform: uppercase; letter-spacing: .06em; margin: 14px 0; }
+  .login-or::before, .login-or::after { content: ""; flex: 1; height: 1px; background: var(--line); }
+  [hidden] { display: none !important; }
 </style>
 </head>
 <body>
@@ -31,16 +39,60 @@
       <span class="brand-name" style="font-size:16px">CtrlLoop</span>
     </div>
     <p class="login-sub">the CtrlLoop engine</p>
-    <form onsubmit="return doLogin(event)">
+    <div class="login-err" id="l-err"></div>
+    <div id="sso-list" hidden></div>
+    <div class="login-or" id="l-or" hidden>or</div>
+    <form id="l-form" onsubmit="return doLogin(event)">
       <input id="l-user" placeholder="username" autocomplete="username" required autofocus>
       <input id="l-pass" type="password" placeholder="password" autocomplete="current-password" required>
       <button id="l-go">Sign in</button>
-      <div class="login-err" id="l-err"></div>
     </form>
     <div class="login-hint">Locked out or need an account? Ask your CtrlLoop admin.</div>
   </div>
 </div>
 <script>
+// Surface OIDC callback failures redirected here as ?error=…
+const ERR_MSG = {
+  oidc: 'SSO sign-in failed — try again, or use your password.',
+  state: 'Your SSO session expired. Please try again.',
+  conflict: 'This SSO identity matches an existing local account — ask your admin to link it.',
+};
+(function showUrlError() {
+  const code = new URLSearchParams(location.search).get('error');
+  if (code && ERR_MSG[code]) document.getElementById('l-err').textContent = ERR_MSG[code];
+})();
+
+// Render whatever providers the instance actually has. The SSO button only
+// appears when OIDC is configured; the password form hides if local login is
+// disabled — so the page always matches the backend, no dead controls.
+async function loadProviders() {
+  let data;
+  try { data = await (await fetch('api/auth/providers')).json(); }
+  catch (e) { return; }  // network blip — keep the password form as the safe default
+  const providers = data.providers || [];
+  const sso = providers.filter(p => p.kind === 'browser_redirect' && p.login_url);
+  if (sso.length) {
+    const list = document.getElementById('sso-list');
+    for (const p of sso) {
+      const a = document.createElement('a');
+      a.className = 'sso-btn';
+      a.href = p.login_url;
+      a.textContent = 'Sign in with SSO';
+      list.appendChild(a);
+    }
+    list.hidden = false;
+  }
+  const localForm = data.local_login_form !== false;
+  if (!localForm) {
+    document.getElementById('l-form').hidden = true;
+    document.getElementById('l-user').required = false;
+    document.getElementById('l-pass').required = false;
+  } else if (sso.length) {
+    document.getElementById('l-or').hidden = false;  // divider only when both exist
+  }
+}
+loadProviders();
+
 async function doLogin(ev) {
   ev.preventDefault();
   const btn = document.getElementById('l-go'), err = document.getElementById('l-err');
