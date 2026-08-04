@@ -70,14 +70,15 @@ jobs:
             docker compose pull gumo-brain
             docker compose up -d --no-deps gumo-brain
             for i in $(seq 1 30); do
-              STATUS="$(curl -ksS --max-time 5 -o /dev/null -w '%{http_code}' https://gumo.co.in/brain/health || true)"
+              STATUS="$(curl -ksS --max-time 5 -o /dev/null -w '%{http_code}' https://app.ctrloop.ai/health || true)"
               if [ "${STATUS}" = "200" ]; then
                 echo "Brain healthy on attempt ${i}"
                 exit 0
               fi
+              echo "attempt ${i}: status=${STATUS:-000}"
               sleep 2
             done
-            echo "Brain health check failed"
+            echo "Brain health check failed (last status: ${STATUS:-000})"
             docker logs --tail 100 gumo-brain || true
             exit 1
           EOSSH
