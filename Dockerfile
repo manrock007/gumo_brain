@@ -29,6 +29,7 @@ COPY --chown=brain:brain requirements.txt /srv/gumo_brain/requirements.txt
 RUN pip install --user --no-cache-dir -r /srv/gumo_brain/requirements.txt
 
 COPY --chown=brain:brain app /srv/gumo_brain/app
+COPY --chown=brain:brain scripts /srv/gumo_brain/scripts
 COPY --chown=brain:brain entrypoint.sh /srv/gumo_brain/entrypoint.sh
 
 WORKDIR /srv/gumo_brain
