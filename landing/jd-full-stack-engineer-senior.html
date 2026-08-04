@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Senior Full Stack Engineer (Forward-Deployed Track) - Careers - CtrLoop</title>
+<meta name="description" content="Senior Full Stack Engineer at CtrLoop: deep Python + JS/TS. Own features end-to-end as DRI from day one, hold the review gates, mentor, and lead forward-deployed engagements executing external projects. 5+ years.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#05070d; --bg2:#080b14; --panel:rgba(255,255,255,.03); --panel-brd:rgba(255,255,255,.08);
+  --ink:#eef2fb; --mut:#93a0b8; --dim:#5c6a85;
+  --orange:#ff5a36; --orange2:#ff8a5c; --cyan:#27e0ff; --violet:#8b7bff;
+  --glow-o:rgba(255,90,54,.55); --glow-c:rgba(39,224,255,.45);
+  --maxw:1180px;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{background:var(--bg);color:var(--ink);font-family:'Inter',system-ui,sans-serif;line-height:1.55;overflow-x:hidden;-webkit-font-smoothing:antialiased}
+h1,h2,h3,.disp{font-family:'Space Grotesk',sans-serif;letter-spacing:-.02em;line-height:1.08}
+a{color:inherit;text-decoration:none}
+.wrap{max-width:var(--maxw);margin:0 auto;padding:0 24px}
+.grad{background:linear-gradient(100deg,var(--orange),var(--orange2) 40%,var(--cyan));-webkit-background-clip:text;background-clip:text;color:transparent}
+
+/* ---------- animated background ---------- */
+.bg-fx{position:fixed;inset:0;z-index:-2;overflow:hidden;background:
+  radial-gradient(1100px 600px at 80% -10%, rgba(255,90,54,.14), transparent 60%),
+  radial-gradient(900px 600px at 5% 10%, rgba(39,224,255,.10), transparent 55%),
+  var(--bg);}
+.grid-fx{position:fixed;inset:-2px;z-index:-1;
+  background-image:linear-gradient(rgba(255,255,255,.045) 1px,transparent 1px),
+                   linear-gradient(90deg,rgba(255,255,255,.045) 1px,transparent 1px);
+  background-size:54px 54px;mask-image:radial-gradient(ellipse 80% 60% at 50% 0%, #000 30%, transparent 78%);
+  animation:drift 26s linear infinite;}
+@keyframes drift{to{background-position:54px 54px}}
+.orb{position:fixed;border-radius:50%;filter:blur(70px);z-index:-2;opacity:.5;animation:float 16s ease-in-out infinite}
+.orb.a{width:420px;height:420px;background:var(--glow-o);top:-120px;right:-80px}
+.orb.b{width:360px;height:360px;background:var(--glow-c);bottom:10%;left:-140px;animation-delay:-6s}
+@keyframes float{50%{transform:translateY(40px) translateX(20px)}}
+
+/* ---------- nav ---------- */
+nav{position:sticky;top:0;z-index:50;backdrop-filter:blur(14px);background:rgba(5,7,13,.55);border-bottom:1px solid rgba(255,255,255,.06)}
+.nav-in{display:flex;align-items:center;justify-content:space-between;height:66px}
+.logo{font-family:'Space Grotesk';font-weight:700;font-size:22px;letter-spacing:-.03em;display:flex;align-items:center;gap:2px}
+.logo .dot{color:var(--orange)}
+.logo .ring{width:16px;height:16px;margin-right:8px;border:2.4px solid var(--orange);border-top-color:transparent;border-radius:50%;animation:spin 3.2s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.nav-links{display:flex;gap:30px;align-items:center}
+.nav-links a{color:var(--mut);font-size:14px;font-weight:500;transition:.2s}
+.nav-links a:hover{color:var(--ink)}
+.nav-links a.on{color:var(--ink)}
+.nav-cta{display:flex;align-items:center;gap:12px}
+.btn{display:inline-flex;align-items:center;gap:8px;font-weight:600;font-size:14px;padding:11px 20px;border-radius:11px;cursor:pointer;border:0;transition:.22s;font-family:inherit}
+.btn-primary{background:linear-gradient(100deg,var(--orange),var(--orange2));color:#150a05;box-shadow:0 0 0 1px rgba(255,138,92,.4),0 8px 30px -8px var(--glow-o)}
+.btn-primary:hover{transform:translateY(-2px);box-shadow:0 0 0 1px rgba(255,138,92,.6),0 14px 40px -8px var(--glow-o)}
+.btn-ghost{background:rgba(255,255,255,.05);color:var(--ink);border:1px solid var(--panel-brd)}
+.btn-ghost:hover{background:rgba(255,255,255,.1)}
+@media(max-width:820px){.nav-links{display:none}}
+@media(max-width:560px){.nav-cta{gap:8px}.nav-cta .btn{padding:10px 14px;font-size:13px}}
+
+/* ---------- reveal ---------- */
+.reveal{opacity:0;transform:translateY(24px);transition:.7s cubic-bezier(.2,.7,.2,1)}
+.reveal.in{opacity:1;transform:none}
+
+/* ---------- page head ---------- */
+.pagehead{padding:80px 0 12px}
+.crumb{color:var(--dim);font-size:13px;margin-bottom:22px;display:inline-flex;gap:8px;align-items:center}
+.crumb a{color:var(--mut)}
+.crumb a:hover{color:var(--ink)}
+.lvl{display:inline-flex;font-family:'Space Grotesk';font-weight:700;font-size:11px;letter-spacing:.16em;text-transform:uppercase;padding:5px 11px;border-radius:100px;margin-bottom:18px;
+  color:var(--orange2);border:1px solid rgba(255,138,92,.4);background:rgba(255,90,54,.08)}
+.pagehead h1{font-size:clamp(32px,5vw,56px);font-weight:700;max-width:22ch}
+.pagehead .sub{color:var(--mut);font-size:clamp(15.5px,1.9vw,18px);max-width:68ch;margin:22px 0 26px}
+.facts{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:30px}
+.fact{font-size:12.5px;color:var(--mut);border:1px solid var(--panel-brd);background:var(--panel);padding:6px 13px;border-radius:100px}
+.head-cta{display:flex;gap:14px;flex-wrap:wrap}
+
+/* ---------- generic section ---------- */
+section{padding:56px 0;position:relative}
+.eyebrow{color:var(--orange);font-weight:600;font-size:13px;letter-spacing:.14em;text-transform:uppercase;margin-bottom:14px}
+.sec-title{font-size:clamp(26px,3.6vw,40px);font-weight:700;max-width:24ch}
+.sec-sub{color:var(--mut);max-width:62ch;margin-top:16px;font-size:16.5px}
+
+/* ---------- cards ---------- */
+.cards{display:grid;grid-template-columns:repeat(3,1fr);gap:18px;margin-top:40px}
+@media(max-width:900px){.cards{grid-template-columns:1fr 1fr}}
+@media(max-width:560px){.cards{grid-template-columns:1fr}}
+.card{padding:24px 20px;border-radius:16px;background:var(--panel);border:1px solid var(--panel-brd);transition:.28s;position:relative;overflow:hidden}
+.card:hover{transform:translateY(-4px);border-color:rgba(255,138,92,.35);box-shadow:0 20px 50px -22px var(--glow-o)}
+.card .num{font-family:'Space Grotesk';font-size:13px;color:var(--orange);font-weight:700;margin-bottom:12px}
+.card h3{font-size:17px;margin-bottom:8px}
+.card p{color:var(--mut);font-size:14px}
+
+/* ---------- stages (what you'll do) ---------- */
+.stages{display:grid;grid-template-columns:repeat(3,1fr);gap:18px;margin-top:40px}
+@media(max-width:820px){.stages{grid-template-columns:1fr}}
+.stage{padding:26px 22px;border-radius:18px;background:var(--panel);border:1px solid var(--panel-brd);transition:.28s}
+.stage:hover{transform:translateY(-4px);box-shadow:0 24px 60px -28px rgba(0,0,0,.8)}
+.stage .badge{width:30px;height:30px;border-radius:9px;display:flex;align-items:center;justify-content:center;font-family:'Space Grotesk';font-weight:700;font-size:14px;color:#0a0e17;margin-bottom:16px}
+.stage h3{font-size:18px;margin-bottom:6px}
+.stage .role-lab{font-size:12px;color:var(--dim);letter-spacing:.1em;text-transform:uppercase;margin-bottom:14px}
+.stage ul{list-style:none;display:flex;flex-direction:column;gap:9px}
+.stage li{color:var(--mut);font-size:14px;padding-left:18px;position:relative}
+.stage li::before{content:"";position:absolute;left:0;top:8px;width:6px;height:6px;border-radius:50%;background:var(--orange)}
+.s1 .badge{background:linear-gradient(135deg,#3f7fe0,#5a9dff)} .s1 li::before{background:#5a9dff}
+.s2 .badge{background:linear-gradient(135deg,var(--orange),var(--orange2))}
+.s3 .badge{background:linear-gradient(135deg,#12b76a,#3ee08a)} .s3 li::before{background:#3ee08a}
+
+/* ---------- requirement panels ---------- */
+.req{display:grid;grid-template-columns:1.2fr .8fr;gap:18px;margin-top:40px}
+@media(max-width:820px){.req{grid-template-columns:1fr}}
+.reqpanel{padding:28px 24px;border-radius:18px;background:var(--panel);border:1px solid var(--panel-brd)}
+.reqpanel h3{font-size:18px;margin-bottom:16px}
+.reqpanel ul{list-style:none;display:flex;flex-direction:column;gap:12px}
+.reqpanel li{color:var(--mut);font-size:14.5px;padding-left:20px;position:relative}
+.reqpanel li b{color:var(--ink);font-weight:600}
+.reqpanel li::before{content:"";position:absolute;left:0;top:8px;width:6px;height:6px;border-radius:50%;background:var(--orange2)}
+.reqpanel.nice li::before{background:var(--violet)}
+
+/* ---------- process steps ---------- */
+.steps4{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-top:40px}
+@media(max-width:900px){.steps4{grid-template-columns:1fr 1fr}}
+@media(max-width:560px){.steps4{grid-template-columns:1fr}}
+.step{padding:18px 14px;border-radius:14px;background:var(--panel);border:1px solid var(--panel-brd);text-align:center;position:relative;transition:.25s}
+.step:hover{border-color:rgba(39,224,255,.4);box-shadow:0 0 30px -14px var(--glow-c);transform:translateY(-3px)}
+.step .k{font-family:'Space Grotesk';font-weight:700;font-size:14px;letter-spacing:.02em}
+.step .d{color:var(--dim);font-size:11px;margin-top:5px}
+.step .idx{position:absolute;top:8px;right:10px;font-size:10px;color:var(--orange);font-weight:700;font-family:'Space Grotesk'}
+
+/* ---------- insight / apply ---------- */
+.insight{margin-top:24px;padding:48px 40px;border-radius:22px;text-align:center;
+  background:linear-gradient(120deg,rgba(255,90,54,.08),rgba(39,224,255,.06));
+  border:1px solid var(--panel-brd);position:relative;overflow:hidden}
+.insight h2{font-size:clamp(24px,3.4vw,38px);font-weight:700}
+.insight p{color:var(--mut);max-width:60ch;margin:18px auto 0;font-size:16px}
+.insight .cta{display:flex;gap:14px;justify-content:center;flex-wrap:wrap;margin-top:28px}
+.insight .note{color:var(--dim);font-size:12.5px;margin-top:16px}
+
+/* ---------- footer ---------- */
+footer{border-top:1px solid rgba(255,255,255,.06);padding:40px 0;margin-top:40px}
+.foot-in{display:flex;justify-content:space-between;align-items:center;gap:20px;flex-wrap:wrap;color:var(--dim);font-size:13px}
+.foot-in a:hover{color:var(--ink)}
+</style>
+</head>
+<body>
+<div class="bg-fx"></div><div class="grid-fx"></div><div class="orb a"></div><div class="orb b"></div>
+
+<!-- NAV -->
+<nav><div class="wrap nav-in">
+  <a href="index.html" class="logo"><span class="ring"></span>CtrLoop<span class="dot">.</span></a>
+  <div class="nav-links">
+    <a href="index.html#problem">Why we built it</a>
+    <a href="index.html#loop">The loop</a>
+    <a href="careers.html" class="on">Careers</a>
+    <a href="index.html#contact">Contact</a>
+  </div>
+  <div class="nav-cta">
+    <a href="careers.html" class="btn btn-ghost">All roles</a>
+    <a href="mailto:support@ctrloop.ai?subject=Application%20-%20Senior%20Full%20Stack%20Engineer%20(Forward-Deployed%20Track)" class="btn btn-primary">Apply →</a>
+  </div>
+</div></nav>
+
+<!-- HEAD -->
+<header class="pagehead"><div class="wrap">
+  <div class="reveal">
+    <div class="crumb"><a href="careers.html">Careers</a> <span>/</span> <span>Open role</span></div><br>
+    <span class="lvl">Senior · Forward-Deployed track</span>
+    <h1>Senior Full Stack Engineer</h1>
+    <p class="sub">Deep <b>Python + JavaScript/TypeScript</b>. You'll own the biggest features end-to-end as <b>Engineer DRI from day one</b> - frozen contracts, parallel builds with Claude Code, flag-gated launches with the metric wired first - hold the technical bar at the review gates, mentor a junior engineer, and lead <b>forward-deployed engagements</b> executing external projects on our pipeline.</p>
+    <div class="facts">
+      <span class="fact">Full-time</span>
+      <span class="fact">1 opening</span>
+      <span class="fact">5+ years · shipped scope over tenure</span>
+      <span class="fact">Python + JS/TS</span>
+      <span class="fact">Backend · Web · App</span>
+      <span class="fact">Client-facing</span>
+    </div>
+    <div class="head-cta">
+      <a href="mailto:support@ctrloop.ai?subject=Application%20-%20Senior%20Full%20Stack%20Engineer%20(Forward-Deployed%20Track)" class="btn btn-primary">Apply for this role →</a>
+      <a href="#do" class="btn btn-ghost">What you'll do</a>
+    </div>
+  </div>
+</div></header>
+
+<!-- HOW WE BUILD -->
+<section id="how"><div class="wrap">
+  <div class="reveal"><div class="eyebrow">How we build</div>
+  <h2 class="sec-title">No sprints. No staging. No hand-offs.</h2>
+  <p class="sec-sub">Every feature runs a 10-stage pipeline where Claude does the heavy lifting and a human DRI - one directly responsible engineer - drives every step.</p></div>
+  <div class="cards">
+    <div class="card reveal"><div class="num">01</div><h3>Contract-first</h3><p>A frozen backend↔frontend contract + simulator before any code - so both sides build in parallel against the same reality.</p></div>
+    <div class="card reveal"><div class="num">02</div><h3>AI-native execution</h3><p>Claude Code writes most of the code. You direct it, review it, and verify it by running the app - not by trusting the diff.</p></div>
+    <div class="card reveal"><div class="num">03</div><h3>One Design System</h3><p>Every screen is composed from a living component library; anything new is contributed back. Build it in the system, not the feature.</p></div>
+    <div class="card reveal"><div class="num">04</div><h3>Flags, not staging</h3><p>Verify locally, merge dark behind a feature flag in production, dogfood there, flip it on. Rollback is one click.</p></div>
+    <div class="card reveal"><div class="num">05</div><h3>Artifacts, not meetings</h3><p>Each step outputs a structured doc the next step's Claude reads directly. Three synchronous touchpoints per feature - that's it.</p></div>
+    <div class="card reveal"><div class="num">06</div><h3>Done = demonstrated</h3><p>Screenshots, green gates, a flag, and a one-click rollback - never just "code written."</p></div>
+  </div>
+</div></section>
+
+<!-- WHAT YOU'LL DO -->
+<section id="do"><div class="wrap">
+  <div class="reveal"><div class="eyebrow">What you'll do</div>
+  <h2 class="sec-title">Own it end-to-end. Raise the bar. Lead forward.</h2>
+  <p class="sec-sub">The contract is the keystone of the whole pipeline - and designing it is your craft. Two build tracks work against what you freeze; ambiguity in your writing becomes rework in two codebases.</p></div>
+  <div class="stages">
+    <div class="stage s2 reveal">
+      <div class="badge">1</div><h3>Own features</h3><div class="role-lab">Engineer DRI · day one</div>
+      <ul>
+        <li>Design the frozen contract + simulator from the founder's PRD; lock decisions</li>
+        <li>Build backend ∥ frontend in parallel with Claude Code across Python/Django, TypeScript web, and React Native</li>
+        <li>Integrate against a local backend, verify every flow with evidence</li>
+        <li>Launch behind a flag - success metric wired to a live dashboard before the flip</li>
+      </ul>
+    </div>
+    <div class="stage s1 reveal">
+      <div class="badge">2</div><h3>Hold the bar</h3><div class="role-lab">Gates · spine · mentorship</div>
+      <ul>
+        <li>Be the human reviewer at the gates: architecture, scalability, contract adherence, design-system consistency</li>
+        <li>Steward the persistent spine - contract registry, component library, conventions</li>
+        <li>Mentor the junior engineer: review their contracts, hold their gates, raise their slope</li>
+        <li>Evolve the pipeline itself - the playbook is a living repo you can PR</li>
+      </ul>
+    </div>
+    <div class="stage s3 reveal">
+      <div class="badge">3</div><h3>Lead forward</h3><div class="role-lab">External engagements</div>
+      <ul>
+        <li>First into the room: install the portable pipeline on the client's repos</li>
+        <li>Scope with the client, design the contract, build with Claude, demo working software</li>
+        <li>Absorb the punch list, come back with it fixed, launch behind their flag</li>
+        <li>Feed what you learn back into the loop</li>
+      </ul>
+    </div>
+  </div>
+</div></section>
+
+<!-- WHAT WE LOOK FOR -->
+<section id="need"><div class="wrap">
+  <div class="reveal"><div class="eyebrow">What we look for</div>
+  <h2 class="sec-title">Depth on both sides of the stack - and judgment.</h2></div>
+  <div class="req">
+    <div class="reqpanel reveal">
+      <h3>Must-haves</h3>
+      <ul>
+        <li><b>5+ years shipping production full-stack software</b> - we index on the scope of what you've shipped, not tenure</li>
+        <li><b>Python depth</b> - Django/DRF (or comparable) in production: data modelling, migrations, auth, background jobs, tests, Postgres, performance under real load</li>
+        <li><b>JavaScript/TypeScript depth</b> - React on web plus React Native, or a shipped comparable mobile app</li>
+        <li><b>Architecture judgment</b> - API/contract design, failure modes, scalability trade-offs; you can review someone else's design and make it better in one pass</li>
+        <li><b>AI-native working style</b> - an AI coding tool is already your daily driver; you direct, review, and correct its output fast, and verify by running the app</li>
+        <li><b>Written clarity</b> - your contracts are frozen documents two build tracks work against</li>
+        <li><b>Ownership and review leadership</b> - you drive features to live without being chased, and make the people around you better</li>
+        <li><b>Client-facing composure</b> - scope, demo, absorb critique, iterate live; you'll lead engagements early</li>
+      </ul>
+    </div>
+    <div class="reqpanel nice reveal">
+      <h3>Nice-to-haves</h3>
+      <ul>
+        <li>Feature-flag-gated rollouts; observability and product analytics (Mixpanel, Sentry)</li>
+        <li>LLM/agent product experience - prompting, evals, tool use / MCP</li>
+        <li>DevOps - GCP, Docker, CI, systemd; enough to self-serve a deployment</li>
+        <li>Mobile releases (TestFlight / Play Console), push-notification plumbing</li>
+        <li>Prior mentoring or tech-lead experience</li>
+      </ul>
+    </div>
+  </div>
+</div></section>
+
+<!-- WHAT YOU GET -->
+<section id="get"><div class="wrap">
+  <div class="reveal"><div class="eyebrow">What you get</div>
+  <h2 class="sec-title">Run the model. Shape the model.</h2></div>
+  <div class="cards">
+    <div class="card reveal"><div class="num">01</div><h3>The operating model</h3><p>An AI-native pipeline most companies are still theorizing about - you run it daily and help evolve it.</p></div>
+    <div class="card reveal"><div class="num">02</div><h3>End-to-end ownership</h3><p>Your name on the feature from frozen contract to live metric dashboard.</p></div>
+    <div class="card reveal"><div class="num">03</div><h3>The lead FDE seat</h3><p>Client-facing, high-trust, high-leverage - entire external engagements run your way.</p></div>
+    <div class="card reveal"><div class="num">04</div><h3>Claude, on us</h3><p>Claude as your pair on everything, on the company's dime.</p></div>
+    <div class="card reveal"><div class="num">05</div><h3>A team worth raising</h3><p>A junior engineer whose slope you own, founders as your product pair.</p></div>
+    <div class="card reveal"><div class="num">06</div><h3>Leverage, not meetings</h3><p>Three synchronous touchpoints per feature; the rest is you, Claude, and the pipeline.</p></div>
+  </div>
+</div></section>
+
+<!-- PROCESS + APPLY -->
+<section id="process"><div class="wrap">
+  <div class="reveal"><div class="eyebrow">Hiring process</div>
+  <h2 class="sec-title">Built like the job.</h2>
+  <p class="sec-sub">The centrepiece is a paid, timeboxed design + build exercise where using AI isn't just allowed - it's required. We give you a small PRD; you design the contract + simulator spec, ship a vertical slice, and return the contract doc, a working demo, and green gates.</p></div>
+  <div class="steps4">
+    <div class="step reveal"><div class="idx">01</div><div class="k">Intro call</div><div class="d">30 min · bring the biggest thing you've shipped</div></div>
+    <div class="step reveal"><div class="idx">02</div><div class="k">Design + build</div><div class="d">Paid · timeboxed · AI required</div></div>
+    <div class="step reveal"><div class="idx">03</div><div class="k">Architecture deep-dive</div><div class="d">90 min · defend your contract</div></div>
+    <div class="step reveal"><div class="idx">04</div><div class="k">Offer</div><div class="d">Fast</div></div>
+  </div>
+  <div class="insight reveal">
+    <h2>Your contracts need no follow-up call? <span class="grad">Let's talk.</span></h2>
+    <p>Email us with the biggest things you've shipped - repos, live products, systems you designed. Working software beats résumé lines. Location and compensation are discussed during the process.</p>
+    <div class="cta">
+      <a href="mailto:support@ctrloop.ai?subject=Application%20-%20Senior%20Full%20Stack%20Engineer%20(Forward-Deployed%20Track)" class="btn btn-primary">Apply - Senior Full Stack Engineer →</a>
+      <a href="jd-full-stack-engineer-junior.html" class="btn btn-ghost">Earlier in your career? See the junior role</a>
+    </div>
+    <div class="note">Applications go to support@ctrloop.ai with the role in the subject line.</div>
+  </div>
+</div></section>
+
+<!-- FOOTER -->
+<footer><div class="wrap foot-in">
+  <div class="logo" style="font-size:18px"><span class="ring" style="width:13px;height:13px"></span>CtrLoop<span class="dot">.</span></div>
+  <div>The execution loop for AI-native enterprises</div>
+  <div><a href="careers.html">Careers</a> · <a href="mailto:support@ctrloop.ai">support@ctrloop.ai</a> · ctrloop.ai · © 2026 CtrLoop</div>
+</div></footer>
+
+<script>
+const io=new IntersectionObserver((es)=>es.forEach(e=>{if(e.isIntersecting){e.target.classList.add('in');io.unobserve(e.target)}}),{threshold:.12});
+document.querySelectorAll('.reveal').forEach((el,i)=>{el.style.transitionDelay=(i%4*60)+'ms';io.observe(el)});
+</script>
+</body>
+</html>
