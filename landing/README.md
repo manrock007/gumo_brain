@@ -1,16 +1,32 @@
-# CtrLoop landing page (ctrloop.ai)
+# CtrLoop marketing site (ctrloop.ai)
 
 The static marketing site served at **ctrloop.ai** via AWS Amplify. It is a
-single self-contained `index.html` (external Google Fonts only) — no build step.
+plain multi-page site — every page is hand-written HTML sharing `styles.css`,
+with images under `img/`, `logos/` and `team/` — no build step, no framework.
+`DEPLOY.md` (from the site export) documents the pages, the Formspree
+"Book a demo" form, GTM/GA4, SEO/AEO files and the go-live checklist.
+
+## Files
+
+- `index.html` + section pages: `platform`, `agent-teams`, `work`,
+  `industries` (+ `travel`, `retail`, `nbfc`, `government`), `company`,
+  `insights` (+ two insight posts).
+- `careers.html` + the two `jd-*.html` job pages (maintained in this repo;
+  not part of the site export).
+- `styles.css` — shared styles linked by every exported page.
+- `sitemap.xml`, `robots.txt`, `llms.txt`, `og-image.png`, favicons — SEO/AEO
+  files that must stay at the site root.
 
 ## Deploy
 
 Amplify is connected to this GitHub repo and auto-deploys on push to the
 watched branch (`main`). The build spec is [`../amplify.yml`](../amplify.yml),
-which publishes this `landing/` folder as the site root.
+which publishes this `landing/` folder as the site root. (The site export
+ships its own root-level `amplify.yml`; it is intentionally not checked in
+here because the repo-level monorepo spec already covers this folder.)
 
-- **Edit** `index.html`, open a PR, merge to `main` → Amplify builds and
-  deploys automatically.
+- **Edit** the pages, open a PR, merge to `main` → Amplify builds and deploys
+  automatically. Add any new page to `sitemap.xml` (and `llms.txt`).
 - No local build/tooling required; open `index.html` in a browser to preview.
 
 ## Amplify only sees this folder

@@ -1,0 +1,27 @@
+# CtrLoop
+
+> CtrLoop is the Work OS for enterprise teams - a unified operating layer where a company's people and autonomous AI agents run work together on one shared context, so whole teams adopt AI and every loop (plan, execute, launch, feedback, iterate) compounds instead of starting from zero.
+
+CtrLoop is forward-deployed: engineers embed with your team and ship production systems in weeks, governed with contracts, evaluation, RBAC and full audit, deployable on-prem or in your VPC. In production with Swiggy, CREW by Swiggy, Cleartrip, ixigo, Zotel, Stayflexi and RedSky Hospitality. Based in Bengaluru, India.
+
+## Pages
+- [Home](https://ctrloop.ai/): AI that runs with your team - overview of the platform, industries and how it works.
+- [Platform](https://ctrloop.ai/platform.html): The operating layer - agent teams, the execution loop, governance and one shared context.
+- [Agent Teams](https://ctrloop.ai/agent-teams.html): How coordinated teams of people and agents run work with a human-in-the-loop gate.
+- [Work](https://ctrloop.ai/work.html): Enterprise teams already running on CtrLoop.
+- [Industries](https://ctrloop.ai/industries.html): One engine, tailored per vertical.
+  - [Travel](https://ctrloop.ai/travel.html): Pricing, fares, research and review intelligence, conversational agents.
+  - [Retail](https://ctrloop.ai/retail.html): Catalog, CX, returns, real-time market intelligence, revenue ops, autonomous store worker.
+  - [NBFC / BFSI](https://ctrloop.ai/nbfc.html): KYC, underwriting, reconciliation, collections and risk intelligence.
+  - [Government](https://ctrloop.ai/government.html): Application review, citizen queries, grievance resolution, records and casework.
+- [Company](https://ctrloop.ai/company.html): Vision, founders and investors.
+- [Insights](https://ctrloop.ai/insights.html): Articles on building for teams and moving from pilot to production.
+
+## Founders
+- Mohammad Shakir - Co-Founder & CEO (ex-Amazon Alexa; IIM Calcutta)
+- Manish Narang - Co-Founder & CTO (ex-Amazon Alexa)
+- Kapil Sharma - Co-Founder & COO (ex-MakeMyTrip)
+
+## Contact
+- Email: support@ctrloop.ai
+- Request access: https://ctrloop.ai/#contact
