@@ -2,7 +2,7 @@
 
 > CtrLoop is the Work OS for enterprise teams - a unified operating layer where a company's people and autonomous AI agents run work together on one shared context, so whole teams adopt AI and every loop (plan, execute, launch, feedback, iterate) compounds instead of starting from zero.
 
-CtrLoop is forward-deployed: engineers embed with your team and ship production systems in weeks, governed with contracts, evaluation, RBAC and full audit, deployable on-prem or in your VPC. In production with Swiggy, CREW by Swiggy, Cleartrip, ixigo, Zotel, Stayflexi and RedSky Hospitality. Based in Bengaluru, India.
+CtrLoop is forward-deployed: engineers embed with your team and ship production systems in weeks, governed with contracts, evaluation, RBAC and full audit, deployable on-prem or in your VPC. In production with Swiggy, CREW by Swiggy, Cleartrip, ixigo and Zotel. Based in Bengaluru, India.
 
 ## Pages
 - [Home](https://ctrloop.ai/): AI that runs with your team - overview of the platform, industries and how it works.
