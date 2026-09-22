@@ -405,7 +405,7 @@ footer.site{background:var(--navy);color:#aeb7c9;padding:64px 0 40px}
 /* single real-logo wall */
 .brands{padding:60px 0 12px}
 .brands .lbl{text-align:center;font-size:12.5px;font-weight:700;letter-spacing:.16em;text-transform:uppercase;color:var(--muted);margin-bottom:40px}
-.brandwall{display:grid;grid-template-columns:repeat(4,1fr);gap:22px}
+.brandwall{display:grid;grid-template-columns:repeat(5,1fr);gap:22px}
 .blogo{display:flex;align-items:center;justify-content:center;min-height:104px;background:#fff;border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow-sm);padding:24px;transition:transform .18s,box-shadow .18s}
 .blogo:hover{transform:translateY(-3px);box-shadow:var(--shadow)}
 .blogo img{max-height:52px;max-width:150px;width:auto;object-fit:contain;filter:grayscale(1);opacity:.72;transition:filter .2s,opacity .2s}
