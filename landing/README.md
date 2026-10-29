@@ -32,7 +32,7 @@ FAQPage JSON-LD in the same file.
 - `assets/logos/*.webp` - client + partner logos (lossless WebP of the handoff PNGs, 120px tall).
 - `assets/founders/founder-*.webp` - founder photos (600px square, from the handoff JPGs).
 - `assets/crew/*.svg`, `assets/ctrloop-mark.svg` - static crew art and the loop mark.
-- `assets/og-image.png` (1200x630 share card), `assets/logo.png`, favicon set
+- `assets/og-image-v2.png` (1200x630 share card; the old `og-image.png` stays only for the insights pages), `assets/logo.png`, favicon set
   (`/favicon.ico`, `assets/favicon-32.png`, `assets/apple-touch-icon.png`,
   `assets/icon-192.png`, `assets/icon-512.png`, `/site.webmanifest`).
 - Root: `sitemap.xml`, `robots.txt`, `llms.txt`, `_redirects` (Cloudflare
