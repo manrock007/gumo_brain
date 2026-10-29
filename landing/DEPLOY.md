@@ -52,7 +52,7 @@ pre-filled email to support@ctrloop.ai. Override the endpoint by setting
   frame right after `<body>` on all pages, careers and job pages included.
   GA4 `G-XCXSL3Z70K` fires via GTM.
 - Canonical, robots, Open Graph + Twitter tags and the 1200x630 share image
-  (`/assets/og-image.png`) on every page.
+  (`/assets/og-image-v2.png`) on every page.
 - Favicons: `/favicon.ico`, `/assets/ctrloop-mark.svg`, `/assets/favicon-32.png`,
   `/assets/apple-touch-icon.png`, `/site.webmanifest` (192/512 icons).
 - JSON-LD per page: Organization (founders, LinkedIn `sameAs`, offices),
