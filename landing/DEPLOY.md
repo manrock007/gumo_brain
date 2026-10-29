@@ -19,6 +19,8 @@ and invalidates its CDN automatically.
      `/careers.html`) plus the paths listed in the handoff `_redirects`.
    - 200 rewrites so `/platform`, `/crew/bea`, `/industries/...`, `/company`
      and `/careers` resolve to their `index.html` without a trailing slash.
+   - a 301 from `https://www.ctrloop.ai/<*>` to `https://ctrloop.ai/<*>` (first
+     rule, so the www host stops serving a duplicate of the site).
    - `/insights.html` and the two posts stay live (they have published posts).
 2. **Preview** - enable *Previews* (or connect the feature branch) in Amplify
    to get a preview URL for sign-off before merging to `main`.
@@ -33,6 +35,9 @@ and invalidates its CDN automatically.
   and the Facebook Sharing Debugger ("Scrape again") to drop the old preview.
 - Rich results: run each of the 9 URLs through the Google Rich Results Test
   (expects Organization, BreadcrumbList and FAQPage with no errors).
+- Job pages: `/jd-full-stack-engineer-{junior,senior}.html` carry JobPosting
+  JSON-LD (remote, applicants in India, `validThrough` 2026-12-28); bump
+  `validThrough` while the roles stay open and re-request indexing in GSC.
 - Lighthouse mobile: re-run on the live URLs (local runs are skewed by the
   sandbox network; GTM/GA4 and the always-on animations dominate the score).
 

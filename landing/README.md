@@ -15,7 +15,7 @@ handoff on the ClickUp build ticket; `DEPLOY.md` has the go-live checklist.
 | `/industries/consumer-brands`, `/industries/travel-hospitality`, `/industries/financial-services` | `industries/<name>/index.html` |
 | `/company` | `company/index.html` |
 | `/careers` | `careers/index.html` (old template; GTM + canonical added) |
-| `/jd-full-stack-engineer-{junior,senior}.html` | job pages (old template) |
+| `/jd-full-stack-engineer-{junior,senior}.html` | job pages (old template; OG + JobPosting JSON-LD, listed in the sitemap) |
 | `/insights.html` + two posts | kept from the previous site (old template, `styles.css`, `img/`) |
 
 Every redesigned page is self-contained: layout and colour are inline (as

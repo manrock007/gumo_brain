@@ -176,8 +176,8 @@ height="0" width="0" style="display:none;visibility:hidden"></iframe></noscript>
 <div style="display: flex; flex-direction: column; gap: 22px; align-items: center; text-align: center; max-width: 900px">
 <span style="display: inline-flex; align-items: center; gap: 8px; background: #FAF7F2; border-radius: 999px; padding: 8px 16px 8px 12px; font-size: 14px; font-weight: 600"><span class="pulse" style="width: 10px; height: 10px; border-radius: 50%; background: #22C55E"></span>Live in production</span>
 <h1 style="margin: 0; font-family: Outfit, sans-serif; font-weight: 800; font-size: clamp(41px, 8vw, 76px); line-height: 1.04; letter-spacing: -0.035em">AI workers that run your
-<span style="display: block; height: 1.1em; overflow: hidden; color: #E25E1A"><span class="words" style="display: flex; flex-direction: column">
-<span style="height: 1.1em">sales.</span><span style="height: 1.1em">operations.</span><span style="height: 1.1em">finance.</span><span style="height: 1.1em">support.</span><span style="height: 1.1em">growth.</span><span style="height: 1.1em">sales.</span></span></span></h1>
+<span style="display: block; height: 1.1em; overflow: hidden; color: #E25E1A"><span class="words" id="h1-rotator" style="display: flex; flex-direction: column">
+<span style="height: 1.1em">sales.</span></span></span></h1>
 <div style="display: flex; align-items: center; justify-content: center; gap: 10px; font-family: Outfit, sans-serif; font-weight: 600; font-size: clamp(22px, 6vw, 28px); color: #4A5163">For
 <span style="display: inline-block; height: 1.1em; line-height: 1.1em; overflow: hidden; color: #1B2440; text-align: left; background: #FAF7F2; border-radius: 12px; padding: 0 14px"><span class="words words2" style="display: flex; flex-direction: column">
 <span style="height: 1.1em">consumer brands</span><span style="height: 1.1em">travel companies</span><span style="height: 1.1em">hotels</span><span style="height: 1.1em">financial services</span><span style="height: 1.1em">marketplaces</span><span style="height: 1.1em">consumer brands</span></span></span></div>
@@ -519,6 +519,9 @@ height="0" width="0" style="display:none;visibility:hidden"></iframe></noscript>
 </div>
 </footer>
 </div>
+<script>/* H1 rotator: only one word lives in the <h1> for crawlers; the rest are added here for the animation */
+(function(){var r=document.getElementById('h1-rotator');if(!r)return;['operations.','finance.','support.','growth.','sales.'].forEach(function(w){var s=document.createElement('span');s.style.height='1.1em';s.setAttribute('aria-hidden','true');s.textContent=w;r.appendChild(s);});})();
+</script>
 <script>/* close the mobile menu when a menu link is tapped (patch 29 Oct, section 1) */
 document.querySelectorAll('.mnav a').forEach(function(a){a.addEventListener('click',function(){var t=document.getElementById('navtoggle');if(t)t.checked=false;});});
 </script>

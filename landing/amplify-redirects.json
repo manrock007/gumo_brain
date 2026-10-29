@@ -1,5 +1,11 @@
 [
   {
+    "source": "https://www.ctrloop.ai/<*>",
+    "target": "https://ctrloop.ai/<*>",
+    "status": "301",
+    "condition": null
+  },
+  {
     "source": "/index.html",
     "target": "/",
     "status": "301",
