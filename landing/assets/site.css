@@ -48,6 +48,8 @@ a{color:#1B2440}a:hover{color:#C2410C}
 .lift{transition:transform .25s ease,box-shadow .25s ease}
 .lift:hover{transform:translateY(-8px);box-shadow:0 24px 48px rgba(27,36,64,.14)}
 @media (prefers-reduced-motion: reduce){*{animation:none!important}.pop{opacity:1}
+/* the Approve button and its two labels are styled only by keyframes; with motion off, show the resting state */
+.btn{background:#1B2440}.lblB{visibility:hidden}
 /* .climb figures start at opacity 0 and are placed by their keyframes; with motion off, show all four standing on the stairs */
 g.climb{opacity:1;transform:translate(884px,222px)}.climb[style*="2.25s"]{transform:translate(756px,278px)}.climb[style*="4.5s"]{transform:translate(628px,333px)}.climb[style*="6.75s"]{transform:translate(500px,379px)}}
 
