@@ -1,0 +1,26 @@
+# Cloudflare Pages redirects - verify each old path exists in the current live sitemap before deploying
+/agent-teams                 /platform                          301
+/agent-teams/                /platform                          301
+/work                        /                                  301
+/work/                       /                                  301
+/industries/travel           /industries/travel-hospitality     301
+/industries/retail           /industries/consumer-brands        301
+/industries/nbfc             /industries/financial-services     301
+/industries/government       /platform                          301
+# /insights: keep if it has live posts; otherwise uncomment the next line
+# /insights                  /                                  301
+
+# Verified against the live sitemap (ctrloop.ai/sitemap.xml, 2026-09-09): the old site used flat .html URLs.
+# These are the paths that actually exist today and must 301 to the new pages.
+/index.html                  /                                  301
+/platform.html               /platform                          301
+/agent-teams.html            /platform                          301
+/work.html                   /                                  301
+/industries.html             /                                  301
+/travel.html                 /industries/travel-hospitality     301
+/retail.html                 /industries/consumer-brands        301
+/nbfc.html                   /industries/financial-services     301
+/government.html             /platform                          301
+/company.html                /company                           301
+/careers.html                /careers                           301
+# /insights.html and the two insight posts stay live (they have published posts) - no redirect.
