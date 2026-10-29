@@ -47,7 +47,9 @@ a{color:#1B2440}a:hover{color:#C2410C}
 .pulse{animation:pulse 1.6s infinite}
 .lift{transition:transform .25s ease,box-shadow .25s ease}
 .lift:hover{transform:translateY(-8px);box-shadow:0 24px 48px rgba(27,36,64,.14)}
-@media (prefers-reduced-motion: reduce){*{animation:none!important}.pop{opacity:1}}
+@media (prefers-reduced-motion: reduce){*{animation:none!important}.pop{opacity:1}
+/* .climb figures start at opacity 0 and are placed by their keyframes; with motion off, show all four standing on the stairs */
+g.climb{opacity:1;transform:translate(884px,222px)}.climb[style*="2.25s"]{transform:translate(756px,278px)}.climb[style*="4.5s"]{transform:translate(628px,333px)}.climb[style*="6.75s"]{transform:translate(500px,379px)}}
 
 @keyframes travel{0%{left:0;opacity:0}10%,90%{opacity:1}100%{left:100%;opacity:0}}
 .packet{position:absolute;top:50%;width:12px;height:12px;margin:-6px 0 0 -6px;border-radius:50%;animation:travel 2.4s linear infinite}
