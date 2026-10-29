@@ -120,5 +120,5 @@ html{scroll-padding-top:84px}
 .mnav a{padding:14px 0;border-bottom:1px solid #F3EEE7;font-family:Outfit,sans-serif;font-weight:700;font-size:18px;color:#1B2440;text-decoration:none}
 .mnav a.mcta{margin-top:14px;border:none;background:#C2410C;color:#FFFFFF;text-align:center;border-radius:999px;font-family:Inter,sans-serif;font-size:16px;font-weight:600}
 .burger-x{display:none}
-@media (max-width:1020px){.navtoggle{display:block}.nav-links{display:none!important}.nav-burger{display:flex}.navtoggle:checked ~ .mnav{display:flex}.navtoggle:checked ~ .nav-inner .burger-open{display:none}.navtoggle:checked ~ .nav-inner .burger-x{display:block}}
+@media (max-width:1020px){.navtoggle{display:block}.nav-links{display:none!important}.nav-burger{display:flex}.mnav{box-sizing:border-box;max-height:calc(100vh - 72px);max-height:calc(100dvh - 72px);overflow-y:auto}.navtoggle:checked ~ .mnav{display:flex}.navtoggle:checked ~ .nav-inner .burger-open{display:none}.navtoggle:checked ~ .nav-inner .burger-x{display:block}}
 @media (max-width:640px){.nav-cta{display:none!important}.nav-inner{height:62px!important;padding:0 16px!important}}
