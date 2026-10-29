@@ -1,0 +1,212 @@
+[
+  {
+    "source": "/index.html",
+    "target": "/",
+    "status": "301",
+    "condition": null
+  },
+  {
+    "source": "/platform.html",
+    "target": "/platform",
+    "status": "301",
+    "condition": null
+  },
+  {
+    "source": "/agent-teams.html",
+    "target": "/platform",
+    "status": "301",
+    "condition": null
+  },
+  {
+    "source": "/agent-teams",
+    "target": "/platform",
+    "status": "301",
+    "condition": null
+  },
+  {
+    "source": "/work.html",
+    "target": "/",
+    "status": "301",
+    "condition": null
+  },
+  {
+    "source": "/work",
+    "target": "/",
+    "status": "301",
+    "condition": null
+  },
+  {
+    "source": "/industries.html",
+    "target": "/",
+    "status": "301",
+    "condition": null
+  },
+  {
+    "source": "/travel.html",
+    "target": "/industries/travel-hospitality",
+    "status": "301",
+    "condition": null
+  },
+  {
+    "source": "/industries/travel",
+    "target": "/industries/travel-hospitality",
+    "status": "301",
+    "condition": null
+  },
+  {
+    "source": "/retail.html",
+    "target": "/industries/consumer-brands",
+    "status": "301",
+    "condition": null
+  },
+  {
+    "source": "/industries/retail",
+    "target": "/industries/consumer-brands",
+    "status": "301",
+    "condition": null
+  },
+  {
+    "source": "/nbfc.html",
+    "target": "/industries/financial-services",
+    "status": "301",
+    "condition": null
+  },
+  {
+    "source": "/industries/nbfc",
+    "target": "/industries/financial-services",
+    "status": "301",
+    "condition": null
+  },
+  {
+    "source": "/government.html",
+    "target": "/platform",
+    "status": "301",
+    "condition": null
+  },
+  {
+    "source": "/industries/government",
+    "target": "/platform",
+    "status": "301",
+    "condition": null
+  },
+  {
+    "source": "/company.html",
+    "target": "/company",
+    "status": "301",
+    "condition": null
+  },
+  {
+    "source": "/careers.html",
+    "target": "/careers",
+    "status": "301",
+    "condition": null
+  },
+  {
+    "source": "/platform",
+    "target": "/platform/index.html",
+    "status": "200",
+    "condition": null
+  },
+  {
+    "source": "/crew/bea",
+    "target": "/crew/bea/index.html",
+    "status": "200",
+    "condition": null
+  },
+  {
+    "source": "/crew/otto",
+    "target": "/crew/otto/index.html",
+    "status": "200",
+    "condition": null
+  },
+  {
+    "source": "/crew/dash",
+    "target": "/crew/dash/index.html",
+    "status": "200",
+    "condition": null
+  },
+  {
+    "source": "/industries/consumer-brands",
+    "target": "/industries/consumer-brands/index.html",
+    "status": "200",
+    "condition": null
+  },
+  {
+    "source": "/industries/travel-hospitality",
+    "target": "/industries/travel-hospitality/index.html",
+    "status": "200",
+    "condition": null
+  },
+  {
+    "source": "/industries/financial-services",
+    "target": "/industries/financial-services/index.html",
+    "status": "200",
+    "condition": null
+  },
+  {
+    "source": "/company",
+    "target": "/company/index.html",
+    "status": "200",
+    "condition": null
+  },
+  {
+    "source": "/careers",
+    "target": "/careers/index.html",
+    "status": "200",
+    "condition": null
+  },
+  {
+    "source": "/platform/",
+    "target": "/platform/index.html",
+    "status": "200",
+    "condition": null
+  },
+  {
+    "source": "/crew/bea/",
+    "target": "/crew/bea/index.html",
+    "status": "200",
+    "condition": null
+  },
+  {
+    "source": "/crew/otto/",
+    "target": "/crew/otto/index.html",
+    "status": "200",
+    "condition": null
+  },
+  {
+    "source": "/crew/dash/",
+    "target": "/crew/dash/index.html",
+    "status": "200",
+    "condition": null
+  },
+  {
+    "source": "/industries/consumer-brands/",
+    "target": "/industries/consumer-brands/index.html",
+    "status": "200",
+    "condition": null
+  },
+  {
+    "source": "/industries/travel-hospitality/",
+    "target": "/industries/travel-hospitality/index.html",
+    "status": "200",
+    "condition": null
+  },
+  {
+    "source": "/industries/financial-services/",
+    "target": "/industries/financial-services/index.html",
+    "status": "200",
+    "condition": null
+  },
+  {
+    "source": "/company/",
+    "target": "/company/index.html",
+    "status": "200",
+    "condition": null
+  },
+  {
+    "source": "/careers/",
+    "target": "/careers/index.html",
+    "status": "200",
+    "condition": null
+  }
+]
